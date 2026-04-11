@@ -70,8 +70,8 @@ fn matches_codex_process(name: &str, command: &[String]) -> bool {
     }
     command
         .iter()
-        .filter_map(|token| std::path::Path::new(token).file_name())
-        .map(|token| token.to_string_lossy().to_ascii_lowercase())
+        .filter_map(|token| path_file_name(token))
+        .map(|token| token.to_ascii_lowercase())
         .any(|token| matches!(token.as_str(), "codex" | "codex.exe" | "codex.js"))
 }
 
@@ -129,9 +129,7 @@ fn classify_process(command: &[String]) -> (String, Option<String>) {
 
 fn classify_wrapped_codex_command(command: &[String]) -> Option<(String, Option<String>)> {
     let script = command.get(1)?;
-    let script_name = std::path::Path::new(script)
-        .file_name()
-        .map(|name| name.to_string_lossy().to_ascii_lowercase())?;
+    let script_name = path_file_name(script)?.to_ascii_lowercase();
     if script_name != "codex.js" {
         return None;
     }
@@ -196,12 +194,15 @@ fn clean_token(token: &str) -> Option<String> {
     if trimmed.starts_with("/prefetch:") {
         return None;
     }
-    let path = std::path::Path::new(trimmed);
-    let value = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| trimmed.to_owned());
+    let value = path_file_name(trimmed).unwrap_or(trimmed).to_owned();
     if value.is_empty() { None } else { Some(value) }
+}
+
+fn path_file_name(value: &str) -> Option<&str> {
+    value
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty())
 }
 
 fn flag_value_preview(token: &str) -> Option<String> {
