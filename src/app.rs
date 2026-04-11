@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use console::{Key, Term, style};
-use dialoguer::{Confirm, Select, theme::ColorfulTheme};
+use dialoguer::{Select, theme::ColorfulTheme};
 use uuid::Uuid;
 
 use crate::codex;
@@ -181,6 +181,12 @@ where
                         "Activated {} ({})",
                         output.account.email, output.account.id
                     ));
+                    if showed_preflight {
+                        feedback.push(
+                            "Codex was still running during activation. If the account does not change in Codex, close those processes fully and retry."
+                                .to_owned(),
+                        );
+                    }
                     if !showed_preflight && !output.warnings.is_empty() {
                         feedback.extend(process_summary_lines("Codex processes", &output.warnings));
                     }
@@ -249,6 +255,7 @@ struct InteractiveItem {
 
 struct InteractiveMenu {
     prompt: &'static str,
+    current_status_label: Option<String>,
     accounts: Vec<InteractiveItem>,
     actions: Vec<InteractiveItem>,
 }
@@ -355,7 +362,7 @@ fn render_account_label(account: &AccountView) -> String {
     } else if let Some(ts) = account.last_activated_at {
         parts.push(format!("- Last activated {}", ts.date()));
     } else {
-        parts.push("- Saved".to_owned());
+        parts.push(format!("- Saved on {}", account.updated_at.date()));
     }
     parts.join(" ")
 }
@@ -380,6 +387,17 @@ fn build_menu(
     }
 
     let mut actions = Vec::new();
+    let current_status_label = status.current_account.as_ref().map(|current| {
+        format!(
+            "Current: {}{}",
+            current.email,
+            if current_saved.is_some() {
+                " [saved]"
+            } else {
+                " [not saved]"
+            }
+        )
+    });
 
     if matches!(mode, InteractiveMode::Persistent) {
         if let Some(current) = status.current_account.as_ref() {
@@ -387,7 +405,7 @@ fn build_menu(
                 label: if current_saved.is_some() {
                     format!("Refresh saved snapshot for {}", current.email)
                 } else {
-                    format!("Save current account {}", current.email)
+                    format!("Add current account {} to switcher", current.email)
                 },
                 action: InteractiveAction::SaveCurrent,
             });
@@ -417,6 +435,7 @@ fn build_menu(
 
     InteractiveMenu {
         prompt,
+        current_status_label,
         accounts,
         actions,
     }
@@ -499,6 +518,10 @@ fn render_persistent_menu(
     }
     term.write_line(&style(menu.prompt).bold().to_string())?;
     lines += 1;
+    if let Some(current_status_label) = &menu.current_status_label {
+        term.write_line(&style(current_status_label).dim().to_string())?;
+        lines += 1;
+    }
     term.write_line("")?;
     lines += 1;
     term.write_line(&render_section_heading("Accounts"))?;
@@ -602,30 +625,32 @@ fn prompt_for_account_delete(accounts: &[AccountView]) -> Result<Uuid> {
 }
 
 fn confirm_delete(account: &AccountView) -> Result<bool> {
-    Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!(
-            "Delete saved snapshot for {} ({})?",
+    confirm_with_menu(
+        "Delete saved snapshot?",
+        &[
             render_account_label(account),
-            account.id
-        ))
-        .default(false)
-        .interact()
-        .map_err(Into::into)
+            format!("Snapshot id: {}", account.id),
+        ],
+        "Yes, delete",
+        "No, keep it",
+        false,
+    )
 }
 
 fn confirm_activation(warnings: &[crate::model::RunningCodexProcess]) -> Result<bool> {
-    print_process_summary("Codex processes", warnings);
-    Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt("Codex appears to be running. Continue with account activation?")
-        .default(false)
-        .interact()
-        .map_err(Into::into)
-}
-
-fn print_process_summary(title: &str, processes: &[crate::model::RunningCodexProcess]) {
-    for line in process_summary_lines(title, processes) {
-        println!("{line}");
-    }
+    let mut body = vec![
+        "Codex appears to be running.".to_owned(),
+        "Swapping while it is open may not stick until those processes are restarted.".to_owned(),
+        String::new(),
+    ];
+    body.extend(process_summary_lines("Codex processes", warnings));
+    confirm_with_menu(
+        "Continue with account activation?",
+        &body,
+        "Yes, continue",
+        "No, cancel",
+        false,
+    )
 }
 
 fn interactive_status_lines(status: &StatusOutput) -> Vec<String> {
@@ -662,6 +687,70 @@ fn process_summary_lines(
     lines
 }
 
+fn confirm_with_menu(
+    prompt: &str,
+    body_lines: &[String],
+    yes_label: &str,
+    no_label: &str,
+    default_yes: bool,
+) -> Result<bool> {
+    let term = Term::stderr();
+    let mut selection = usize::from(default_yes);
+    let options = [no_label, yes_label];
+    let mut rendered_lines = 0usize;
+    term.hide_cursor()?;
+    loop {
+        if rendered_lines > 0 {
+            term.clear_last_lines(rendered_lines)?;
+        }
+        rendered_lines = 0;
+        term.write_line(&style(prompt).bold().to_string())?;
+        rendered_lines += 1;
+        for line in body_lines {
+            term.write_line(line)?;
+            rendered_lines += 1;
+        }
+        if !body_lines.is_empty() {
+            term.write_line("")?;
+            rendered_lines += 1;
+        }
+        for (index, option) in options.iter().enumerate() {
+            term.write_line(&render_confirm_option(option, selection == index))?;
+            rendered_lines += 1;
+        }
+        match term.read_key()? {
+            Key::ArrowUp
+            | Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Tab
+            | Key::Char('j')
+            | Key::Char('k') => {
+                selection = 1 - selection;
+            }
+            Key::Enter => {
+                term.clear_last_lines(rendered_lines)?;
+                term.show_cursor()?;
+                return Ok(selection == 1);
+            }
+            Key::Escape | Key::Char('q') => {
+                term.clear_last_lines(rendered_lines)?;
+                term.show_cursor()?;
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn render_confirm_option(label: &str, selected: bool) -> String {
+    if selected {
+        style(format!("> {label}")).cyan().bold().to_string()
+    } else {
+        format!("  {label}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use base64::Engine;
@@ -675,12 +764,12 @@ mod tests {
     use crate::repository::SnapshotRepository;
     use crate::secrets::test_support::MemorySecretStore;
 
-    fn sample_status(current_saved_id: Option<Uuid>) -> StatusOutput {
+    fn sample_status_with_email(email: &str, current_saved_id: Option<Uuid>) -> StatusOutput {
         StatusOutput {
             environment: EnvironmentKind::Windows,
             codex_root: "C:\\Users\\tester\\.codex".to_owned(),
             current_account: current_saved_id.map(|_| DisplayIdentity {
-                email: "person@example.com".to_owned(),
+                email: email.to_owned(),
                 subject: Some("sub-1".to_owned()),
                 name: Some("Tester".to_owned()),
                 plan_label: Some("Pro".to_owned()),
@@ -691,7 +780,11 @@ mod tests {
         }
     }
 
-    fn sample_list(id: Uuid) -> ListOutput {
+    fn sample_status(current_saved_id: Option<Uuid>) -> StatusOutput {
+        sample_status_with_email("person@example.com", current_saved_id)
+    }
+
+    fn sample_list(id: Uuid, is_active: bool) -> ListOutput {
         ListOutput {
             environment: EnvironmentKind::Windows,
             accounts: vec![AccountView {
@@ -701,10 +794,10 @@ mod tests {
                 name: Some("Tester".to_owned()),
                 plan_label: Some("Pro".to_owned()),
                 environment: EnvironmentKind::Windows,
-                is_active: true,
+                is_active,
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 updated_at: OffsetDateTime::UNIX_EPOCH,
-                last_activated_at: Some(OffsetDateTime::UNIX_EPOCH),
+                last_activated_at: is_active.then_some(OffsetDateTime::UNIX_EPOCH),
             }],
         }
     }
@@ -715,7 +808,7 @@ mod tests {
         let menu = build_menu(
             InteractiveMode::ActivateOnce,
             &sample_status(Some(id)),
-            &sample_list(id),
+            &sample_list(id, true),
             Some(id),
         );
         assert_eq!(menu.len(), 2);
@@ -730,7 +823,7 @@ mod tests {
         let menu = build_menu(
             InteractiveMode::DeleteOnce,
             &sample_status(Some(id)),
-            &sample_list(id),
+            &sample_list(id, true),
             Some(id),
         );
         assert_eq!(menu.prompt, "Which saved account do you want to delete?");
@@ -746,7 +839,7 @@ mod tests {
         let menu = build_menu(
             InteractiveMode::Persistent,
             &sample_status(Some(id)),
-            &sample_list(id),
+            &sample_list(id, true),
             Some(id),
         );
         assert_eq!(menu.accounts.len(), 1);
@@ -763,11 +856,46 @@ mod tests {
         let menu = build_menu(
             InteractiveMode::Persistent,
             &sample_status(Some(id)),
-            &sample_list(id),
+            &sample_list(id, true),
             Some(id),
         );
         assert_eq!(jump_section(&menu, 0), 1);
         assert_eq!(jump_section(&menu, 1), 0);
+    }
+
+    #[test]
+    fn persistent_menu_keeps_unsaved_current_account_out_of_saved_accounts() {
+        let id = Uuid::new_v4();
+        let status = StatusOutput {
+            environment: EnvironmentKind::Windows,
+            codex_root: "C:\\Users\\tester\\.codex".to_owned(),
+            current_account: Some(DisplayIdentity {
+                email: "other@example.com".to_owned(),
+                subject: Some("sub-2".to_owned()),
+                name: Some("Other".to_owned()),
+                plan_label: Some("Plus".to_owned()),
+            }),
+            current_account_saved_id: None,
+            saved_accounts: 1,
+            process_warnings: Vec::new(),
+        };
+        let menu = build_menu(
+            InteractiveMode::Persistent,
+            &status,
+            &sample_list(id, false),
+            None,
+        );
+        assert_eq!(
+            menu.current_status_label.as_deref(),
+            Some("Current: other@example.com [not saved]")
+        );
+        assert_eq!(menu.accounts.len(), 1);
+        assert!(menu.accounts[0].label.contains("person@example.com"));
+        assert!(menu.accounts[0].label.contains("Saved on 1970-01-01"));
+        assert_eq!(
+            menu.actions[0].label,
+            "Add current account other@example.com to switcher"
+        );
     }
 
     #[test]
@@ -805,6 +933,44 @@ mod tests {
         let output = app.list().expect("list");
         assert_eq!(output.accounts.len(), 1);
         assert!(output.accounts[0].is_active);
+    }
+
+    #[test]
+    fn list_keeps_saved_account_when_live_account_is_unsaved() {
+        let temp = tempdir().expect("tempdir");
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+        std::fs::create_dir_all(&env.codex_root).expect("codex root");
+        std::fs::write(
+            env.codex_root.join("auth.json"),
+            auth_json_fixture("current@example.com", "sub-2", Some("plus")),
+        )
+        .expect("auth");
+        std::fs::write(env.codex_root.join("cap_sid"), "sid-current").expect("cap");
+        let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
+        repo.save_snapshot(
+            &env.kind,
+            &DisplayIdentity {
+                email: "saved@example.com".to_owned(),
+                subject: Some("sub-1".to_owned()),
+                name: None,
+                plan_label: Some("Pro".to_owned()),
+            },
+            &SnapshotBlob {
+                schema_version: 1,
+                files: vec![],
+            },
+        )
+        .expect("save");
+        let app = App::new(env, repo);
+        let output = app.list().expect("list");
+        assert_eq!(output.accounts.len(), 1);
+        assert_eq!(output.accounts[0].email, "saved@example.com");
+        assert!(!output.accounts[0].is_active);
     }
 
     #[test]
