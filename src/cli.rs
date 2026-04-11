@@ -4,6 +4,8 @@ use uuid::Uuid;
 
 use crate::app::{App, InteractiveMode};
 use crate::env;
+use crate::model::RunningCodexProcess;
+use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
 use crate::secrets::KeyringSecretStore;
 
@@ -66,10 +68,7 @@ pub fn run() -> Result<()> {
                 }
                 println!("Saved accounts: {}", status.saved_accounts);
                 if !status.process_warnings.is_empty() {
-                    println!("Warnings:");
-                    for warning in status.process_warnings {
-                        println!("- {warning}");
-                    }
+                    print_process_summary("Codex processes", &status.process_warnings);
                 }
             }
             Ok(())
@@ -112,10 +111,7 @@ pub fn run() -> Result<()> {
                     let warnings = app.activation_preflight_warnings();
                     if !warnings.is_empty() && !json {
                         showed_preflight = true;
-                        println!("Warnings:");
-                        for warning in &warnings {
-                            println!("- {warning}");
-                        }
+                        print_process_summary("Codex processes", &warnings);
                     }
                     app.activate(account_id)?
                 }
@@ -129,9 +125,7 @@ pub fn run() -> Result<()> {
             } else {
                 println!("Activated {} ({})", output.account.email, output.account.id);
                 if !showed_preflight {
-                    for warning in output.warnings {
-                        println!("Warning: {warning}");
-                    }
+                    print_process_summary("Codex processes", &output.warnings);
                 }
             }
             Ok(())
@@ -161,4 +155,11 @@ where
     let json = serde_json::to_string_pretty(value).context("failed to encode JSON output")?;
     println!("{json}");
     Ok(())
+}
+
+fn print_process_summary(title: &str, processes: &[RunningCodexProcess]) {
+    println!("{title}:");
+    for line in format_process_table(processes) {
+        println!("{line}");
+    }
 }

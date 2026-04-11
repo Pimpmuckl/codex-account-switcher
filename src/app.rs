@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use console::{Key, Term, style};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use uuid::Uuid;
 
@@ -8,7 +9,7 @@ use crate::model::{
     AccountView, ActivateOutput, DeleteOutput, DisplayIdentity, ListOutput, SaveAction, SaveOutput,
     StatusOutput,
 };
-use crate::process::detect_running_codex_processes;
+use crate::process::{detect_running_codex_processes, format_process_table};
 use crate::repository::SnapshotRepository;
 use crate::secrets::SecretStore;
 
@@ -114,7 +115,7 @@ where
         })
     }
 
-    pub fn activation_preflight_warnings(&self) -> Vec<String> {
+    pub fn activation_preflight_warnings(&self) -> Vec<crate::model::RunningCodexProcess> {
         detect_running_codex_processes()
     }
 
@@ -128,6 +129,7 @@ where
 
     pub fn interactive(&self, mode: InteractiveMode) -> Result<()> {
         let mut default_selection = 0usize;
+        let mut feedback = Vec::new();
         loop {
             let status = self.status()?;
             let list = self.list()?;
@@ -138,22 +140,27 @@ where
                     .map(|account| account.id)
             });
 
-            let (prompt, labels, actions) = build_menu(mode, &status, &list, current_saved);
-            let selection = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt(prompt)
-                .items(&labels)
-                .default(next_selectable_index(
-                    &actions,
-                    default_selection.min(labels.len().saturating_sub(1)),
-                ))
-                .interact()?;
-            default_selection = next_selectable_index(&actions, selection);
+            let menu = build_menu(mode, &status, &list, current_saved);
+            let selection = match mode {
+                InteractiveMode::Persistent => {
+                    select_persistent_entry(&menu, default_selection, &feedback)?
+                }
+                InteractiveMode::ActivateOnce | InteractiveMode::DeleteOnce => {
+                    let labels = menu.labels();
+                    Select::with_theme(&ColorfulTheme::default())
+                        .with_prompt(menu.prompt)
+                        .items(&labels)
+                        .default(default_selection.min(menu.len().saturating_sub(1)))
+                        .interact()?
+                }
+            };
+            default_selection = selection;
+            feedback.clear();
 
-            match actions[selection] {
-                InteractiveAction::Separator => {}
+            match menu.action(selection) {
                 InteractiveAction::SaveCurrent => {
                     let output = self.save_current()?;
-                    println!(
+                    feedback.push(format!(
                         "{} {} ({})",
                         match output.action {
                             SaveAction::Created => "Saved",
@@ -161,7 +168,7 @@ where
                         },
                         output.account.email,
                         output.account.id
-                    );
+                    ));
                 }
                 InteractiveAction::Activate(account_id) => {
                     let warnings = self.activation_preflight_warnings();
@@ -170,12 +177,12 @@ where
                         continue;
                     }
                     let output = self.activate(account_id)?;
-                    println!("Activated {} ({})", output.account.email, output.account.id);
+                    feedback.push(format!(
+                        "Activated {} ({})",
+                        output.account.email, output.account.id
+                    ));
                     if !showed_preflight && !output.warnings.is_empty() {
-                        println!("Warnings:");
-                        for warning in output.warnings {
-                            println!("- {warning}");
-                        }
+                        feedback.extend(process_summary_lines("Codex processes", &output.warnings));
                     }
                     if matches!(mode, InteractiveMode::ActivateOnce) {
                         break;
@@ -191,7 +198,10 @@ where
                         continue;
                     }
                     let output = self.delete(account_id)?;
-                    println!("Deleted saved snapshot {}", output.deleted_account_id);
+                    feedback.push(format!(
+                        "Deleted saved snapshot {}",
+                        output.deleted_account_id
+                    ));
                     if matches!(mode, InteractiveMode::DeleteOnce) {
                         break;
                     }
@@ -207,10 +217,13 @@ where
                         continue;
                     }
                     let output = self.delete(account_id)?;
-                    println!("Deleted saved snapshot {}", output.deleted_account_id);
+                    feedback.push(format!(
+                        "Deleted saved snapshot {}",
+                        output.deleted_account_id
+                    ));
                 }
                 InteractiveAction::ShowStatus => {
-                    print_interactive_status(&status);
+                    feedback = interactive_status_lines(&status);
                 }
                 InteractiveAction::Quit => break,
             }
@@ -221,13 +234,62 @@ where
 
 #[derive(Clone, Copy)]
 enum InteractiveAction {
-    Separator,
     SaveCurrent,
     Activate(Uuid),
     Delete(Uuid),
     DeletePrompt,
     ShowStatus,
     Quit,
+}
+
+struct InteractiveItem {
+    label: String,
+    action: InteractiveAction,
+}
+
+struct InteractiveMenu {
+    prompt: &'static str,
+    accounts: Vec<InteractiveItem>,
+    actions: Vec<InteractiveItem>,
+}
+
+struct PersistentRenderState {
+    total_lines: usize,
+    row_lines: Vec<usize>,
+}
+
+impl InteractiveMenu {
+    fn len(&self) -> usize {
+        self.accounts.len() + self.actions.len()
+    }
+
+    fn labels(&self) -> Vec<&str> {
+        self.accounts
+            .iter()
+            .chain(self.actions.iter())
+            .map(|item| item.label.as_str())
+            .collect()
+    }
+
+    fn action(&self, index: usize) -> InteractiveAction {
+        if index < self.accounts.len() {
+            self.accounts[index].action
+        } else {
+            self.actions[index - self.accounts.len()].action
+        }
+    }
+
+    fn label(&self, index: usize) -> &str {
+        if index < self.accounts.len() {
+            &self.accounts[index].label
+        } else {
+            &self.actions[index - self.accounts.len()].label
+        }
+    }
+
+    fn first_action_index(&self) -> Option<usize> {
+        (!self.actions.is_empty()).then_some(self.accounts.len())
+    }
 }
 
 fn account_view(
@@ -303,44 +365,48 @@ fn build_menu(
     status: &StatusOutput,
     list: &ListOutput,
     current_saved: Option<Uuid>,
-) -> (&'static str, Vec<String>, Vec<InteractiveAction>) {
-    let mut labels = Vec::new();
-    let mut actions = Vec::new();
-
-    labels.push("-------------------- Accounts --------------------".to_owned());
-    actions.push(InteractiveAction::Separator);
-
+) -> InteractiveMenu {
+    let mut accounts = Vec::new();
     for account in &list.accounts {
-        labels.push(render_account_label(account));
-        actions.push(match mode {
-            InteractiveMode::Persistent | InteractiveMode::ActivateOnce => {
-                InteractiveAction::Activate(account.id)
-            }
-            InteractiveMode::DeleteOnce => InteractiveAction::Delete(account.id),
+        accounts.push(InteractiveItem {
+            label: render_account_label(account),
+            action: match mode {
+                InteractiveMode::Persistent | InteractiveMode::ActivateOnce => {
+                    InteractiveAction::Activate(account.id)
+                }
+                InteractiveMode::DeleteOnce => InteractiveAction::Delete(account.id),
+            },
         });
     }
 
-    if matches!(mode, InteractiveMode::Persistent) {
-        labels.push("-------------------- Actions ---------------------".to_owned());
-        actions.push(InteractiveAction::Separator);
+    let mut actions = Vec::new();
 
+    if matches!(mode, InteractiveMode::Persistent) {
         if let Some(current) = status.current_account.as_ref() {
-            labels.push(if current_saved.is_some() {
-                format!("Refresh saved snapshot for {}", current.email)
-            } else {
-                format!("Save current account {}", current.email)
+            actions.push(InteractiveItem {
+                label: if current_saved.is_some() {
+                    format!("Refresh saved snapshot for {}", current.email)
+                } else {
+                    format!("Save current account {}", current.email)
+                },
+                action: InteractiveAction::SaveCurrent,
             });
-            actions.push(InteractiveAction::SaveCurrent);
         }
         if !list.accounts.is_empty() {
-            labels.push("Delete saved account".to_owned());
-            actions.push(InteractiveAction::DeletePrompt);
+            actions.push(InteractiveItem {
+                label: "Delete saved account".to_owned(),
+                action: InteractiveAction::DeletePrompt,
+            });
         }
-        labels.push("Show status".to_owned());
-        actions.push(InteractiveAction::ShowStatus);
+        actions.push(InteractiveItem {
+            label: "Show status".to_owned(),
+            action: InteractiveAction::ShowStatus,
+        });
     }
-    labels.push("Quit".to_owned());
-    actions.push(InteractiveAction::Quit);
+    actions.push(InteractiveItem {
+        label: "Quit".to_owned(),
+        action: InteractiveAction::Quit,
+    });
 
     let prompt = match mode {
         InteractiveMode::Persistent | InteractiveMode::ActivateOnce => {
@@ -349,27 +415,177 @@ fn build_menu(
         InteractiveMode::DeleteOnce => "Which saved account do you want to delete?",
     };
 
-    (prompt, labels, actions)
+    InteractiveMenu {
+        prompt,
+        accounts,
+        actions,
+    }
 }
 
-fn next_selectable_index(actions: &[InteractiveAction], preferred: usize) -> usize {
-    if !matches!(actions.get(preferred), Some(InteractiveAction::Separator)) {
-        return preferred;
+fn select_persistent_entry(
+    menu: &InteractiveMenu,
+    default_selection: usize,
+    feedback: &[String],
+) -> Result<usize> {
+    let term = Term::stderr();
+    let mut selection = default_selection.min(menu.len().saturating_sub(1));
+    term.hide_cursor()?;
+    let render_state = render_persistent_menu(&term, menu, selection, feedback)?;
+    loop {
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('k') => {
+                let next = if selection == 0 {
+                    menu.len().saturating_sub(1)
+                } else {
+                    selection - 1
+                };
+                update_persistent_selection(&term, menu, &render_state, selection, next)?;
+                selection = next;
+            }
+            Key::ArrowDown | Key::Char('j') => {
+                let next = (selection + 1) % menu.len().max(1);
+                update_persistent_selection(&term, menu, &render_state, selection, next)?;
+                selection = next;
+            }
+            Key::ArrowLeft | Key::ArrowRight | Key::Tab => {
+                let next = jump_section(menu, selection);
+                update_persistent_selection(&term, menu, &render_state, selection, next)?;
+                selection = next;
+            }
+            Key::Enter => {
+                if render_state.total_lines > 0 {
+                    term.clear_last_lines(render_state.total_lines)?;
+                }
+                term.show_cursor()?;
+                return Ok(selection);
+            }
+            Key::Escape | Key::Char('q') => {
+                if render_state.total_lines > 0 {
+                    term.clear_last_lines(render_state.total_lines)?;
+                }
+                term.show_cursor()?;
+                return Ok(menu.len().saturating_sub(1));
+            }
+            _ => {}
+        }
     }
-    actions
-        .iter()
-        .enumerate()
-        .skip(preferred + 1)
-        .find(|(_, action)| !matches!(action, InteractiveAction::Separator))
-        .map(|(index, _)| index)
-        .or_else(|| {
-            actions
-                .iter()
-                .enumerate()
-                .find(|(_, action)| !matches!(action, InteractiveAction::Separator))
-                .map(|(index, _)| index)
-        })
-        .unwrap_or(0)
+}
+
+fn jump_section(menu: &InteractiveMenu, selection: usize) -> usize {
+    if selection < menu.accounts.len() {
+        menu.first_action_index().unwrap_or(selection)
+    } else if !menu.accounts.is_empty() {
+        0
+    } else {
+        selection
+    }
+}
+
+fn render_persistent_menu(
+    term: &Term,
+    menu: &InteractiveMenu,
+    selection: usize,
+    feedback: &[String],
+) -> Result<PersistentRenderState> {
+    let mut lines = 0usize;
+    let mut row_lines = Vec::with_capacity(menu.len());
+    for line in feedback {
+        term.write_line(line)?;
+        lines += 1;
+    }
+    if !feedback.is_empty() {
+        term.write_line("")?;
+        lines += 1;
+    }
+    term.write_line(&style(menu.prompt).bold().to_string())?;
+    lines += 1;
+    term.write_line("")?;
+    lines += 1;
+    term.write_line(&render_section_heading("Accounts"))?;
+    lines += 1;
+    if menu.accounts.is_empty() {
+        term.write_line(&style("  (no saved accounts)").dim().to_string())?;
+        lines += 1;
+    } else {
+        for index in 0..menu.accounts.len() {
+            row_lines.push(lines);
+            term.write_line(&render_menu_row(menu, selection, index))?;
+            lines += 1;
+        }
+    }
+    term.write_line(&render_section_heading("Actions"))?;
+    lines += 1;
+    for index in menu.accounts.len()..menu.len() {
+        row_lines.push(lines);
+        term.write_line(&render_menu_row(menu, selection, index))?;
+        lines += 1;
+    }
+    term.write_line(&render_divider())?;
+    lines += 1;
+    term.write_line(
+        &style("Arrows or j/k move. Tab or left/right jumps sections. Enter selects. q exits.")
+            .dim()
+            .to_string(),
+    )?;
+    lines += 1;
+    Ok(PersistentRenderState {
+        total_lines: lines,
+        row_lines,
+    })
+}
+
+fn render_menu_row(menu: &InteractiveMenu, selection: usize, index: usize) -> String {
+    render_menu_row_explicit(menu, index, selection == index)
+}
+
+fn render_section_heading(title: &str) -> String {
+    style(title).blue().bold().to_string()
+}
+
+fn render_divider() -> String {
+    style("--------------------------------------------------")
+        .dim()
+        .to_string()
+}
+
+fn update_persistent_selection(
+    term: &Term,
+    menu: &InteractiveMenu,
+    render_state: &PersistentRenderState,
+    previous: usize,
+    next: usize,
+) -> Result<()> {
+    if previous == next {
+        return Ok(());
+    }
+    rewrite_menu_row(term, menu, render_state, previous, false)?;
+    rewrite_menu_row(term, menu, render_state, next, true)?;
+    Ok(())
+}
+
+fn rewrite_menu_row(
+    term: &Term,
+    menu: &InteractiveMenu,
+    render_state: &PersistentRenderState,
+    index: usize,
+    selected: bool,
+) -> Result<()> {
+    let line_index = render_state.row_lines[index];
+    let lines_up = render_state.total_lines.saturating_sub(line_index);
+    term.move_cursor_up(lines_up)?;
+    term.clear_line()?;
+    term.write_line(&render_menu_row_explicit(menu, index, selected))?;
+    term.move_cursor_down(lines_up.saturating_sub(1))?;
+    Ok(())
+}
+
+fn render_menu_row_explicit(menu: &InteractiveMenu, index: usize, selected: bool) -> String {
+    let label = menu.label(index);
+    if selected {
+        style(format!("> {label}")).cyan().bold().to_string()
+    } else {
+        format!("  {label}")
+    }
 }
 
 fn prompt_for_account_delete(accounts: &[AccountView]) -> Result<Uuid> {
@@ -397,11 +613,8 @@ fn confirm_delete(account: &AccountView) -> Result<bool> {
         .map_err(Into::into)
 }
 
-fn confirm_activation(warnings: &[String]) -> Result<bool> {
-    println!("Warnings:");
-    for warning in warnings {
-        println!("- {warning}");
-    }
+fn confirm_activation(warnings: &[crate::model::RunningCodexProcess]) -> Result<bool> {
+    print_process_summary("Codex processes", warnings);
     Confirm::with_theme(&ColorfulTheme::default())
         .with_prompt("Codex appears to be running. Continue with account activation?")
         .default(false)
@@ -409,26 +622,44 @@ fn confirm_activation(warnings: &[String]) -> Result<bool> {
         .map_err(Into::into)
 }
 
-fn print_interactive_status(status: &StatusOutput) {
-    println!("Status");
-    println!("Environment: {}", status.environment);
-    println!("Codex root: {}", status.codex_root);
+fn print_process_summary(title: &str, processes: &[crate::model::RunningCodexProcess]) {
+    for line in process_summary_lines(title, processes) {
+        println!("{line}");
+    }
+}
+
+fn interactive_status_lines(status: &StatusOutput) -> Vec<String> {
+    let mut lines = vec![
+        "Status".to_owned(),
+        format!("Environment: {}", status.environment),
+        format!("Codex root: {}", status.codex_root),
+    ];
     match &status.current_account {
         Some(account) => {
-            println!("Current account: {}", account.email);
+            lines.push(format!("Current account: {}", account.email));
             if let Some(plan) = &account.plan_label {
-                println!("Plan: {plan}");
+                lines.push(format!("Plan: {plan}"));
             }
         }
-        None => println!("Current account: not logged in"),
+        None => lines.push("Current account: not logged in".to_owned()),
     }
-    println!("Saved accounts: {}", status.saved_accounts);
+    lines.push(format!("Saved accounts: {}", status.saved_accounts));
     if !status.process_warnings.is_empty() {
-        println!("Warnings:");
-        for warning in &status.process_warnings {
-            println!("- {warning}");
-        }
+        lines.extend(process_summary_lines(
+            "Codex processes",
+            &status.process_warnings,
+        ));
     }
+    lines
+}
+
+fn process_summary_lines(
+    title: &str,
+    processes: &[crate::model::RunningCodexProcess],
+) -> Vec<String> {
+    let mut lines = vec![format!("{title}:")];
+    lines.extend(format_process_table(processes));
+    lines
 }
 
 #[cfg(test)]
@@ -481,52 +712,62 @@ mod tests {
     #[test]
     fn activate_once_menu_only_lists_accounts_and_quit() {
         let id = Uuid::new_v4();
-        let (_, labels, actions) = build_menu(
+        let menu = build_menu(
             InteractiveMode::ActivateOnce,
             &sample_status(Some(id)),
             &sample_list(id),
             Some(id),
         );
-        assert_eq!(labels.len(), 3);
-        assert!(matches!(actions[0], InteractiveAction::Separator));
-        assert!(matches!(actions[1], InteractiveAction::Activate(actual) if actual == id));
-        assert!(matches!(actions[2], InteractiveAction::Quit));
+        assert_eq!(menu.len(), 2);
+        assert_eq!(menu.accounts.len(), 1);
+        assert!(matches!(menu.action(0), InteractiveAction::Activate(actual) if actual == id));
+        assert!(matches!(menu.action(1), InteractiveAction::Quit));
     }
 
     #[test]
     fn delete_once_menu_only_lists_deletes_and_quit() {
         let id = Uuid::new_v4();
-        let (prompt, labels, actions) = build_menu(
+        let menu = build_menu(
             InteractiveMode::DeleteOnce,
             &sample_status(Some(id)),
             &sample_list(id),
             Some(id),
         );
-        assert_eq!(prompt, "Which saved account do you want to delete?");
-        assert_eq!(labels.len(), 3);
-        assert!(matches!(actions[0], InteractiveAction::Separator));
-        assert!(matches!(actions[1], InteractiveAction::Delete(actual) if actual == id));
-        assert!(matches!(actions[2], InteractiveAction::Quit));
+        assert_eq!(menu.prompt, "Which saved account do you want to delete?");
+        assert_eq!(menu.len(), 2);
+        assert_eq!(menu.accounts.len(), 1);
+        assert!(matches!(menu.action(0), InteractiveAction::Delete(actual) if actual == id));
+        assert!(matches!(menu.action(1), InteractiveAction::Quit));
     }
 
     #[test]
     fn persistent_menu_keeps_refresh_in_actions() {
         let id = Uuid::new_v4();
-        let (_, labels, actions) = build_menu(
+        let menu = build_menu(
             InteractiveMode::Persistent,
             &sample_status(Some(id)),
             &sample_list(id),
             Some(id),
         );
+        assert_eq!(menu.accounts.len(), 1);
+        assert!(matches!(menu.action(1), InteractiveAction::SaveCurrent));
         assert_eq!(
-            labels[0],
-            "-------------------- Accounts --------------------"
+            menu.actions[0].label,
+            "Refresh saved snapshot for person@example.com"
         );
-        assert_eq!(
-            labels[2],
-            "-------------------- Actions ---------------------"
+    }
+
+    #[test]
+    fn jump_section_switches_between_accounts_and_actions() {
+        let id = Uuid::new_v4();
+        let menu = build_menu(
+            InteractiveMode::Persistent,
+            &sample_status(Some(id)),
+            &sample_list(id),
+            Some(id),
         );
-        assert!(matches!(actions[3], InteractiveAction::SaveCurrent));
+        assert_eq!(jump_section(&menu, 0), 1);
+        assert_eq!(jump_section(&menu, 1), 0);
     }
 
     #[test]

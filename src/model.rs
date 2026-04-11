@@ -132,7 +132,7 @@ pub struct StatusOutput {
     pub current_account: Option<DisplayIdentity>,
     pub current_account_saved_id: Option<Uuid>,
     pub saved_accounts: usize,
-    pub process_warnings: Vec<String>,
+    pub process_warnings: Vec<RunningCodexProcess>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -157,7 +157,15 @@ pub enum SaveAction {
 #[derive(Clone, Debug, Serialize)]
 pub struct ActivateOutput {
     pub account: AccountView,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<RunningCodexProcess>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RunningCodexProcess {
+    pub pid: u32,
+    pub executable: String,
+    pub role: String,
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
