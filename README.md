@@ -55,19 +55,25 @@ cargo build --release
 
 Tagged releases publish prebuilt archives plus installer scripts on GitHub Releases.
 
-Current install paths:
-
-- Windows (PowerShell):
+- Windows: Install prebuilt binaries via PowerShell script
 
 ```text
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.0/codex-account-switcher-installer.ps1 | iex"
 ```
 
-- macOS / Linux / WSL (shell):
+- macOS / Linux / WSL: Install prebuilt binaries via shell script
 
 ```text
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.0/codex-account-switcher-installer.sh | sh
 ```
+
+Default installer location:
+
+- `~/.codex-account-switcher/bin`
+
+Override install location by setting:
+
+- `CODEX_ACCOUNT_SWITCHER_INSTALL_DIR`
 
 The release workflow builds these targets:
 
