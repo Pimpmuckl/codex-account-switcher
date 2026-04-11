@@ -51,11 +51,44 @@ Account labels come from the `id_token` payload:
 cargo build --release
 ```
 
+## Install
+
+Tagged releases publish prebuilt archives plus installer scripts on GitHub Releases.
+
+Current install paths:
+
+- Windows (PowerShell):
+
+```text
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.0/codex-account-switcher-installer.ps1 | iex"
+```
+
+- macOS / Linux / WSL (shell):
+
+```text
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.0/codex-account-switcher-installer.sh | sh
+```
+
+The release workflow builds these targets:
+
+- `x86_64-pc-windows-msvc`
+- `x86_64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+Release automation lives in:
+
+- `.github/workflows/ci.yml`
+- `.github/workflows/release.yml`
+
+To cut a release, bump `Cargo.toml` to the target version and push a matching tag like `v0.1.0`.
+
 ## Validation
 
 ```text
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
 ```
 
 ## Current Limits

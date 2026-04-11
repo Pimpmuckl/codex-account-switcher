@@ -2,6 +2,13 @@
 name = "codex-account-switcher"
 version = "0.1.0"
 edition = "2024"
+description = "Cross-platform CLI for saving and restoring Codex login snapshots"
+license = "MIT"
+repository = "https://github.com/Pimpmuckl/codex-account-switcher"
+homepage = "https://github.com/Pimpmuckl/codex-account-switcher"
+readme = "README.md"
+keywords = ["codex", "cli", "accounts", "cross-platform"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -18,3 +25,8 @@ uuid = { version = "1.23.0", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
