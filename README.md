@@ -27,6 +27,7 @@ codex-account-switcher
 codex-account-switcher status [--json]
 codex-account-switcher list [--json]
 codex-account-switcher save [--json]
+codex-account-switcher usage [ACCOUNT_ID] [--json]
 codex-account-switcher activate [ACCOUNT_ID] [--force] [--json]
 codex-account-switcher delete [ACCOUNT_ID] [--json]
 ```
@@ -34,8 +35,9 @@ codex-account-switcher delete [ACCOUNT_ID] [--json]
 ## Behavior
 
 - `save` snapshots the currently logged-in Codex account.
-- `list` shows saved accounts for the current environment.
+- `list` shows saved accounts for the current environment and includes weekly usage/reset data when it can read it from the saved snapshot.
 - `status` shows the live account, Codex root, saved-account count, and process warnings.
+- `usage` fetches current usage for the live account or for a saved account by id.
 - `activate` restores a saved snapshot. Reliable swaps require all Codex processes to be closed first; `--force` lets the command attempt activation anyway, but it still fails if the restored files do not stay stable.
 - `delete` removes the saved snapshot from the switcher store only.
 
@@ -110,3 +112,4 @@ cargo fmt --check
 - v1 supports only the existing live-login capture flow. It does not drive Codex login itself.
 - Saved snapshots are keyed by the current environment and current account identity.
 - Plan metadata is best effort and may be blank if the token does not expose a recognizable value.
+- Usage enrichment depends on saved `auth.json` tokens still being present and accepted by the Codex/OpenAI usage endpoints.

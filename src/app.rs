@@ -4,7 +4,9 @@ mod tui;
 use uuid::Uuid;
 
 use crate::env::AppEnv;
-use crate::model::{AccountView, DisplayIdentity, RunningCodexProcess, SavedAccountMetadata};
+use crate::model::{
+    AccountUsageView, AccountView, DisplayIdentity, RunningCodexProcess, SavedAccountMetadata,
+};
 use crate::repository::SnapshotRepository;
 
 pub struct App<S> {
@@ -19,7 +21,12 @@ pub enum InteractiveMode {
     DeleteOnce,
 }
 
-fn account_view(account: SavedAccountMetadata, active_id: Option<Uuid>) -> AccountView {
+fn account_view(
+    account: SavedAccountMetadata,
+    active_id: Option<Uuid>,
+    usage: Option<AccountUsageView>,
+    usage_error: Option<String>,
+) -> AccountView {
     AccountView {
         id: account.id,
         email: account.email,
@@ -31,6 +38,8 @@ fn account_view(account: SavedAccountMetadata, active_id: Option<Uuid>) -> Accou
         created_at: account.created_at,
         updated_at: account.updated_at,
         last_activated_at: account.last_activated_at,
+        usage: usage.or(account.cached_usage),
+        usage_error,
     }
 }
 

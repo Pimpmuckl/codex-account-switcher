@@ -7,7 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::model::{DisplayIdentity, EnvironmentKind, SavedAccountMetadata, SnapshotBlob};
+use crate::model::{
+    AccountUsageView, DisplayIdentity, EnvironmentKind, SavedAccountMetadata, SnapshotBlob,
+};
 use crate::secrets::SecretStore;
 use codec::{decode_snapshot, encode_snapshot};
 use index_store::MetadataIndexStore;
@@ -95,6 +97,7 @@ where
                 created_at: now,
                 updated_at: now,
                 last_activated_at: None,
+                cached_usage: None,
             };
             index.accounts.push(metadata.clone());
             (metadata, true)
@@ -125,6 +128,34 @@ where
             })?;
         let snapshot = decode_snapshot(&encoded_snapshot)?;
         Ok((metadata, snapshot))
+    }
+
+    pub fn replace_snapshot(
+        &self,
+        environment: &EnvironmentKind,
+        account_id: Uuid,
+        identity: &DisplayIdentity,
+        snapshot: &SnapshotBlob,
+        usage: Option<AccountUsageView>,
+    ) -> Result<SavedAccountMetadata> {
+        let mut index = self.index_store.load_index()?;
+        let position = index
+            .accounts
+            .iter()
+            .position(|account| account.id == account_id && &account.environment == environment)
+            .ok_or_else(|| anyhow!("saved account {account_id} not found"))?;
+        let encoded_snapshot = encode_snapshot(snapshot)?;
+        let account = &mut index.accounts[position];
+        account.email = identity.email.clone();
+        account.subject = identity.subject.clone();
+        account.name = identity.name.clone();
+        account.plan_label = identity.plan_label.clone();
+        account.cached_usage = usage;
+        let metadata = account.clone();
+        self.secret_store
+            .save(&metadata.secret_key, &encoded_snapshot)?;
+        self.index_store.save_index(&index)?;
+        Ok(metadata)
     }
 
     pub fn delete_snapshot(&self, environment: &EnvironmentKind, account_id: Uuid) -> Result<()> {

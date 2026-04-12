@@ -1,6 +1,7 @@
 use anyhow::{Context, Error, Result};
 use console::{Key, Term, style};
 use dialoguer::{Select, theme::ColorfulTheme};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::model::{AccountView, ListOutput, RunningCodexProcess, SaveAction, StatusOutput};
@@ -249,6 +250,18 @@ fn render_account_label(account: &AccountView) -> String {
         parts.push(format!("- Last activated {}", ts.date()));
     } else {
         parts.push(format!("- Saved on {}", account.updated_at.date()));
+    }
+    if let Some(usage) = &account.usage
+        && let Some(weekly) = &usage.weekly
+    {
+        if weekly.reset_at <= OffsetDateTime::now_utc() {
+            parts.push("- Weekly Reset passed".to_owned());
+        } else {
+            parts.push(format!("- Weekly Remaining: {}%", weekly.remaining_percent));
+            parts.push(format!("- Reset {}", weekly.reset_at.date()));
+        }
+    } else if account.usage_error.is_some() {
+        parts.push("- Usage unavailable".to_owned());
     }
     parts.join(" ")
 }
@@ -722,6 +735,8 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 updated_at: OffsetDateTime::UNIX_EPOCH,
                 last_activated_at: is_active.then_some(OffsetDateTime::UNIX_EPOCH),
+                usage: None,
+                usage_error: None,
             }],
         }
     }

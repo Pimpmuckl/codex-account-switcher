@@ -1,14 +1,16 @@
 use anyhow::{Context, Result};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::codex;
 use crate::env::AppEnv;
 use crate::model::{
     ActivateOutput, DeleteOutput, DisplayIdentity, ListOutput, RunningCodexProcess, SaveAction,
-    SaveOutput, SnapshotBlob, StatusOutput,
+    SaveOutput, SnapshotBlob, StatusOutput, UsageOutput, UsageSource,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::SecretStore;
+use crate::usage::{fetch_usage, usage_target_from_snapshot};
 
 use super::{
     App, account_view, match_saved_account, saved_identity, should_verify_activation_stability,
@@ -51,7 +53,7 @@ where
             environment: self.env.kind.clone(),
             accounts: accounts
                 .into_iter()
-                .map(|account| account_view(account, active_id))
+                .map(|account| account_view(account, active_id, None, None))
                 .collect(),
         })
     }
@@ -67,7 +69,7 @@ where
             self.repository
                 .save_snapshot(&self.env.kind, &live.identity, &live.snapshot)?;
         Ok(SaveOutput {
-            account: account_view(metadata.clone(), Some(metadata.id)),
+            account: account_view(metadata.clone(), Some(metadata.id), None, None),
             action: if created {
                 SaveAction::Created
             } else {
@@ -101,7 +103,7 @@ where
             .sync_activated_account(&self.env.kind, account_id, &snapshot_identity)
             .context("activated live auth but failed to update local metadata")?;
         Ok(ActivateOutput {
-            account: account_view(metadata, Some(account_id)),
+            account: account_view(metadata, Some(account_id), None, None),
             warnings,
         })
     }
@@ -132,6 +134,52 @@ where
         crate::process::detect_running_codex_processes()
     }
 
+    pub fn usage(&self, account_id: Option<Uuid>) -> Result<UsageOutput> {
+        match account_id {
+            Some(account_id) => {
+                let (snapshot, _, _) = self.load_activation_target(account_id)?;
+                let target = usage_target_from_snapshot(
+                    self.env.kind.clone(),
+                    snapshot,
+                    UsageSource::SavedAccessToken,
+                    true,
+                )?;
+                let (output, refreshed_snapshot) = fetch_usage(target)?;
+                self.repository.replace_snapshot(
+                    &self.env.kind,
+                    account_id,
+                    &output.account,
+                    &refreshed_snapshot,
+                    Some(output.usage.clone()),
+                )?;
+                Ok(output)
+            }
+            None => {
+                let live = codex::read_live_auth_bundle(&self.env).with_context(|| {
+                    format!(
+                        "no live Codex auth bundle found at {}",
+                        self.env.codex_root.display()
+                    )
+                })?;
+                let live_snapshot = live.snapshot.clone();
+                let target = usage_target_from_snapshot(
+                    self.env.kind.clone(),
+                    live.snapshot,
+                    UsageSource::LiveAccessToken,
+                    true,
+                )?;
+                let (output, refreshed_snapshot) = fetch_usage(target)?;
+                if refreshed_snapshot != live_snapshot
+                    && live_bundle_still_matches_snapshot(&self.env, &live_snapshot)
+                {
+                    codex::restore_snapshot(&self.env, &refreshed_snapshot, &output.account, false)
+                        .context("refreshed live auth but failed to update local auth files")?;
+                }
+                Ok(output)
+            }
+        }
+    }
+
     pub fn delete(&self, account_id: Uuid) -> Result<DeleteOutput> {
         self.repository
             .delete_snapshot(&self.env.kind, account_id)?;
@@ -139,6 +187,18 @@ where
             deleted_account_id: account_id,
         })
     }
+}
+
+fn live_bundle_still_matches_snapshot(env: &AppEnv, snapshot: &SnapshotBlob) -> bool {
+    for attempt in 0..3 {
+        if codex::live_bundle_matches_snapshot(env, snapshot).unwrap_or(false) {
+            return true;
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    false
 }
 
 #[cfg(test)]

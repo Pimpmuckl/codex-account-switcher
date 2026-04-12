@@ -27,13 +27,13 @@ impl std::fmt::Display for EnvironmentKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotBlob {
     pub schema_version: u32,
     pub files: Vec<SnapshotFile>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotFile {
     pub name: String,
     pub bytes_base64: String,
@@ -101,6 +101,8 @@ pub struct SavedAccountMetadata {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub last_activated_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub cached_usage: Option<AccountUsageView>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -111,7 +113,7 @@ pub struct MetadataIndex {
     pub accounts: Vec<SavedAccountMetadata>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountView {
     pub id: Uuid,
     pub email: String,
@@ -123,6 +125,8 @@ pub struct AccountView {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub last_activated_at: Option<OffsetDateTime>,
+    pub usage: Option<AccountUsageView>,
+    pub usage_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -139,6 +143,13 @@ pub struct StatusOutput {
 pub struct ListOutput {
     pub environment: EnvironmentKind,
     pub accounts: Vec<AccountView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageOutput {
+    pub environment: EnvironmentKind,
+    pub account: DisplayIdentity,
+    pub usage: AccountUsageView,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -171,4 +182,36 @@ pub struct RunningCodexProcess {
 #[derive(Clone, Debug, Serialize)]
 pub struct DeleteOutput {
     pub deleted_account_id: Uuid,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountUsageView {
+    pub source: UsageSource,
+    pub fetched_at: OffsetDateTime,
+    pub five_hour: Option<UsageWindowView>,
+    pub weekly: Option<UsageWindowView>,
+    pub credits: Option<CreditsView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsageWindowView {
+    pub used_percent: u8,
+    pub remaining_percent: u8,
+    pub reset_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreditsView {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource {
+    LiveAccessToken,
+    LiveRefreshToken,
+    SavedAccessToken,
+    SavedRefreshToken,
 }
