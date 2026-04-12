@@ -27,13 +27,13 @@ impl std::fmt::Display for EnvironmentKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotBlob {
     pub schema_version: u32,
     pub files: Vec<SnapshotFile>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotFile {
     pub name: String,
     pub bytes_base64: String,

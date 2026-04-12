@@ -160,13 +160,19 @@ where
                         self.env.codex_root.display()
                     )
                 })?;
+                let live_snapshot = live.snapshot.clone();
                 let target = usage_target_from_snapshot(
                     self.env.kind.clone(),
                     live.snapshot,
                     UsageSource::LiveAccessToken,
                     true,
                 )?;
-                Ok(fetch_usage(target)?.0)
+                let (output, refreshed_snapshot) = fetch_usage(target)?;
+                if refreshed_snapshot != live_snapshot {
+                    codex::restore_snapshot(&self.env, &refreshed_snapshot, &output.account, false)
+                        .context("refreshed live auth but failed to update local auth files")?;
+                }
+                Ok(output)
             }
         }
     }
