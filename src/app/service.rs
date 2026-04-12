@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::codex;
@@ -169,8 +170,7 @@ where
                 )?;
                 let (output, refreshed_snapshot) = fetch_usage(target)?;
                 if refreshed_snapshot != live_snapshot
-                    && codex::live_bundle_matches_snapshot(&self.env, &live_snapshot)
-                        .unwrap_or(false)
+                    && live_bundle_still_matches_snapshot(&self.env, &live_snapshot)
                 {
                     codex::restore_snapshot(&self.env, &refreshed_snapshot, &output.account, false)
                         .context("refreshed live auth but failed to update local auth files")?;
@@ -187,6 +187,13 @@ where
             deleted_account_id: account_id,
         })
     }
+}
+
+fn live_bundle_still_matches_snapshot(env: &AppEnv, snapshot: &SnapshotBlob) -> bool {
+    codex::live_bundle_matches_snapshot(env, snapshot).unwrap_or_else(|_| {
+        std::thread::sleep(Duration::from_millis(25));
+        codex::live_bundle_matches_snapshot(env, snapshot).unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
