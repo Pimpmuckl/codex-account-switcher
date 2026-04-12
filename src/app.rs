@@ -38,7 +38,7 @@ fn account_view(
         created_at: account.created_at,
         updated_at: account.updated_at,
         last_activated_at: account.last_activated_at,
-        usage,
+        usage: usage.or(account.cached_usage),
         usage_error,
     }
 }

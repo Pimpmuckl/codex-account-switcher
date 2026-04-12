@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::app::{App, InteractiveMode};
@@ -197,11 +198,15 @@ fn render_account_summary(account: &AccountView) -> String {
     if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
-        line.push_str(&format!(
-            " [weekly remaining: {}%, reset {}]",
-            weekly.remaining_percent,
-            weekly.reset_at.date()
-        ));
+        if weekly.reset_at <= OffsetDateTime::now_utc() {
+            line.push_str(" [weekly reset passed]");
+        } else {
+            line.push_str(&format!(
+                " [weekly remaining: {}%, reset {}]",
+                weekly.remaining_percent,
+                weekly.reset_at.date()
+            ));
+        }
     } else if account.usage_error.is_some() {
         line.push_str(" [usage unavailable]");
     }

@@ -1,13 +1,11 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::codex;
 use crate::env::AppEnv;
 use crate::model::{
-    AccountUsageView, ActivateOutput, DeleteOutput, DisplayIdentity, ListOutput,
-    RunningCodexProcess, SaveAction, SaveOutput, SnapshotBlob, StatusOutput, UsageOutput,
-    UsageSource,
+    ActivateOutput, DeleteOutput, DisplayIdentity, ListOutput, RunningCodexProcess, SaveAction,
+    SaveOutput, SnapshotBlob, StatusOutput, UsageOutput, UsageSource,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::SecretStore;
@@ -17,12 +15,6 @@ use super::{
     App, account_view, match_saved_account, saved_identity, should_verify_activation_stability,
     subject_bound_identity_matches,
 };
-
-struct AccountUsageStateOwned {
-    usage: Option<AccountUsageView>,
-    usage_error: Option<String>,
-    identity: Option<DisplayIdentity>,
-}
 
 impl<S> App<S>
 where
@@ -56,24 +48,11 @@ where
             .as_ref()
             .and_then(|bundle| match_saved_account(&accounts, &bundle.identity))
             .map(|account| account.id);
-        let usage = self.saved_account_usage(&accounts);
         Ok(ListOutput {
             environment: self.env.kind.clone(),
             accounts: accounts
                 .into_iter()
-                .map(|mut account| {
-                    let state = usage.get(&account.id);
-                    if let Some(identity) = state.and_then(|state| state.identity.as_ref()) {
-                        account.email = identity.email.clone();
-                        account.subject = identity.subject.clone();
-                        account.name = identity.name.clone();
-                        account.plan_label = identity.plan_label.clone();
-                    }
-                    let (usage, usage_error) = state
-                        .map(|state| (state.usage.clone(), state.usage_error.clone()))
-                        .unwrap_or((None, None));
-                    account_view(account, active_id, usage, usage_error)
-                })
+                .map(|account| account_view(account, active_id, None, None))
                 .collect(),
         })
     }
@@ -157,12 +136,12 @@ where
     pub fn usage(&self, account_id: Option<Uuid>) -> Result<UsageOutput> {
         match account_id {
             Some(account_id) => {
-                let (metadata, snapshot) =
-                    self.repository.load_snapshot(&self.env.kind, account_id)?;
+                let (_, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
                 let target = usage_target_from_snapshot(
                     self.env.kind.clone(),
                     snapshot,
                     UsageSource::SavedAccessToken,
+                    true,
                 )?;
                 let (output, refreshed_snapshot) = fetch_usage(target)?;
                 self.repository.replace_snapshot(
@@ -171,7 +150,11 @@ where
                     &output.account,
                     &refreshed_snapshot,
                 )?;
-                let _ = metadata;
+                self.repository.update_cached_usage(
+                    &self.env.kind,
+                    account_id,
+                    Some(output.usage.clone()),
+                )?;
                 Ok(output)
             }
             None => {
@@ -185,6 +168,7 @@ where
                     self.env.kind.clone(),
                     live.snapshot,
                     UsageSource::LiveAccessToken,
+                    false,
                 )?;
                 Ok(fetch_usage(target)?.0)
             }
@@ -197,57 +181,6 @@ where
         Ok(DeleteOutput {
             deleted_account_id: account_id,
         })
-    }
-
-    fn saved_account_usage(
-        &self,
-        accounts: &[crate::model::SavedAccountMetadata],
-    ) -> HashMap<Uuid, AccountUsageStateOwned> {
-        let mut usage_by_account = HashMap::with_capacity(accounts.len());
-        for account in accounts {
-            let usage = match self.repository.load_snapshot(&self.env.kind, account.id) {
-                Ok((_, snapshot)) => {
-                    match usage_target_from_snapshot(
-                        self.env.kind.clone(),
-                        snapshot,
-                        UsageSource::SavedAccessToken,
-                    ) {
-                        Ok(target) => match fetch_usage(target) {
-                            Ok((output, refreshed_snapshot)) => {
-                                let _ = self.repository.replace_snapshot(
-                                    &self.env.kind,
-                                    account.id,
-                                    &output.account,
-                                    &refreshed_snapshot,
-                                );
-                                AccountUsageStateOwned {
-                                    usage: Some(output.usage),
-                                    usage_error: None,
-                                    identity: Some(output.account),
-                                }
-                            }
-                            Err(error) => AccountUsageStateOwned {
-                                usage: None,
-                                usage_error: Some(format!("{error:#}")),
-                                identity: None,
-                            },
-                        },
-                        Err(error) => AccountUsageStateOwned {
-                            usage: None,
-                            usage_error: Some(format!("{error:#}")),
-                            identity: None,
-                        },
-                    }
-                }
-                Err(error) => AccountUsageStateOwned {
-                    usage: None,
-                    usage_error: Some(format!("{error:#}")),
-                    identity: None,
-                },
-            };
-            usage_by_account.insert(account.id, usage);
-        }
-        usage_by_account
     }
 }
 

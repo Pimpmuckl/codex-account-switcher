@@ -24,6 +24,7 @@ pub struct UsageTarget {
     pub identity: DisplayIdentity,
     pub snapshot: SnapshotBlob,
     pub source: UsageSource,
+    pub allow_refresh: bool,
 }
 
 pub fn fetch_usage(target: UsageTarget) -> Result<(UsageOutput, SnapshotBlob)> {
@@ -32,7 +33,7 @@ pub fn fetch_usage(target: UsageTarget) -> Result<(UsageOutput, SnapshotBlob)> {
 
     let response = match fetch_usage_response(&auth.access_token, auth.account_id.as_deref()) {
         Ok(response) => response,
-        Err(error) if should_refresh_after_error(&error, &auth) => {
+        Err(error) if target.allow_refresh && should_refresh_after_error(&error, &auth) => {
             auth = refresh_auth(&auth)?;
             source = refresh_source(source);
             fetch_usage_response(&auth.access_token, auth.account_id.as_deref())?
@@ -352,6 +353,7 @@ pub fn usage_target_from_snapshot(
     environment: EnvironmentKind,
     snapshot: SnapshotBlob,
     source: UsageSource,
+    allow_refresh: bool,
 ) -> Result<UsageTarget> {
     let auth_file = snapshot
         .files
@@ -367,5 +369,6 @@ pub fn usage_target_from_snapshot(
         identity,
         snapshot,
         source,
+        allow_refresh,
     })
 }

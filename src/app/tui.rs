@@ -1,6 +1,7 @@
 use anyhow::{Context, Error, Result};
 use console::{Key, Term, style};
 use dialoguer::{Select, theme::ColorfulTheme};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::model::{AccountView, ListOutput, RunningCodexProcess, SaveAction, StatusOutput};
@@ -253,8 +254,12 @@ fn render_account_label(account: &AccountView) -> String {
     if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
-        parts.push(format!("- Weekly Remaining: {}%", weekly.remaining_percent));
-        parts.push(format!("- Reset {}", weekly.reset_at.date()));
+        if weekly.reset_at <= OffsetDateTime::now_utc() {
+            parts.push("- Weekly Reset passed".to_owned());
+        } else {
+            parts.push(format!("- Weekly Remaining: {}%", weekly.remaining_percent));
+            parts.push(format!("- Reset {}", weekly.reset_at.date()));
+        }
     } else if account.usage_error.is_some() {
         parts.push("- Usage unavailable".to_owned());
     }

@@ -101,6 +101,8 @@ pub struct SavedAccountMetadata {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub last_activated_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub cached_usage: Option<AccountUsageView>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -111,7 +113,7 @@ pub struct MetadataIndex {
     pub accounts: Vec<SavedAccountMetadata>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountView {
     pub id: Uuid,
     pub email: String,
@@ -182,7 +184,7 @@ pub struct DeleteOutput {
     pub deleted_account_id: Uuid,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountUsageView {
     pub source: UsageSource,
     pub fetched_at: OffsetDateTime,
@@ -191,21 +193,21 @@ pub struct AccountUsageView {
     pub credits: Option<CreditsView>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsageWindowView {
     pub used_percent: u8,
     pub remaining_percent: u8,
     pub reset_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreditsView {
     pub has_credits: bool,
     pub unlimited: bool,
     pub balance: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageSource {
     LiveAccessToken,
