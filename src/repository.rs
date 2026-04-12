@@ -1,25 +1,19 @@
-use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::Path;
+
+mod codec;
+mod index_store;
 
 use anyhow::{Context, Result, anyhow};
-use flate2::Compression;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::model::{
-    DisplayIdentity, EnvironmentKind, METADATA_SCHEMA_VERSION, MetadataIndex, SavedAccountMetadata,
-    SnapshotBlob,
-};
+use crate::model::{DisplayIdentity, EnvironmentKind, SavedAccountMetadata, SnapshotBlob};
 use crate::secrets::SecretStore;
-
-const SNAPSHOT_ENCODING_V1_MAGIC: &[u8] = b"cas-snapshot-v1\n";
+use codec::{decode_snapshot, encode_snapshot};
+use index_store::MetadataIndexStore;
 
 pub struct SnapshotRepository<S> {
-    metadata_path: PathBuf,
+    index_store: MetadataIndexStore,
     secret_store: S,
 }
 
@@ -29,7 +23,7 @@ where
 {
     pub fn new(data_dir: &Path, secret_store: S) -> Self {
         Self {
-            metadata_path: data_dir.join("metadata.json"),
+            index_store: MetadataIndexStore::new(data_dir),
             secret_store,
         }
     }
@@ -39,6 +33,7 @@ where
         environment: &EnvironmentKind,
     ) -> Result<Vec<SavedAccountMetadata>> {
         let mut accounts = self
+            .index_store
             .load_index()?
             .accounts
             .into_iter()
@@ -65,7 +60,7 @@ where
         identity: &DisplayIdentity,
         snapshot: &SnapshotBlob,
     ) -> Result<(SavedAccountMetadata, bool)> {
-        let mut index = self.load_index()?;
+        let mut index = self.index_store.load_index()?;
         let now = OffsetDateTime::now_utc();
         let encoded_snapshot = encode_snapshot(snapshot)?;
         let existing_index = index.accounts.iter().position(|account| {
@@ -107,7 +102,7 @@ where
 
         self.secret_store
             .save(&metadata.secret_key, &encoded_snapshot)?;
-        self.save_index(&index)?;
+        self.index_store.save_index(&index)?;
         Ok((metadata, created))
     }
 
@@ -133,7 +128,7 @@ where
     }
 
     pub fn delete_snapshot(&self, environment: &EnvironmentKind, account_id: Uuid) -> Result<()> {
-        let mut index = self.load_index()?;
+        let mut index = self.index_store.load_index()?;
         let Some(position) = index
             .accounts
             .iter()
@@ -146,7 +141,7 @@ where
         if let Err(error) = self.secret_store.delete(&metadata.secret_key) {
             return Err(error).context("failed to delete saved snapshot data");
         }
-        if let Err(error) = self.save_index(&index) {
+        if let Err(error) = self.index_store.save_index(&index) {
             if let Some(serialized_snapshot) = deleted_secret.as_deref()
                 && let Err(restore_error) = self
                     .secret_store
@@ -167,7 +162,7 @@ where
         account_id: Uuid,
         identity: &DisplayIdentity,
     ) -> Result<SavedAccountMetadata> {
-        let mut index = self.load_index()?;
+        let mut index = self.index_store.load_index()?;
         let now = OffsetDateTime::now_utc();
         let Some(account_position) = index
             .accounts
@@ -211,286 +206,35 @@ where
         account.last_activated_at = Some(now);
         account.updated_at = now;
         let updated = account.clone();
-        self.save_index(&index)?;
+        self.index_store.save_index(&index)?;
         for duplicate in duplicates {
             let _ = self.secret_store.delete(&duplicate.secret_key);
         }
         Ok(updated)
     }
-
-    fn load_index(&self) -> Result<MetadataIndex> {
-        match self.best_available_index()? {
-            Some(index) => Ok(index),
-            None => Ok(MetadataIndex {
-                schema_version: METADATA_SCHEMA_VERSION,
-                write_generation: 0,
-                accounts: Vec::new(),
-            }),
-        }
-    }
-
-    fn save_index(&self, index: &MetadataIndex) -> Result<()> {
-        if let Some(parent) = self.metadata_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let pending_path = self.metadata_path.with_extension("json.pending");
-        let mut persisted = index.clone();
-        persisted.write_generation = index.write_generation.saturating_add(1);
-        let json =
-            serde_json::to_string_pretty(&persisted).context("failed to serialize metadata")?;
-        let temp_path = self
-            .metadata_path
-            .with_extension(format!("json.tmp-{}", Uuid::new_v4().simple()));
-        let backup_path = self
-            .metadata_path
-            .with_extension(format!("json.bak-{}", Uuid::new_v4().simple()));
-        fs::write(&pending_path, &json)
-            .with_context(|| format!("failed to write {}", pending_path.display()))?;
-        if let Err(error) = fs::write(&temp_path, &json) {
-            let _ = self.cleanup_recovery_paths(&pending_path, &temp_path, None);
-            return Err(error).with_context(|| format!("failed to write {}", temp_path.display()));
-        }
-        if !self.metadata_path.exists() {
-            if let Err(error) = fs::rename(&temp_path, &self.metadata_path) {
-                let _ = self.cleanup_recovery_paths(&pending_path, &temp_path, None);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to replace {} with {}",
-                        self.metadata_path.display(),
-                        temp_path.display()
-                    )
-                });
-            }
-            let _ = self.cleanup_recovery_paths(&pending_path, &temp_path, None);
-            return Ok(());
-        }
-
-        if let Err(error) = fs::rename(&self.metadata_path, &backup_path) {
-            let _ = self.cleanup_recovery_paths(&pending_path, &temp_path, None);
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to rotate {} to {}",
-                    self.metadata_path.display(),
-                    backup_path.display()
-                )
-            });
-        }
-
-        match fs::rename(&temp_path, &self.metadata_path) {
-            Ok(()) => {
-                let _ = self.cleanup_recovery_paths(&pending_path, &temp_path, Some(&backup_path));
-                Ok(())
-            }
-            Err(error) => {
-                let rollback_succeeded = fs::rename(&backup_path, &self.metadata_path).is_ok();
-                if rollback_succeeded {
-                    let _ =
-                        self.cleanup_recovery_paths(&pending_path, &temp_path, Some(&backup_path));
-                }
-                Err(error).with_context(|| {
-                    format!(
-                        "failed to replace {} with {}",
-                        self.metadata_path.display(),
-                        temp_path.display()
-                    )
-                })
-            }
-        }
-    }
-
-    fn best_available_index(&self) -> Result<Option<MetadataIndex>> {
-        let Some(parent) = self.metadata_path.parent() else {
-            return Ok(None);
-        };
-        if !parent.exists() {
-            return Ok(None);
-        }
-        let Some(file_name) = self
-            .metadata_path
-            .file_name()
-            .and_then(|value| value.to_str())
-        else {
-            return Ok(None);
-        };
-        let canonical_name = file_name.to_owned();
-        let temp_prefix = format!("{file_name}.tmp");
-        let backup_prefix = format!("{file_name}.bak");
-        let mut saw_candidate = false;
-        let mut entries = fs::read_dir(parent)
-            .with_context(|| format!("failed to read {}", parent.display()))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.file_name().to_str().is_some_and(|name| {
-                    name == canonical_name
-                        || name.starts_with(&backup_prefix)
-                        || name.starts_with(&temp_prefix)
-                })
-            })
-            .filter_map(|entry| {
-                saw_candidate = true;
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_str()?.to_owned();
-                let raw = fs::read_to_string(&path).ok()?;
-                let mut index: MetadataIndex = serde_json::from_str(&raw).ok()?;
-                if index.schema_version == 0 {
-                    index.schema_version = METADATA_SCHEMA_VERSION;
-                }
-                if index.schema_version != METADATA_SCHEMA_VERSION {
-                    return None;
-                }
-                let modified = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                let kind = if name == canonical_name {
-                    RecoveryKind::Canonical
-                } else if name.starts_with(&backup_prefix) {
-                    RecoveryKind::Backup
-                } else if name.starts_with(&temp_prefix) {
-                    RecoveryKind::Temp
-                } else {
-                    return None;
-                };
-                Some(RecoveryCandidate {
-                    kind,
-                    write_generation: index.write_generation,
-                    modified,
-                    index,
-                })
-            })
-            .collect::<Vec<_>>();
-        if let Some(pending) =
-            parse_recovery_candidate(&self.metadata_path.with_extension("json.pending"))
-        {
-            saw_candidate = true;
-            entries.push(pending);
-        }
-        if saw_candidate && entries.is_empty() {
-            return Err(anyhow!(
-                "failed to parse metadata recovery state under {}",
-                parent.display()
-            ));
-        }
-        if let Some(canonical) = entries
-            .iter()
-            .find(|entry| matches!(entry.kind, RecoveryKind::Canonical))
-        {
-            if let Some(pending) = entries.iter().find(|entry| {
-                matches!(entry.kind, RecoveryKind::Pending)
-                    && entry.write_generation > canonical.write_generation
-            }) {
-                return Ok(Some(pending.index.clone()));
-            }
-            return Ok(Some(canonical.index.clone()));
-        }
-        entries.sort_by(|left, right| {
-            right
-                .write_generation
-                .cmp(&left.write_generation)
-                .then_with(|| right.modified.cmp(&left.modified))
-                .then_with(|| recovery_priority(right.kind).cmp(&recovery_priority(left.kind)))
-        });
-        Ok(entries.first().map(|entry| entry.index.clone()))
-    }
-
-    fn cleanup_recovery_paths(
-        &self,
-        pending_path: &Path,
-        temp_path: &Path,
-        backup_path: Option<&Path>,
-    ) -> Result<()> {
-        let _ = fs::remove_file(pending_path);
-        let _ = fs::remove_file(temp_path);
-        if let Some(backup_path) = backup_path {
-            let _ = fs::remove_file(backup_path);
-        }
-        Ok(())
-    }
 }
 
-fn encode_snapshot(snapshot: &SnapshotBlob) -> Result<Vec<u8>> {
-    let serialized = serde_json::to_vec(snapshot).context("failed to serialize snapshot")?;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(&serialized)
-        .context("failed to compress snapshot")?;
-    let compressed = encoder.finish().context("failed to finalize snapshot")?;
-    let mut encoded = Vec::with_capacity(SNAPSHOT_ENCODING_V1_MAGIC.len() + compressed.len());
-    encoded.extend_from_slice(SNAPSHOT_ENCODING_V1_MAGIC);
-    encoded.extend_from_slice(&compressed);
-    Ok(encoded)
-}
-
-fn decode_snapshot(encoded: &[u8]) -> Result<SnapshotBlob> {
-    if let Some(compressed) = encoded.strip_prefix(SNAPSHOT_ENCODING_V1_MAGIC) {
-        let mut decoder = GzDecoder::new(compressed);
-        let mut serialized = Vec::new();
-        decoder
-            .read_to_end(&mut serialized)
-            .context("failed to decompress stored snapshot")?;
-        return serde_json::from_slice(&serialized).context("failed to parse stored snapshot");
+#[cfg(test)]
+impl<S> SnapshotRepository<S>
+where
+    S: SecretStore,
+{
+    fn best_available_index(&self) -> Result<Option<crate::model::MetadataIndex>> {
+        self.index_store.best_available_index()
     }
-
-    serde_json::from_slice(encoded).context("failed to parse stored snapshot")
-}
-
-#[derive(Clone, Copy)]
-enum RecoveryKind {
-    Canonical,
-    Pending,
-    Temp,
-    Backup,
-}
-
-struct RecoveryCandidate {
-    kind: RecoveryKind,
-    write_generation: u64,
-    modified: SystemTime,
-    index: MetadataIndex,
-}
-
-fn recovery_priority(kind: RecoveryKind) -> u8 {
-    match kind {
-        RecoveryKind::Canonical => 3,
-        RecoveryKind::Pending => 2,
-        RecoveryKind::Temp => 1,
-        RecoveryKind::Backup => 0,
-    }
-}
-
-fn parse_recovery_candidate(path: &Path) -> Option<RecoveryCandidate> {
-    let _ = path.file_name()?.to_str()?;
-    let raw = fs::read_to_string(path).ok()?;
-    let mut index: MetadataIndex = serde_json::from_str(&raw).ok()?;
-    if index.schema_version == 0 {
-        index.schema_version = METADATA_SCHEMA_VERSION;
-    }
-    if index.schema_version != METADATA_SCHEMA_VERSION {
-        return None;
-    }
-    let modified = path
-        .metadata()
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    Some(RecoveryCandidate {
-        kind: RecoveryKind::Pending,
-        write_generation: index.write_generation,
-        modified,
-        index,
-    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use anyhow::{Result, anyhow};
     use tempfile::tempdir;
     use time::Duration;
 
     use super::*;
+    use crate::model::{METADATA_SCHEMA_VERSION, MetadataIndex};
+    use crate::repository::codec::SNAPSHOT_ENCODING_V1_MAGIC;
     use crate::secrets::{SecretStore, test_support::MemorySecretStore};
 
     fn identity(email: &str, subject: &str) -> DisplayIdentity {
@@ -693,6 +437,17 @@ mod tests {
             .best_available_index()
             .expect_err("invalid recovery state should fail");
         assert!(format!("{error:#}").contains("failed to parse metadata recovery state"));
+    }
+
+    #[test]
+    fn ignores_invalid_pending_metadata_when_no_other_index_exists() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+
+        fs::write(temp.path().join("metadata.json.pending"), "{not-json").expect("write pending");
+
+        let index = repo.best_available_index().expect("pending-only recovery");
+        assert!(index.is_none());
     }
 
     #[test]

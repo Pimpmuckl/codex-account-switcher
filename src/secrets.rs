@@ -2,13 +2,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::file_store::{RecoveryFileKind, list_recovery_files, replace_file_with_recovery};
+use crate::model::SnapshotBlob;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use flate2::read::GzDecoder;
-use uuid::Uuid;
-
-use crate::model::SnapshotBlob;
 
 const SNAPSHOT_ENCODING_V1_MAGIC: &[u8] = b"cas-snapshot-v1\n";
 
@@ -43,26 +42,15 @@ impl LocalSecretStore {
     }
 
     fn recovery_paths(&self, path: &Path) -> Result<Vec<PathBuf>> {
-        if !self.root_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            return Ok(Vec::new());
-        };
-        let backup_prefix = format!("{file_name}.bak-");
-        let temp_prefix = format!("{file_name}.tmp-");
-        let mut candidates = fs::read_dir(&self.root_dir)
-            .with_context(|| format!("failed to read {}", self.root_dir.display()))?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let name = entry.file_name();
-                let name = name.to_str()?;
-                if name.starts_with(&backup_prefix) || name.starts_with(&temp_prefix) {
-                    Some(entry.path())
-                } else {
-                    None
-                }
+        let mut candidates = list_recovery_files(path, None)?
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.kind,
+                    RecoveryFileKind::Temp | RecoveryFileKind::Backup
+                )
             })
+            .map(|entry| entry.path)
             .collect::<Vec<_>>();
         candidates.sort_by_key(|candidate| {
             fs::metadata(candidate)
@@ -76,48 +64,9 @@ impl LocalSecretStore {
     fn save_local(&self, key: &str, value: &[u8]) -> Result<()> {
         ensure_store_dir(&self.root_dir)?;
         let path = self.path_for_key(key);
-        let temp_path = self.root_dir.join(format!(
-            "{}.tmp-{}",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("snapshot"),
-            Uuid::new_v4().simple()
-        ));
-        let backup_path = self.root_dir.join(format!(
-            "{}.bak-{}",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("snapshot"),
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&temp_path, value)?;
-
-        if !path.exists() {
-            if let Err(error) = fs::rename(&temp_path, &path) {
-                let _ = fs::remove_file(&temp_path);
-                return Err(error).with_context(|| format!("failed to persist {}", path.display()));
-            }
-            return Ok(());
-        }
-
-        if let Err(error) = fs::rename(&path, &backup_path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to prepare existing snapshot {} for replacement",
-                    path.display()
-                )
-            });
-        }
-
-        if let Err(error) = fs::rename(&temp_path, &path) {
-            let _ = fs::rename(&backup_path, &path);
-            let _ = fs::remove_file(&temp_path);
-            return Err(error).with_context(|| format!("failed to persist {}", path.display()));
-        }
-
-        let _ = fs::remove_file(&backup_path);
-        Ok(())
+        replace_file_with_recovery(&path, None, |temp_path| {
+            write_private_file(temp_path, value)
+        })
     }
 
     fn load_local(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -176,8 +125,8 @@ impl LocalSecretStore {
 
     fn delete_local(&self, key: &str) -> Result<()> {
         let path = self.path_for_key(key);
-        let mut targets = vec![path.clone()];
-        targets.extend(self.recovery_paths(&path)?);
+        let mut targets = vec![path];
+        targets.extend(self.recovery_paths(&targets[0])?);
         let mut first_error = None;
         for target in targets {
             match fs::remove_file(&target) {

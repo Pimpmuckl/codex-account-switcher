@@ -2,6 +2,7 @@ pub mod app;
 pub mod cli;
 pub mod codex;
 pub mod env;
+pub mod file_store;
 pub mod identity;
 pub mod model;
 pub mod process;
