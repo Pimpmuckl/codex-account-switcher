@@ -319,7 +319,7 @@ fn write_private_file(path: &Path, value: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to write {}", path.display()))?;
         file.write_all(value)
             .with_context(|| format!("failed to write {}", path.display()))?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
