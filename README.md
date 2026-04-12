@@ -6,7 +6,7 @@ Cross-platform CLI for saving and restoring Codex login snapshots.
 
 - Works as a Rust single-binary CLI.
 - Targets Windows, WSL, Linux, and macOS.
-- Uses the OS keychain for saved snapshots.
+- Stores saved snapshots locally under the switcher app-data directory.
 - Treats each environment separately. Windows and WSL do not share state.
 
 ## What It Switches
@@ -27,7 +27,7 @@ codex-account-switcher
 codex-account-switcher status [--json]
 codex-account-switcher list [--json]
 codex-account-switcher save [--json]
-codex-account-switcher activate [ACCOUNT_ID] [--json]
+codex-account-switcher activate [ACCOUNT_ID] [--force] [--json]
 codex-account-switcher delete [ACCOUNT_ID] [--json]
 ```
 
@@ -36,8 +36,16 @@ codex-account-switcher delete [ACCOUNT_ID] [--json]
 - `save` snapshots the currently logged-in Codex account.
 - `list` shows saved accounts for the current environment.
 - `status` shows the live account, Codex root, saved-account count, and process warnings.
-- `activate` restores a saved snapshot and warns if Codex appears to be running.
+- `activate` restores a saved snapshot. Reliable swaps require all Codex processes to be closed first; `--force` lets the command attempt activation anyway, but it still fails if the restored files do not stay stable.
 - `delete` removes the saved snapshot from the switcher store only.
+
+Saved snapshot data lives in the app-data directory for the current environment:
+
+- Windows: `%LOCALAPPDATA%\\nextide\\codex-account-switcher`
+- macOS: `~/Library/Application Support/nextide/codex-account-switcher`
+- Linux / WSL: `${XDG_DATA_HOME:-~/.local/share}/nextide/codex-account-switcher`
+
+Older keyring-backed snapshots are migrated into the local store on first use when they are still readable. Metadata rows created by the broken mock-backed builds still need to be re-saved once.
 
 Account labels come from the `id_token` payload:
 
@@ -58,13 +66,13 @@ Tagged releases publish prebuilt archives plus installer scripts on GitHub Relea
 - Windows: Install prebuilt binaries via PowerShell script
 
 ```text
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.0/codex-account-switcher-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.1/codex-account-switcher-installer.ps1 | iex"
 ```
 
 - macOS / Linux / WSL: Install prebuilt binaries via shell script
 
 ```text
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.0/codex-account-switcher-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.1/codex-account-switcher-installer.sh | sh
 ```
 
 Default installer location:
@@ -87,7 +95,7 @@ Release automation lives in:
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 
-To cut a release, bump `Cargo.toml` to the target version and push a matching tag like `v0.1.0`.
+To cut a release, bump `Cargo.toml` to the target version and push a matching tag like `v0.1.1`.
 
 ## Validation
 

@@ -1,8 +1,12 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -11,6 +15,8 @@ use crate::model::{
     SnapshotBlob,
 };
 use crate::secrets::SecretStore;
+
+const SNAPSHOT_ENCODING_V1_MAGIC: &[u8] = b"cas-snapshot-v1\n";
 
 pub struct SnapshotRepository<S> {
     metadata_path: PathBuf,
@@ -61,8 +67,7 @@ where
     ) -> Result<(SavedAccountMetadata, bool)> {
         let mut index = self.load_index()?;
         let now = OffsetDateTime::now_utc();
-        let serialized_snapshot =
-            serde_json::to_string(snapshot).context("failed to serialize snapshot")?;
+        let encoded_snapshot = encode_snapshot(snapshot)?;
         let existing_index = index.accounts.iter().position(|account| {
             &account.environment == environment
                 && DisplayIdentity {
@@ -101,7 +106,7 @@ where
         };
 
         self.secret_store
-            .save(&metadata.secret_key, &serialized_snapshot)?;
+            .save(&metadata.secret_key, &encoded_snapshot)?;
         self.save_index(&index)?;
         Ok((metadata, created))
     }
@@ -114,12 +119,16 @@ where
         let metadata = self
             .get_account(environment, account_id)?
             .ok_or_else(|| anyhow!("saved account {account_id} not found"))?;
-        let serialized_snapshot = self
+        let encoded_snapshot = self
             .secret_store
             .load(&metadata.secret_key)?
-            .ok_or_else(|| anyhow!("snapshot secret missing for {}", metadata.email))?;
-        let snapshot: SnapshotBlob = serde_json::from_str(&serialized_snapshot)
-            .context("failed to parse stored snapshot")?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "saved snapshot data missing for {}. Re-save that account while logged into it.",
+                    metadata.email
+                )
+            })?;
+        let snapshot = decode_snapshot(&encoded_snapshot)?;
         Ok((metadata, snapshot))
     }
 
@@ -135,7 +144,7 @@ where
         let metadata = index.accounts.remove(position);
         let deleted_secret = self.secret_store.load(&metadata.secret_key).ok().flatten();
         if let Err(error) = self.secret_store.delete(&metadata.secret_key) {
-            return Err(error).context("failed to delete snapshot secret");
+            return Err(error).context("failed to delete saved snapshot data");
         }
         if let Err(error) = self.save_index(&index) {
             if let Some(serialized_snapshot) = deleted_secret.as_deref()
@@ -144,7 +153,7 @@ where
                     .save(&metadata.secret_key, serialized_snapshot)
             {
                 return Err(anyhow!(
-                    "failed to persist deleted metadata and failed to restore snapshot secret: {error:#}; restore error: {restore_error:#}"
+                    "failed to persist deleted metadata and failed to restore saved snapshot data: {error:#}; restore error: {restore_error:#}"
                 ));
             }
             return Err(error);
@@ -402,6 +411,32 @@ where
     }
 }
 
+fn encode_snapshot(snapshot: &SnapshotBlob) -> Result<Vec<u8>> {
+    let serialized = serde_json::to_vec(snapshot).context("failed to serialize snapshot")?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&serialized)
+        .context("failed to compress snapshot")?;
+    let compressed = encoder.finish().context("failed to finalize snapshot")?;
+    let mut encoded = Vec::with_capacity(SNAPSHOT_ENCODING_V1_MAGIC.len() + compressed.len());
+    encoded.extend_from_slice(SNAPSHOT_ENCODING_V1_MAGIC);
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+fn decode_snapshot(encoded: &[u8]) -> Result<SnapshotBlob> {
+    if let Some(compressed) = encoded.strip_prefix(SNAPSHOT_ENCODING_V1_MAGIC) {
+        let mut decoder = GzDecoder::new(compressed);
+        let mut serialized = Vec::new();
+        decoder
+            .read_to_end(&mut serialized)
+            .context("failed to decompress stored snapshot")?;
+        return serde_json::from_slice(&serialized).context("failed to parse stored snapshot");
+    }
+
+    serde_json::from_slice(encoded).context("failed to parse stored snapshot")
+}
+
 #[derive(Clone, Copy)]
 enum RecoveryKind {
     Canonical,
@@ -508,11 +543,11 @@ mod tests {
     }
 
     impl SecretStore for FailingDeleteSecretStore {
-        fn save(&self, key: &str, value: &str) -> Result<()> {
+        fn save(&self, key: &str, value: &[u8]) -> Result<()> {
             self.inner.save(key, value)
         }
 
-        fn load(&self, key: &str) -> Result<Option<String>> {
+        fn load(&self, key: &str) -> Result<Option<Vec<u8>>> {
             self.inner.load(key)
         }
 
@@ -538,7 +573,7 @@ mod tests {
             .delete_snapshot(&env, saved.id)
             .expect_err("delete should fail");
         let rendered = format!("{error:#}");
-        assert!(rendered.contains("failed to delete snapshot secret"));
+        assert!(rendered.contains("failed to delete saved snapshot data"));
         assert!(rendered.contains("delete failed"));
         let restored = repo.get_account(&env, saved.id).expect("get account");
         assert!(restored.is_some());
@@ -890,5 +925,73 @@ mod tests {
                 .expect("load duplicate secret")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn save_snapshot_stores_compressed_payload_and_loads_it_back() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+        let env = EnvironmentKind::Windows;
+        let snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![
+                crate::model::SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: "auth-payload".to_owned(),
+                },
+                crate::model::SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: "cap-payload".to_owned(),
+                },
+            ],
+        };
+
+        let (saved, _) = repo
+            .save_snapshot(&env, &identity("person@example.com", "sub-1"), &snapshot)
+            .expect("save");
+        let raw = repo
+            .secret_store
+            .load(&saved.secret_key)
+            .expect("load stored payload")
+            .expect("stored payload");
+        assert!(raw.starts_with(SNAPSHOT_ENCODING_V1_MAGIC));
+
+        let loaded = repo.load_snapshot(&env, saved.id).expect("load snapshot").1;
+        assert_eq!(loaded.schema_version, snapshot.schema_version);
+        assert_eq!(loaded.files.len(), snapshot.files.len());
+        assert_eq!(loaded.files[0].bytes_base64, "auth-payload");
+        assert_eq!(loaded.files[1].bytes_base64, "cap-payload");
+    }
+
+    #[test]
+    fn load_snapshot_accepts_legacy_plain_json_payloads() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+        let env = EnvironmentKind::Windows;
+        let snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![
+                crate::model::SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: "legacy-auth".to_owned(),
+                },
+                crate::model::SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: "legacy-cap".to_owned(),
+                },
+            ],
+        };
+        let (saved, _) = repo
+            .save_snapshot(&env, &identity("person@example.com", "sub-1"), &snapshot)
+            .expect("save");
+        let legacy = serde_json::to_vec(&snapshot).expect("serialize legacy");
+        repo.secret_store
+            .save(&saved.secret_key, &legacy)
+            .expect("overwrite with legacy payload");
+
+        let loaded = repo.load_snapshot(&env, saved.id).expect("load snapshot").1;
+        assert_eq!(loaded.schema_version, snapshot.schema_version);
+        assert_eq!(loaded.files[0].bytes_base64, "legacy-auth");
+        assert_eq!(loaded.files[1].bytes_base64, "legacy-cap");
     }
 }

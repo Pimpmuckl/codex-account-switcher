@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
@@ -7,7 +7,7 @@ use crate::env;
 use crate::model::RunningCodexProcess;
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
-use crate::secrets::KeyringSecretStore;
+use crate::secrets::MigratingSecretStore;
 
 #[derive(Parser)]
 #[command(
@@ -38,7 +38,7 @@ enum Command {
         account_id: Option<Uuid>,
         #[arg(long)]
         json: bool,
-        #[arg(long, hide = true)]
+        #[arg(long)]
         force: bool,
     },
     Delete {
@@ -51,10 +51,13 @@ enum Command {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let env = env::detect()?;
-    let repository = SnapshotRepository::new(&env.app_data_dir, KeyringSecretStore::default());
+    let repository = SnapshotRepository::new(
+        &env.app_data_dir,
+        MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),
+    );
     let app = App::new(env, repository);
     match cli.command {
-        None => app.interactive(InteractiveMode::Persistent),
+        None => app.interactive(InteractiveMode::Persistent, false),
         Some(Command::Status { json }) => {
             let status = app.status()?;
             if json {
@@ -103,20 +106,31 @@ pub fn run() -> Result<()> {
         Some(Command::Activate {
             account_id,
             json,
-            force: _,
+            force,
         }) => {
             let mut showed_preflight = false;
             let output = match account_id {
                 Some(account_id) => {
+                    app.validate_activation_target(account_id)?;
                     let warnings = app.activation_preflight_warnings();
-                    if !warnings.is_empty() && !json {
-                        showed_preflight = true;
-                        print_process_summary("Codex processes", &warnings);
+                    if !warnings.is_empty() {
+                        if !force {
+                            if !json {
+                                print_process_summary("Codex processes", &warnings);
+                            }
+                            bail!(
+                                "Codex appears to be running. Close those processes first or rerun `activate` with `--force`."
+                            );
+                        }
+                        if !json {
+                            showed_preflight = true;
+                            print_process_summary("Codex processes", &warnings);
+                        }
                     }
-                    app.activate(account_id)?
+                    app.activate_with_running_policy(account_id, force)?
                 }
                 None => {
-                    app.interactive(InteractiveMode::ActivateOnce)?;
+                    app.interactive(InteractiveMode::ActivateOnce, force)?;
                     return Ok(());
                 }
             };
@@ -134,7 +148,7 @@ pub fn run() -> Result<()> {
             let output = match account_id {
                 Some(account_id) => app.delete(account_id)?,
                 None => {
-                    app.interactive(InteractiveMode::DeleteOnce)?;
+                    app.interactive(InteractiveMode::DeleteOnce, false)?;
                     return Ok(());
                 }
             };

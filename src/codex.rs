@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -70,6 +71,7 @@ pub fn restore_snapshot(
     env: &AppEnv,
     snapshot: &SnapshotBlob,
     expected_identity: &DisplayIdentity,
+    verify_stable: bool,
 ) -> Result<()> {
     ensure_snapshot_complete(snapshot)?;
     fs::create_dir_all(&env.codex_root)
@@ -92,21 +94,52 @@ pub fn restore_snapshot(
         return Err(error);
     }
 
-    let live = read_live_auth_bundle(env).context("failed to verify restored auth bundle")?;
-    if !live.identity.matches(expected_identity) {
+    if let Err(error) = verify_live_snapshot_once(env, snapshot, expected_identity) {
         let _ = restore_from_backup(&env.codex_root, &backup_dir);
         let _ = fs::remove_dir_all(&temp_dir);
         let _ = fs::remove_dir_all(&backup_dir);
-        bail!(
-            "restore verification failed: expected {:?}, got {:?}",
+        return Err(error);
+    }
+
+    if verify_stable
+        && let Err(error) = verify_live_snapshot_stable_with_retry(
+            env,
+            snapshot,
             expected_identity,
-            live.identity
-        );
+            4,
+            Duration::from_millis(250),
+        )
+    {
+        let _ = restore_from_backup(&env.codex_root, &backup_dir);
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&backup_dir);
+        return Err(error);
     }
 
     let _ = fs::remove_dir_all(&temp_dir);
     let _ = fs::remove_dir_all(&backup_dir);
     Ok(())
+}
+
+pub fn live_bundle_matches_snapshot(env: &AppEnv, snapshot: &SnapshotBlob) -> Result<bool> {
+    let Some(live) = try_read_live_auth_bundle(env)? else {
+        return Ok(false);
+    };
+    Ok(snapshot_matches(&live.snapshot, snapshot))
+}
+
+pub fn verify_live_snapshot_stable(
+    env: &AppEnv,
+    expected_snapshot: &SnapshotBlob,
+    expected_identity: &DisplayIdentity,
+) -> Result<()> {
+    verify_live_snapshot_stable_with_retry(
+        env,
+        expected_snapshot,
+        expected_identity,
+        4,
+        Duration::from_millis(250),
+    )
 }
 
 fn ensure_snapshot_complete(snapshot: &SnapshotBlob) -> Result<()> {
@@ -180,6 +213,61 @@ fn restore_from_backup(codex_root: &Path, backup_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn verify_live_snapshot_stable_with_retry(
+    env: &AppEnv,
+    expected_snapshot: &SnapshotBlob,
+    expected_identity: &DisplayIdentity,
+    polls: usize,
+    delay: Duration,
+) -> Result<()> {
+    verify_live_snapshot_once(env, expected_snapshot, expected_identity)?;
+    for _ in 0..polls {
+        std::thread::sleep(delay);
+        verify_live_snapshot_once(env, expected_snapshot, expected_identity)
+            .context("restored auth bundle changed again after activation")?;
+    }
+    Ok(())
+}
+
+fn verify_live_snapshot_once(
+    env: &AppEnv,
+    expected_snapshot: &SnapshotBlob,
+    expected_identity: &DisplayIdentity,
+) -> Result<()> {
+    let live = read_live_auth_bundle(env).context("failed to verify restored auth bundle")?;
+    if !snapshot_matches(&live.snapshot, expected_snapshot) {
+        bail!(
+            "restore verification failed: managed auth files no longer match the restored snapshot"
+        );
+    }
+    if !live.identity.matches(expected_identity) {
+        bail!(
+            "restore verification failed: expected {:?}, got {:?}",
+            expected_identity,
+            live.identity
+        );
+    }
+    Ok(())
+}
+
+fn snapshot_matches(left: &SnapshotBlob, right: &SnapshotBlob) -> bool {
+    left.schema_version == right.schema_version
+        && AUTH_FILES.iter().all(|file_name| {
+            let left_files = snapshot_files(left, file_name);
+            let right_files = snapshot_files(right, file_name);
+            left_files.len() == 1 && right_files.len() == 1 && left_files[0] == right_files[0]
+        })
+}
+
+fn snapshot_files<'a>(snapshot: &'a SnapshotBlob, file_name: &str) -> Vec<&'a str> {
+    snapshot
+        .files
+        .iter()
+        .filter(|file| file.name == file_name)
+        .map(|file| file.bytes_base64.as_str())
+        .collect()
+}
+
 #[cfg(test)]
 pub fn auth_json_fixture(email: &str, subject: &str, plan: Option<&str>) -> String {
     let payload = serde_json::json!({
@@ -234,7 +322,7 @@ mod tests {
             auth_json_fixture("other@example.com", "sub-2", Some("plus")),
         )?;
         fs::write(codex_root.join("cap_sid"), "sid-2")?;
-        restore_snapshot(&env, &bundle.snapshot, &bundle.identity)?;
+        restore_snapshot(&env, &bundle.snapshot, &bundle.identity, false)?;
         let restored = read_live_auth_bundle(&env)?;
         assert_eq!(restored.identity.email, "person@example.com");
         Ok(())
@@ -263,7 +351,130 @@ mod tests {
             name: bundle.identity.name.clone(),
             plan_label: bundle.identity.plan_label.clone(),
         };
-        restore_snapshot(&env, &bundle.snapshot, &expected)?;
+        restore_snapshot(&env, &bundle.snapshot, &expected, false)?;
         Ok(())
+    }
+
+    #[test]
+    fn stable_verification_fails_when_auth_reverts() -> Result<()> {
+        let temp = tempdir()?;
+        let codex_root = temp.path().join(".codex");
+        fs::create_dir_all(&codex_root)?;
+        fs::write(
+            codex_root.join("auth.json"),
+            auth_json_fixture("after@example.com", "sub-2", Some("plus")),
+        )?;
+        fs::write(codex_root.join("cap_sid"), "sid-2")?;
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: codex_root.clone(),
+            app_data_dir: temp.path().join("data"),
+        };
+        let expected = DisplayIdentity {
+            email: "after@example.com".to_owned(),
+            subject: Some("sub-2".to_owned()),
+            name: Some("Tester".to_owned()),
+            plan_label: Some("Plus".to_owned()),
+        };
+        let expected_snapshot = read_live_auth_bundle(&env)?.snapshot;
+        let auth_path = codex_root.join("auth.json");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            fs::write(
+                auth_path,
+                auth_json_fixture("before@example.com", "sub-1", Some("pro")),
+            )
+            .expect("rewrite auth");
+        });
+
+        let error = verify_live_snapshot_stable_with_retry(
+            &env,
+            &expected_snapshot,
+            &expected,
+            10,
+            Duration::from_millis(10),
+        )
+        .expect_err("verification should fail after revert");
+        assert!(format!("{error:#}").contains("changed again after activation"));
+        Ok(())
+    }
+
+    #[test]
+    fn stable_verification_fails_when_cap_sid_reverts() -> Result<()> {
+        let temp = tempdir()?;
+        let codex_root = temp.path().join(".codex");
+        fs::create_dir_all(&codex_root)?;
+        fs::write(
+            codex_root.join("auth.json"),
+            auth_json_fixture("after@example.com", "sub-2", Some("plus")),
+        )?;
+        fs::write(codex_root.join("cap_sid"), "sid-2")?;
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: codex_root.clone(),
+            app_data_dir: temp.path().join("data"),
+        };
+        let expected = DisplayIdentity {
+            email: "after@example.com".to_owned(),
+            subject: Some("sub-2".to_owned()),
+            name: Some("Tester".to_owned()),
+            plan_label: Some("Plus".to_owned()),
+        };
+        let expected_snapshot = read_live_auth_bundle(&env)?.snapshot;
+        let cap_sid_path = codex_root.join("cap_sid");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            fs::write(cap_sid_path, "sid-1").expect("rewrite cap sid");
+        });
+
+        let error = verify_live_snapshot_stable_with_retry(
+            &env,
+            &expected_snapshot,
+            &expected,
+            10,
+            Duration::from_millis(10),
+        )
+        .expect_err("verification should fail after cap_sid drift");
+        assert!(format!("{error:#}").contains("changed again after activation"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_match_rejects_duplicate_managed_files() {
+        let left = SnapshotBlob {
+            schema_version: 1,
+            files: vec![
+                SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: "auth-a".to_owned(),
+                },
+                SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: "sid-a".to_owned(),
+                },
+            ],
+        };
+        let right = SnapshotBlob {
+            schema_version: 1,
+            files: vec![
+                SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: "auth-a".to_owned(),
+                },
+                SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: "auth-b".to_owned(),
+                },
+                SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: "sid-a".to_owned(),
+                },
+            ],
+        };
+
+        assert!(!snapshot_matches(&left, &right));
+        assert!(!snapshot_matches(&right, &left));
     }
 }

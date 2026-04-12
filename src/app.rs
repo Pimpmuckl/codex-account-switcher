@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use console::{Key, Term, style};
 use dialoguer::{Select, theme::ColorfulTheme};
 use uuid::Uuid;
@@ -88,8 +88,40 @@ where
     }
 
     pub fn activate(&self, account_id: Uuid) -> Result<ActivateOutput> {
+        self.activate_with_running_policy(account_id, false)
+    }
+
+    pub fn validate_activation_target(&self, account_id: Uuid) -> Result<()> {
+        let _ = self.load_activation_target(account_id)?;
+        Ok(())
+    }
+
+    pub fn activate_with_running_policy(
+        &self,
+        account_id: Uuid,
+        force_running: bool,
+    ) -> Result<ActivateOutput> {
         let warnings = detect_running_codex_processes();
-        let (mut metadata, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
+        let (snapshot, snapshot_identity, restore_identity) =
+            self.load_activation_target(account_id)?;
+        let verify_stable = should_verify_activation_stability(force_running, &warnings);
+        codex::restore_snapshot(&self.env, &snapshot, &restore_identity, verify_stable)
+            .context("failed to restore the selected account snapshot")?;
+        let metadata = self
+            .repository
+            .sync_activated_account(&self.env.kind, account_id, &snapshot_identity)
+            .context("activated live auth but failed to update local metadata")?;
+        Ok(ActivateOutput {
+            account: account_view(metadata, Some(account_id)),
+            warnings,
+        })
+    }
+
+    fn load_activation_target(
+        &self,
+        account_id: Uuid,
+    ) -> Result<(crate::model::SnapshotBlob, DisplayIdentity, DisplayIdentity)> {
+        let (metadata, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
         let expected_identity = saved_identity(&metadata);
         let snapshot_identity = codex::identity_from_snapshot(&snapshot)?;
         let restore_identity = if expected_identity.subject.is_some() {
@@ -104,15 +136,7 @@ where
         } else {
             snapshot_identity.clone()
         };
-        codex::restore_snapshot(&self.env, &snapshot, &restore_identity)?;
-        metadata = self
-            .repository
-            .sync_activated_account(&self.env.kind, account_id, &snapshot_identity)
-            .context("activated live auth but failed to update local metadata")?;
-        Ok(ActivateOutput {
-            account: account_view(metadata, Some(account_id)),
-            warnings,
-        })
+        Ok((snapshot, snapshot_identity, restore_identity))
     }
 
     pub fn activation_preflight_warnings(&self) -> Vec<crate::model::RunningCodexProcess> {
@@ -127,7 +151,7 @@ where
         })
     }
 
-    pub fn interactive(&self, mode: InteractiveMode) -> Result<()> {
+    pub fn interactive(&self, mode: InteractiveMode, force_running: bool) -> Result<()> {
         let mut default_selection = 0usize;
         let mut feedback = Vec::new();
         loop {
@@ -159,7 +183,17 @@ where
 
             match menu.action(selection) {
                 InteractiveAction::SaveCurrent => {
-                    let output = self.save_current()?;
+                    let output = match self.save_current() {
+                        Ok(output) => output,
+                        Err(error) => {
+                            if matches!(mode, InteractiveMode::Persistent) {
+                                feedback =
+                                    error_feedback("Saving the current account failed.", error);
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                    };
                     feedback.push(format!(
                         "{} {} ({})",
                         match output.action {
@@ -176,7 +210,30 @@ where
                     if showed_preflight && !confirm_activation(&warnings)? {
                         continue;
                     }
-                    let output = self.activate(account_id)?;
+                    let output = match self
+                        .activate_with_running_policy(account_id, force_running || showed_preflight)
+                    {
+                        Ok(output) => output,
+                        Err(error) => {
+                            if matches!(mode, InteractiveMode::Persistent) {
+                                let rendered_error = format!("{error:#}");
+                                feedback = error_feedback_rendered(
+                                    "Account activation failed.",
+                                    &rendered_error,
+                                );
+                                if showed_preflight
+                                    && error_indicates_running_process_instability(&rendered_error)
+                                {
+                                    feedback.push(
+                                        "Codex was still running during activation. Close those processes fully and retry."
+                                            .to_owned(),
+                                    );
+                                }
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                    };
                     feedback.push(format!(
                         "Activated {} ({})",
                         output.account.email, output.account.id
@@ -203,7 +260,17 @@ where
                     if !confirm_delete(account)? {
                         continue;
                     }
-                    let output = self.delete(account_id)?;
+                    let output = match self.delete(account_id) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            if matches!(mode, InteractiveMode::Persistent) {
+                                feedback =
+                                    error_feedback("Deleting the saved account failed.", error);
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                    };
                     feedback.push(format!(
                         "Deleted saved snapshot {}",
                         output.deleted_account_id
@@ -222,7 +289,17 @@ where
                     if !confirm_delete(account)? {
                         continue;
                     }
-                    let output = self.delete(account_id)?;
+                    let output = match self.delete(account_id) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            if matches!(mode, InteractiveMode::Persistent) {
+                                feedback =
+                                    error_feedback("Deleting the saved account failed.", error);
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                    };
                     feedback.push(format!(
                         "Deleted saved snapshot {}",
                         output.deleted_account_id
@@ -352,6 +429,13 @@ fn subject_bound_identity_matches(expected: &DisplayIdentity, snapshot: &Display
     }
 }
 
+fn should_verify_activation_stability(
+    force_running: bool,
+    warnings: &[crate::model::RunningCodexProcess],
+) -> bool {
+    force_running || !warnings.is_empty()
+}
+
 fn render_account_label(account: &AccountView) -> String {
     let mut parts = vec![account.email.clone()];
     if let Some(plan) = &account.plan_label {
@@ -374,7 +458,12 @@ fn build_menu(
     current_saved: Option<Uuid>,
 ) -> InteractiveMenu {
     let mut accounts = Vec::new();
-    for account in &list.accounts {
+    for account in list.accounts.iter().filter(|account| {
+        !matches!(
+            mode,
+            InteractiveMode::Persistent | InteractiveMode::ActivateOnce
+        ) || !account.is_active
+    }) {
         accounts.push(InteractiveItem {
             label: render_account_label(account),
             action: match mode {
@@ -389,7 +478,7 @@ fn build_menu(
     let mut actions = Vec::new();
     let current_status_label = status.current_account.as_ref().map(|current| {
         format!(
-            "Current: {}{}",
+            "{}{}",
             current.email,
             if current_saved.is_some() {
                 " [saved]"
@@ -518,13 +607,19 @@ fn render_persistent_menu(
     }
     term.write_line(&style(menu.prompt).bold().to_string())?;
     lines += 1;
-    if let Some(current_status_label) = &menu.current_status_label {
-        term.write_line(&style(current_status_label).dim().to_string())?;
-        lines += 1;
-    }
-    term.write_line("")?;
+    term.write_line(&render_section_heading("Active Account"))?;
     lines += 1;
-    term.write_line(&render_section_heading("Accounts"))?;
+    if let Some(current_status_label) = &menu.current_status_label {
+        term.write_line(
+            &style(format!("  {current_status_label}"))
+                .white()
+                .to_string(),
+        )?;
+    } else {
+        term.write_line(&style("  (not logged in)").white().to_string())?;
+    }
+    lines += 1;
+    term.write_line(&render_section_heading("Saved Accounts"))?;
     lines += 1;
     if menu.accounts.is_empty() {
         term.write_line(&style("  (no saved accounts)").dim().to_string())?;
@@ -631,6 +726,7 @@ fn confirm_delete(account: &AccountView) -> Result<bool> {
             render_account_label(account),
             format!("Snapshot id: {}", account.id),
         ],
+        &[],
         "Yes, delete",
         "No, keep it",
         false,
@@ -638,16 +734,17 @@ fn confirm_delete(account: &AccountView) -> Result<bool> {
 }
 
 fn confirm_activation(warnings: &[crate::model::RunningCodexProcess]) -> Result<bool> {
-    let mut body = vec![
+    let body = vec![
         "Codex appears to be running.".to_owned(),
-        "Swapping while it is open may not stick until those processes are restarted.".to_owned(),
-        String::new(),
+        "Close every listed process first for a reliable swap, or force activation anyway."
+            .to_owned(),
     ];
-    body.extend(process_summary_lines("Codex processes", warnings));
+    let details = process_summary_lines("Codex processes", warnings);
     confirm_with_menu(
         "Continue with account activation?",
         &body,
-        "Yes, continue",
+        &details,
+        "Yes, force activation",
         "No, cancel",
         false,
     )
@@ -687,9 +784,31 @@ fn process_summary_lines(
     lines
 }
 
+fn error_feedback(prefix: &str, error: Error) -> Vec<String> {
+    error_feedback_rendered(prefix, &format!("{error:#}"))
+}
+
+fn error_feedback_rendered(prefix: &str, rendered_error: &str) -> Vec<String> {
+    let mut lines = vec![prefix.to_owned()];
+    for (index, line) in rendered_error.lines().enumerate() {
+        lines.push(if index == 0 {
+            format!("Error: {line}")
+        } else {
+            format!("  {line}")
+        });
+    }
+    lines
+}
+
+fn error_indicates_running_process_instability(rendered_error: &str) -> bool {
+    rendered_error.contains("managed auth files no longer match")
+        || rendered_error.contains("changed again after activation")
+}
+
 fn confirm_with_menu(
     prompt: &str,
     body_lines: &[String],
+    trailing_lines: &[String],
     yes_label: &str,
     no_label: &str,
     default_yes: bool,
@@ -710,13 +829,21 @@ fn confirm_with_menu(
             term.write_line(line)?;
             rendered_lines += 1;
         }
-        if !body_lines.is_empty() {
+        if !body_lines.is_empty() || !trailing_lines.is_empty() {
             term.write_line("")?;
             rendered_lines += 1;
         }
         for (index, option) in options.iter().enumerate() {
             term.write_line(&render_confirm_option(option, selection == index))?;
             rendered_lines += 1;
+        }
+        if !trailing_lines.is_empty() {
+            term.write_line("")?;
+            rendered_lines += 1;
+            for line in trailing_lines {
+                term.write_line(line)?;
+                rendered_lines += 1;
+            }
         }
         match term.read_key()? {
             Key::ArrowUp
@@ -803,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_once_menu_only_lists_accounts_and_quit() {
+    fn activate_once_menu_hides_active_account() {
         let id = Uuid::new_v4();
         let menu = build_menu(
             InteractiveMode::ActivateOnce,
@@ -811,10 +938,9 @@ mod tests {
             &sample_list(id, true),
             Some(id),
         );
-        assert_eq!(menu.len(), 2);
-        assert_eq!(menu.accounts.len(), 1);
-        assert!(matches!(menu.action(0), InteractiveAction::Activate(actual) if actual == id));
-        assert!(matches!(menu.action(1), InteractiveAction::Quit));
+        assert_eq!(menu.accounts.len(), 0);
+        assert_eq!(menu.len(), 1);
+        assert!(matches!(menu.action(0), InteractiveAction::Quit));
     }
 
     #[test]
@@ -839,7 +965,7 @@ mod tests {
         let menu = build_menu(
             InteractiveMode::Persistent,
             &sample_status(Some(id)),
-            &sample_list(id, true),
+            &sample_list(id, false),
             Some(id),
         );
         assert_eq!(menu.accounts.len(), 1);
@@ -851,7 +977,35 @@ mod tests {
     }
 
     #[test]
+    fn force_running_always_enables_stability_verification() {
+        let warnings = Vec::new();
+        assert!(should_verify_activation_stability(true, &warnings));
+        assert!(!should_verify_activation_stability(false, &warnings));
+
+        let warnings = vec![crate::model::RunningCodexProcess {
+            pid: 1,
+            executable: "codex.exe".to_owned(),
+            role: "process".to_owned(),
+            summary: None,
+        }];
+        assert!(should_verify_activation_stability(false, &warnings));
+    }
+
+    #[test]
     fn jump_section_switches_between_accounts_and_actions() {
+        let id = Uuid::new_v4();
+        let menu = build_menu(
+            InteractiveMode::Persistent,
+            &sample_status(Some(id)),
+            &sample_list(id, false),
+            Some(id),
+        );
+        assert_eq!(jump_section(&menu, 0), 1);
+        assert_eq!(jump_section(&menu, 1), 0);
+    }
+
+    #[test]
+    fn persistent_menu_hides_active_account_from_switch_targets() {
         let id = Uuid::new_v4();
         let menu = build_menu(
             InteractiveMode::Persistent,
@@ -859,8 +1013,15 @@ mod tests {
             &sample_list(id, true),
             Some(id),
         );
-        assert_eq!(jump_section(&menu, 0), 1);
-        assert_eq!(jump_section(&menu, 1), 0);
+        assert_eq!(menu.accounts.len(), 0);
+        assert_eq!(
+            menu.current_status_label.as_deref(),
+            Some("person@example.com [saved]")
+        );
+        assert_eq!(
+            menu.actions[0].label,
+            "Refresh saved snapshot for person@example.com"
+        );
     }
 
     #[test]
@@ -887,7 +1048,7 @@ mod tests {
         );
         assert_eq!(
             menu.current_status_label.as_deref(),
-            Some("Current: other@example.com [not saved]")
+            Some("other@example.com [not saved]")
         );
         assert_eq!(menu.accounts.len(), 1);
         assert!(menu.accounts[0].label.contains("person@example.com"));
@@ -1016,7 +1177,7 @@ mod tests {
         std::fs::create_dir_all(&env.codex_root).expect("codex root");
         std::fs::write(
             env.codex_root.join("auth.json"),
-            auth_json_fixture("before@example.com", "sub-1", Some("pro")),
+            auth_json_fixture("current@example.com", "sub-current", Some("pro")),
         )
         .expect("auth");
         std::fs::write(env.codex_root.join("cap_sid"), "sid-a").expect("cap");
