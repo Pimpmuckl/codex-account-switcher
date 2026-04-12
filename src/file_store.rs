@@ -232,16 +232,21 @@ where
 }
 
 pub fn cleanup_paths(paths: &[&Path]) -> Result<()> {
+    let mut first_error = None;
     for path in paths {
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(error).with_context(|| format!("failed to delete {}", path.display()));
+                if first_error.is_none() {
+                    first_error = Some(
+                        Err(error).with_context(|| format!("failed to delete {}", path.display())),
+                    );
+                }
             }
         }
     }
-    Ok(())
+    first_error.unwrap_or(Ok(()))
 }
 
 #[cfg(test)]
@@ -251,7 +256,7 @@ mod tests {
     use anyhow::anyhow;
     use tempfile::tempdir;
 
-    use super::replace_file_with_recovery_impl;
+    use super::{cleanup_paths, replace_file_with_recovery_impl};
 
     #[test]
     fn save_without_existing_file_ignores_cleanup_failure_after_persist() {
@@ -287,5 +292,20 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(fs::read(&canonical_path).expect("canonical file"), b"after");
+    }
+
+    #[test]
+    fn cleanup_paths_attempts_later_deletes_after_first_error() {
+        let temp_dir = tempdir().expect("temp dir");
+        let blocked_dir = temp_dir.path().join("blocked");
+        let trailing_file = temp_dir.path().join("trailing.tmp");
+        fs::create_dir(&blocked_dir).expect("blocked dir");
+        fs::write(&trailing_file, b"cleanup").expect("trailing file");
+
+        let error = cleanup_paths(&[blocked_dir.as_path(), trailing_file.as_path()])
+            .expect_err("directory delete should fail");
+
+        assert!(format!("{error:#}").contains("failed to delete"));
+        assert!(!trailing_file.exists());
     }
 }
