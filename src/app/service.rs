@@ -137,7 +137,7 @@ where
     pub fn usage(&self, account_id: Option<Uuid>) -> Result<UsageOutput> {
         match account_id {
             Some(account_id) => {
-                let (_, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
+                let (snapshot, _, _) = self.load_activation_target(account_id)?;
                 let target = usage_target_from_snapshot(
                     self.env.kind.clone(),
                     snapshot,
