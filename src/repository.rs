@@ -7,7 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::model::{DisplayIdentity, EnvironmentKind, SavedAccountMetadata, SnapshotBlob};
+use crate::model::{
+    AccountUsageView, DisplayIdentity, EnvironmentKind, SavedAccountMetadata, SnapshotBlob,
+};
 use crate::secrets::SecretStore;
 use codec::{decode_snapshot, encode_snapshot};
 use index_store::MetadataIndexStore;
@@ -134,6 +136,7 @@ where
         account_id: Uuid,
         identity: &DisplayIdentity,
         snapshot: &SnapshotBlob,
+        usage: Option<AccountUsageView>,
     ) -> Result<SavedAccountMetadata> {
         let mut index = self.index_store.load_index()?;
         let position = index
@@ -147,27 +150,10 @@ where
         account.subject = identity.subject.clone();
         account.name = identity.name.clone();
         account.plan_label = identity.plan_label.clone();
+        account.cached_usage = usage;
         let metadata = account.clone();
         self.secret_store
             .save(&metadata.secret_key, &encoded_snapshot)?;
-        self.index_store.save_index(&index)?;
-        Ok(metadata)
-    }
-
-    pub fn update_cached_usage(
-        &self,
-        environment: &EnvironmentKind,
-        account_id: Uuid,
-        usage: Option<crate::model::AccountUsageView>,
-    ) -> Result<SavedAccountMetadata> {
-        let mut index = self.index_store.load_index()?;
-        let position = index
-            .accounts
-            .iter()
-            .position(|account| account.id == account_id && &account.environment == environment)
-            .ok_or_else(|| anyhow!("saved account {account_id} not found"))?;
-        index.accounts[position].cached_usage = usage;
-        let metadata = index.accounts[position].clone();
         self.index_store.save_index(&index)?;
         Ok(metadata)
     }

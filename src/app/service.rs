@@ -149,10 +149,6 @@ where
                     account_id,
                     &output.account,
                     &refreshed_snapshot,
-                )?;
-                self.repository.update_cached_usage(
-                    &self.env.kind,
-                    account_id,
                     Some(output.usage.clone()),
                 )?;
                 Ok(output)
@@ -168,7 +164,7 @@ where
                     self.env.kind.clone(),
                     live.snapshot,
                     UsageSource::LiveAccessToken,
-                    false,
+                    true,
                 )?;
                 Ok(fetch_usage(target)?.0)
             }
