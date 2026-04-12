@@ -169,7 +169,8 @@ where
                 )?;
                 let (output, refreshed_snapshot) = fetch_usage(target)?;
                 if refreshed_snapshot != live_snapshot
-                    && codex::live_bundle_matches_snapshot(&self.env, &live_snapshot)?
+                    && codex::live_bundle_matches_snapshot(&self.env, &live_snapshot)
+                        .unwrap_or(false)
                 {
                     codex::restore_snapshot(&self.env, &refreshed_snapshot, &output.account, false)
                         .context("refreshed live auth but failed to update local auth files")?;
