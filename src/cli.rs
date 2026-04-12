@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::app::{App, InteractiveMode};
 use crate::env;
-use crate::model::RunningCodexProcess;
+use crate::model::{AccountUsageView, AccountView, RunningCodexProcess, UsageOutput};
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
 use crate::secrets::MigratingSecretStore;
@@ -31,6 +31,11 @@ enum Command {
         json: bool,
     },
     Save {
+        #[arg(long)]
+        json: bool,
+    },
+    Usage {
+        account_id: Option<Uuid>,
         #[arg(long)]
         json: bool,
     },
@@ -84,12 +89,7 @@ pub fn run() -> Result<()> {
                 println!("No saved accounts in {}.", list.environment);
             } else {
                 for account in list.accounts {
-                    println!(
-                        "{} {}{}",
-                        account.id,
-                        account.email,
-                        if account.is_active { " [active]" } else { "" }
-                    );
+                    println!("{}", render_account_summary(&account));
                 }
             }
             Ok(())
@@ -100,6 +100,15 @@ pub fn run() -> Result<()> {
                 print_json(&output)?;
             } else {
                 println!("Saved {} ({})", output.account.email, output.account.id);
+            }
+            Ok(())
+        }
+        Some(Command::Usage { account_id, json }) => {
+            let output = app.usage(account_id)?;
+            if json {
+                print_json(&output)?;
+            } else {
+                print_usage_output(&output);
             }
             Ok(())
         }
@@ -175,5 +184,58 @@ fn print_process_summary(title: &str, processes: &[RunningCodexProcess]) {
     println!("{title}:");
     for line in format_process_table(processes) {
         println!("{line}");
+    }
+}
+
+fn render_account_summary(account: &AccountView) -> String {
+    let mut line = format!(
+        "{} {}{}",
+        account.id,
+        account.email,
+        if account.is_active { " [active]" } else { "" }
+    );
+    if let Some(usage) = &account.usage
+        && let Some(weekly) = &usage.weekly
+    {
+        line.push_str(&format!(
+            " [weekly remaining: {}%, reset {}]",
+            weekly.remaining_percent,
+            weekly.reset_at.date()
+        ));
+    } else if account.usage_error.is_some() {
+        line.push_str(" [usage unavailable]");
+    }
+    line
+}
+
+fn print_usage_output(output: &UsageOutput) {
+    println!("Environment: {}", output.environment);
+    println!("Account: {}", output.account.email);
+    if let Some(plan) = &output.account.plan_label {
+        println!("Plan: {plan}");
+    }
+    print_usage_summary(&output.usage);
+}
+
+fn print_usage_summary(usage: &AccountUsageView) {
+    println!("Source: {}", format!("{:?}", usage.source).to_lowercase());
+    println!("Fetched at: {}", usage.fetched_at);
+    if let Some(five_hour) = &usage.five_hour {
+        println!(
+            "5h remaining: {}% (reset {})",
+            five_hour.remaining_percent, five_hour.reset_at
+        );
+    }
+    if let Some(weekly) = &usage.weekly {
+        println!(
+            "Weekly remaining: {}% (reset {})",
+            weekly.remaining_percent, weekly.reset_at
+        );
+    }
+    if let Some(credits) = &usage.credits {
+        println!(
+            "Credits: {} (has_credits={}, unlimited={})",
+            credits.balance, credits.has_credits, credits.unlimited
+        );
     }
 }

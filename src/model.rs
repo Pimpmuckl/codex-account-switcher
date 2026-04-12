@@ -123,6 +123,8 @@ pub struct AccountView {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
     pub last_activated_at: Option<OffsetDateTime>,
+    pub usage: Option<AccountUsageView>,
+    pub usage_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -139,6 +141,13 @@ pub struct StatusOutput {
 pub struct ListOutput {
     pub environment: EnvironmentKind,
     pub accounts: Vec<AccountView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageOutput {
+    pub environment: EnvironmentKind,
+    pub account: DisplayIdentity,
+    pub usage: AccountUsageView,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -171,4 +180,36 @@ pub struct RunningCodexProcess {
 #[derive(Clone, Debug, Serialize)]
 pub struct DeleteOutput {
     pub deleted_account_id: Uuid,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AccountUsageView {
+    pub source: UsageSource,
+    pub fetched_at: OffsetDateTime,
+    pub five_hour: Option<UsageWindowView>,
+    pub weekly: Option<UsageWindowView>,
+    pub credits: Option<CreditsView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageWindowView {
+    pub used_percent: u8,
+    pub remaining_percent: u8,
+    pub reset_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CreditsView {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource {
+    LiveAccessToken,
+    LiveRefreshToken,
+    SavedAccessToken,
+    SavedRefreshToken,
 }

@@ -250,6 +250,14 @@ fn render_account_label(account: &AccountView) -> String {
     } else {
         parts.push(format!("- Saved on {}", account.updated_at.date()));
     }
+    if let Some(usage) = &account.usage
+        && let Some(weekly) = &usage.weekly
+    {
+        parts.push(format!("- Weekly Remaining: {}%", weekly.remaining_percent));
+        parts.push(format!("- Reset {}", weekly.reset_at.date()));
+    } else if account.usage_error.is_some() {
+        parts.push("- Usage unavailable".to_owned());
+    }
     parts.join(" ")
 }
 
@@ -722,6 +730,8 @@ mod tests {
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 updated_at: OffsetDateTime::UNIX_EPOCH,
                 last_activated_at: is_active.then_some(OffsetDateTime::UNIX_EPOCH),
+                usage: None,
+                usage_error: None,
             }],
         }
     }
