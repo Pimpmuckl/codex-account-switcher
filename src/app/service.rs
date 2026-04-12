@@ -190,10 +190,15 @@ where
 }
 
 fn live_bundle_still_matches_snapshot(env: &AppEnv, snapshot: &SnapshotBlob) -> bool {
-    codex::live_bundle_matches_snapshot(env, snapshot).unwrap_or_else(|_| {
-        std::thread::sleep(Duration::from_millis(25));
-        codex::live_bundle_matches_snapshot(env, snapshot).unwrap_or(false)
-    })
+    for attempt in 0..3 {
+        if codex::live_bundle_matches_snapshot(env, snapshot).unwrap_or(false) {
+            return true;
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    false
 }
 
 #[cfg(test)]
