@@ -93,6 +93,7 @@ where
         force_running: bool,
     ) -> Result<ActivateOutput> {
         let warnings = crate::process::detect_running_codex_processes();
+        self.refresh_current_saved_account_before_activation();
         let (snapshot, snapshot_identity, restore_identity) =
             self.load_activation_target(account_id)?;
         let verify_stable = should_verify_activation_stability(force_running, &warnings);
@@ -106,6 +107,22 @@ where
             account: account_view(metadata, Some(account_id), None, None),
             warnings,
         })
+    }
+
+    fn refresh_current_saved_account_before_activation(&self) {
+        let Ok(saved_accounts) = self.repository.list_accounts(&self.env.kind) else {
+            return;
+        };
+        let Ok(Some(live)) = codex::try_read_live_auth_bundle(&self.env) else {
+            return;
+        };
+        let Some(_current_saved) = match_saved_account(&saved_accounts, &live.identity) else {
+            return;
+        };
+        let Ok(saved) = self.save_current() else {
+            return;
+        };
+        let _ = self.usage(Some(saved.account.id));
     }
 
     fn load_activation_target(
@@ -132,6 +149,14 @@ where
 
     pub fn activation_preflight_warnings(&self) -> Vec<RunningCodexProcess> {
         crate::process::detect_running_codex_processes()
+    }
+
+    pub fn refresh_saved_usage_cache(&self) -> Result<()> {
+        let accounts = self.repository.list_accounts(&self.env.kind)?;
+        for account in accounts {
+            let _ = self.usage(Some(account.id));
+        }
+        Ok(())
     }
 
     pub fn usage(&self, account_id: Option<Uuid>) -> Result<UsageOutput> {

@@ -16,6 +16,9 @@ where
 {
     pub fn interactive(&self, mode: InteractiveMode, force_running: bool) -> Result<()> {
         let mut default_selection = 0usize;
+        if matches!(mode, InteractiveMode::Persistent) {
+            self.refresh_saved_usage_cache()?;
+        }
         let mut feedback = Vec::new();
         loop {
             let status = self.status()?;
@@ -205,6 +208,16 @@ struct PersistentRenderState {
     row_lines: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct AccountLabelWidths {
+    email: usize,
+    plan: usize,
+    saved: usize,
+    last_used: usize,
+    remaining: usize,
+    reset: usize,
+}
+
 impl InteractiveMenu {
     pub(crate) fn len(&self) -> usize {
         self.accounts.len() + self.actions.len()
@@ -239,31 +252,96 @@ impl InteractiveMenu {
     }
 }
 
-fn render_account_label(account: &AccountView) -> String {
-    let mut parts = vec![account.email.clone()];
-    if let Some(plan) = &account.plan_label {
-        parts.push(format!("[{plan}]"));
-    }
-    if account.is_active {
-        parts.push("- Active".to_owned());
+fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> String {
+    let email = format!("{:<width$}", account.email, width = widths.email);
+    let plan = format!(
+        "{:<width$}",
+        account
+            .plan_label
+            .as_ref()
+            .map(|plan| format!("Plan: {plan}"))
+            .unwrap_or_default(),
+        width = widths.plan
+    );
+    let saved = format!("Saved: {}", account.updated_at.date());
+    let saved = format!("{:<width$}", saved, width = widths.saved);
+    let last_used = if account.is_active {
+        "Last Used: Active".to_owned()
     } else if let Some(ts) = account.last_activated_at {
-        parts.push(format!("- Last activated {}", ts.date()));
+        format!("Last Used: {}", ts.date())
     } else {
-        parts.push(format!("- Saved on {}", account.updated_at.date()));
-    }
-    if let Some(usage) = &account.usage
+        String::new()
+    };
+    let last_used = format!("{:<width$}", last_used, width = widths.last_used);
+
+    let (remaining, reset) = if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
         if weekly.reset_at <= OffsetDateTime::now_utc() {
-            parts.push("- Weekly Reset passed".to_owned());
+            ("Weekly Remaining: passed".to_owned(), String::new())
         } else {
-            parts.push(format!("- Weekly Remaining: {}%", weekly.remaining_percent));
-            parts.push(format!("- Reset {}", weekly.reset_at.date()));
+            (
+                format!("Weekly Remaining: {}%", weekly.remaining_percent),
+                format!("Reset: {}", weekly.reset_at.date()),
+            )
         }
     } else if account.usage_error.is_some() {
-        parts.push("- Usage unavailable".to_owned());
+        ("Usage unavailable".to_owned(), String::new())
+    } else {
+        (String::new(), String::new())
+    };
+    let remaining = format!("{:<width$}", remaining, width = widths.remaining);
+    let reset = format!("{:<width$}", reset, width = widths.reset);
+
+    [email, plan, saved, last_used, remaining, reset]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
+    let mut widths = AccountLabelWidths::default();
+    for account in accounts {
+        widths.email = widths.email.max(account.email.len());
+        widths.plan = widths.plan.max(
+            account
+                .plan_label
+                .as_ref()
+                .map(|plan| format!("Plan: {plan}").len())
+                .unwrap_or(0),
+        );
+        widths.saved = widths
+            .saved
+            .max(format!("Saved: {}", account.updated_at.date()).len());
+        widths.last_used = widths.last_used.max(if account.is_active {
+            "Last Used: Active".len()
+        } else if let Some(ts) = account.last_activated_at {
+            format!("Last Used: {}", ts.date()).len()
+        } else {
+            0
+        });
+
+        let (remaining, reset) = if let Some(usage) = &account.usage
+            && let Some(weekly) = &usage.weekly
+        {
+            if weekly.reset_at <= OffsetDateTime::now_utc() {
+                ("Weekly Remaining: passed".len(), 0)
+            } else {
+                (
+                    format!("Weekly Remaining: {}%", weekly.remaining_percent).len(),
+                    format!("Reset: {}", weekly.reset_at.date()).len(),
+                )
+            }
+        } else if account.usage_error.is_some() {
+            ("Usage unavailable".len(), 0)
+        } else {
+            (0, 0)
+        };
+        widths.remaining = widths.remaining.max(remaining);
+        widths.reset = widths.reset.max(reset);
     }
-    parts.join(" ")
+    widths
 }
 
 pub(crate) fn build_menu(
@@ -272,6 +350,18 @@ pub(crate) fn build_menu(
     list: &ListOutput,
     current_saved: Option<Uuid>,
 ) -> InteractiveMenu {
+    let active_account = current_saved
+        .and_then(|saved_id| list.accounts.iter().find(|account| account.id == saved_id));
+    let mut label_accounts = list.accounts.iter().collect::<Vec<_>>();
+    if let Some(active_account) = active_account
+        && !label_accounts
+            .iter()
+            .any(|account| account.id == active_account.id)
+    {
+        label_accounts.push(active_account);
+    }
+    let widths = account_label_widths(&label_accounts);
+
     let mut accounts = Vec::new();
     for account in list.accounts.iter().filter(|account| {
         !matches!(
@@ -280,7 +370,7 @@ pub(crate) fn build_menu(
         ) || !account.is_active
     }) {
         accounts.push(InteractiveItem {
-            label: render_account_label(account),
+            label: render_account_label(account, widths),
             action: match mode {
                 InteractiveMode::Persistent | InteractiveMode::ActivateOnce => {
                     InteractiveAction::Activate(account.id)
@@ -291,17 +381,21 @@ pub(crate) fn build_menu(
     }
 
     let mut actions = Vec::new();
-    let current_status_label = status.current_account.as_ref().map(|current| {
-        format!(
-            "{}{}",
-            current.email,
-            if current_saved.is_some() {
-                " [saved]"
-            } else {
-                " [not saved]"
-            }
-        )
-    });
+    let current_status_label = active_account
+        .map(|account| render_account_label(account, widths))
+        .or_else(|| {
+            status.current_account.as_ref().map(|current| {
+                format!(
+                    "{}{}",
+                    current.email,
+                    if current_saved.is_some() {
+                        " [saved]"
+                    } else {
+                        " [not saved]"
+                    }
+                )
+            })
+        });
 
     if matches!(mode, InteractiveMode::Persistent) {
         if let Some(current) = status.current_account.as_ref() {
@@ -522,9 +616,10 @@ fn render_menu_row_explicit(menu: &InteractiveMenu, index: usize, selected: bool
 }
 
 fn prompt_for_account_delete(accounts: &[AccountView]) -> Result<Uuid> {
+    let widths = account_label_widths(&accounts.iter().collect::<Vec<_>>());
     let labels = accounts
         .iter()
-        .map(render_account_label)
+        .map(|account| render_account_label(account, widths))
         .collect::<Vec<_>>();
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Which saved account do you want to delete?")
@@ -535,10 +630,11 @@ fn prompt_for_account_delete(accounts: &[AccountView]) -> Result<Uuid> {
 }
 
 fn confirm_delete(account: &AccountView) -> Result<bool> {
+    let widths = account_label_widths(&[account]);
     confirm_with_menu(
         "Delete saved snapshot?",
         &[
-            render_account_label(account),
+            render_account_label(account, widths),
             format!("Snapshot id: {}", account.id),
         ],
         &[],
@@ -826,10 +922,14 @@ mod tests {
             Some(id),
         );
         assert_eq!(menu.accounts.len(), 0);
-        assert_eq!(
-            menu.current_status_label.as_deref(),
-            Some("person@example.com [saved]")
-        );
+        let current = menu
+            .current_status_label
+            .as_deref()
+            .expect("current status label");
+        assert!(current.contains("person@example.com"));
+        assert!(current.contains("Plan: Pro"));
+        assert!(current.contains("Saved: 1970-01-01"));
+        assert!(current.contains("Last Used: Active"));
         assert_eq!(
             menu.actions[0].label,
             "Refresh saved snapshot for person@example.com"
@@ -864,7 +964,7 @@ mod tests {
         );
         assert_eq!(menu.accounts.len(), 1);
         assert!(menu.accounts[0].label.contains("person@example.com"));
-        assert!(menu.accounts[0].label.contains("Saved on 1970-01-01"));
+        assert!(menu.accounts[0].label.contains("Saved: 1970-01-01"));
         assert_eq!(
             menu.actions[0].label,
             "Add current account other@example.com to switcher"
