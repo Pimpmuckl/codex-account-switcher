@@ -8,6 +8,7 @@ pub mod model;
 pub mod process;
 pub mod repository;
 pub mod secrets;
+pub mod settings;
 #[cfg(windows)]
 pub mod tray;
 pub mod usage;

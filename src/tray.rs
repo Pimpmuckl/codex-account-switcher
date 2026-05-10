@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use uuid::Uuid;
 use winit::application::ApplicationHandler;
@@ -23,6 +23,7 @@ enum UserEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayCommand {
     Activate(Uuid),
+    SetAutoStartUsageWindows(bool),
     ShowTui,
     Quit,
 }
@@ -115,6 +116,16 @@ where
                     eprintln!("failed to refresh tray menu: {error:#}");
                 }
             }
+            Some(TrayCommand::SetAutoStartUsageWindows(enabled)) => {
+                if let Err(error) = self.app.set_auto_start_usage_windows(enabled) {
+                    eprintln!("failed to update auto-start usage windows from tray: {error:#}");
+                } else if enabled && let Err(error) = self.app.auto_start_usage_windows_once(true) {
+                    eprintln!("failed to run auto-start usage window check from tray: {error:#}");
+                }
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
             Some(TrayCommand::ShowTui) => {
                 self.exit = TrayExit::ShowTui;
                 event_loop.exit();
@@ -175,6 +186,14 @@ where
         }
 
         menu.append(&PredefinedMenuItem::separator())?;
+        let auto_start_enabled = self.app.auto_start_usage_windows_status()?.enabled;
+        self.append_check_command(
+            &menu,
+            "toggle-auto-start-usage-windows",
+            "Auto-start usage windows",
+            auto_start_enabled,
+            TrayCommand::SetAutoStartUsageWindows(!auto_start_enabled),
+        )?;
         self.append_command(&menu, "show-tui", "Show TUI", TrayCommand::ShowTui)?;
         self.append_command(&menu, "quit", "Quit", TrayCommand::Quit)?;
         Ok(menu)
@@ -188,6 +207,25 @@ where
         command: TrayCommand,
     ) -> Result<()> {
         menu.append(&MenuItem::with_id(MenuId::new(id), label, true, None))?;
+        self.commands.insert(id.to_owned(), command);
+        Ok(())
+    }
+
+    fn append_check_command(
+        &mut self,
+        menu: &Menu,
+        id: &str,
+        label: &str,
+        checked: bool,
+        command: TrayCommand,
+    ) -> Result<()> {
+        menu.append(&CheckMenuItem::with_id(
+            MenuId::new(id),
+            label,
+            true,
+            checked,
+            None,
+        ))?;
         self.commands.insert(id.to_owned(), command);
         Ok(())
     }

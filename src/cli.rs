@@ -5,7 +5,10 @@ use uuid::Uuid;
 
 use crate::app::{App, InteractiveExit, InteractiveMode};
 use crate::env;
-use crate::model::{AccountUsageView, AccountView, RunningCodexProcess, UsageOutput};
+use crate::model::{
+    AccountUsageView, AccountView, AutoStartUsageWindowsRunOutput,
+    AutoStartUsageWindowsStatusOutput, RunningCodexProcess, UsageOutput,
+};
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
 use crate::secrets::MigratingSecretStore;
@@ -49,6 +52,16 @@ enum Command {
     },
     Delete {
         account_id: Option<Uuid>,
+        #[arg(long)]
+        json: bool,
+    },
+    AutoStartUsageWindows {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long)]
+        run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -169,6 +182,33 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::AutoStartUsageWindows {
+            enable,
+            disable,
+            run,
+            json,
+        }) => {
+            let status = if enable {
+                app.set_auto_start_usage_windows(true)?
+            } else if disable {
+                app.set_auto_start_usage_windows(false)?
+            } else {
+                app.auto_start_usage_windows_status()?
+            };
+            if run {
+                let output = app.auto_start_usage_windows_once(true)?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_auto_start_usage_windows_run(&output);
+                }
+            } else if json {
+                print_json(&status)?;
+            } else {
+                print_auto_start_usage_windows_status(&status);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -176,6 +216,7 @@ fn run_interactive_app<S>(app: &App<S>) -> Result<()>
 where
     S: crate::secrets::SecretStore,
 {
+    crate::app::spawn_auto_start_usage_windows_worker();
     loop {
         match app.interactive(InteractiveMode::Persistent, false)? {
             InteractiveExit::Quit => return Ok(()),
@@ -239,6 +280,42 @@ fn print_usage_output(output: &UsageOutput) {
         println!("Plan: {plan}");
     }
     print_usage_summary(&output.usage);
+}
+
+fn print_auto_start_usage_windows_status(output: &AutoStartUsageWindowsStatusOutput) {
+    println!(
+        "Auto-start usage windows: {}",
+        if output.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("Poll interval: {}s", output.poll_seconds);
+}
+
+fn print_auto_start_usage_windows_run(output: &AutoStartUsageWindowsRunOutput) {
+    println!(
+        "Auto-start usage windows: {}",
+        if output.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("Checked accounts: {}", output.checked_accounts);
+    if let Some(model) = &output.selected_model {
+        println!("Model: {model}");
+    }
+    for account in &output.pinged_accounts {
+        match &account.detail {
+            Some(detail) => println!("{}: {} ({detail})", account.email, account.status),
+            None => println!("{}: {}", account.email, account.status),
+        }
+    }
+    for skipped in &output.skipped {
+        println!("Skipped: {skipped}");
+    }
 }
 
 fn print_usage_summary(usage: &AccountUsageView) {

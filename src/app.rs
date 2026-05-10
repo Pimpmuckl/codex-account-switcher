@@ -1,7 +1,10 @@
+mod auto_start;
 mod service;
 mod tui;
 
 use uuid::Uuid;
+
+pub use auto_start::spawn_auto_start_usage_windows_worker;
 
 use crate::env::AppEnv;
 use crate::model::{
