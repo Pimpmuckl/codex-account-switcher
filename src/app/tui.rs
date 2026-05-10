@@ -8,13 +8,17 @@ use crate::model::{AccountView, ListOutput, RunningCodexProcess, SaveAction, Sta
 use crate::process::format_process_table;
 use crate::secrets::SecretStore;
 
-use super::{App, InteractiveMode, account_view_matches_identity};
+use super::{App, InteractiveExit, InteractiveMode, account_view_matches_identity};
 
 impl<S> App<S>
 where
     S: SecretStore,
 {
-    pub fn interactive(&self, mode: InteractiveMode, force_running: bool) -> Result<()> {
+    pub fn interactive(
+        &self,
+        mode: InteractiveMode,
+        force_running: bool,
+    ) -> Result<InteractiveExit> {
         let mut default_selection = 0usize;
         if matches!(mode, InteractiveMode::Persistent) {
             self.refresh_saved_usage_cache()?;
@@ -174,10 +178,12 @@ where
                 InteractiveAction::ShowStatus => {
                     feedback = interactive_status_lines(&status);
                 }
+                #[cfg(windows)]
+                InteractiveAction::SendToTray => return Ok(InteractiveExit::SendToTray),
                 InteractiveAction::Quit => break,
             }
         }
-        Ok(())
+        Ok(InteractiveExit::Quit)
     }
 }
 
@@ -188,6 +194,8 @@ pub(crate) enum InteractiveAction {
     Delete(Uuid),
     DeletePrompt,
     ShowStatus,
+    #[cfg(windows)]
+    SendToTray,
     Quit,
 }
 
@@ -212,8 +220,6 @@ struct PersistentRenderState {
 struct AccountLabelWidths {
     email: usize,
     plan: usize,
-    saved: usize,
-    last_used: usize,
     remaining: usize,
     reset: usize,
 }
@@ -263,16 +269,6 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
             .unwrap_or_default(),
         width = widths.plan
     );
-    let saved = format!("Saved: {}", account.updated_at.date());
-    let saved = format!("{:<width$}", saved, width = widths.saved);
-    let last_used = if account.is_active {
-        "Last Used: Active".to_owned()
-    } else if let Some(ts) = account.last_activated_at {
-        format!("Last Used: {}", ts.date())
-    } else {
-        String::new()
-    };
-    let last_used = format!("{:<width$}", last_used, width = widths.last_used);
 
     let (remaining, reset) = if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
@@ -293,7 +289,7 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
     let remaining = format!("{:<width$}", remaining, width = widths.remaining);
     let reset = format!("{:<width$}", reset, width = widths.reset);
 
-    [email, plan, saved, last_used, remaining, reset]
+    [email, plan, remaining, reset]
         .into_iter()
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
@@ -311,17 +307,6 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
                 .map(|plan| format!("Plan: {plan}").len())
                 .unwrap_or(0),
         );
-        widths.saved = widths
-            .saved
-            .max(format!("Saved: {}", account.updated_at.date()).len());
-        widths.last_used = widths.last_used.max(if account.is_active {
-            "Last Used: Active".len()
-        } else if let Some(ts) = account.last_activated_at {
-            format!("Last Used: {}", ts.date()).len()
-        } else {
-            0
-        });
-
         let (remaining, reset) = if let Some(usage) = &account.usage
             && let Some(weekly) = &usage.weekly
         {
@@ -417,6 +402,11 @@ pub(crate) fn build_menu(
         actions.push(InteractiveItem {
             label: "Show status".to_owned(),
             action: InteractiveAction::ShowStatus,
+        });
+        #[cfg(windows)]
+        actions.push(InteractiveItem {
+            label: "Send to Tray".to_owned(),
+            action: InteractiveAction::SendToTray,
         });
     }
     actions.push(InteractiveItem {
@@ -928,8 +918,8 @@ mod tests {
             .expect("current status label");
         assert!(current.contains("person@example.com"));
         assert!(current.contains("Plan: Pro"));
-        assert!(current.contains("Saved: 1970-01-01"));
-        assert!(current.contains("Last Used: Active"));
+        assert!(!current.contains("Saved:"));
+        assert!(!current.contains("Last Used:"));
         assert_eq!(
             menu.actions[0].label,
             "Refresh saved snapshot for person@example.com"
@@ -964,7 +954,8 @@ mod tests {
         );
         assert_eq!(menu.accounts.len(), 1);
         assert!(menu.accounts[0].label.contains("person@example.com"));
-        assert!(menu.accounts[0].label.contains("Saved: 1970-01-01"));
+        assert!(!menu.accounts[0].label.contains("Saved:"));
+        assert!(!menu.accounts[0].label.contains("Last Used:"));
         assert_eq!(
             menu.actions[0].label,
             "Add current account other@example.com to switcher"
