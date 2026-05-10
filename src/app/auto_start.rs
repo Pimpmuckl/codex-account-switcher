@@ -113,6 +113,12 @@ where
         let identity = codex::identity_from_snapshot(&snapshot)?;
         let (refreshed_snapshot, selected_model) =
             run_codex_usage_ping(&self.env, &snapshot, &identity)?;
+        let (_, current_snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
+        if current_snapshot != snapshot {
+            return Err(anyhow!(
+                "saved snapshot changed while ping was running; skipped write-back"
+            ));
+        }
         let refreshed_identity = codex::identity_from_snapshot(&refreshed_snapshot)?;
         self.repository.replace_snapshot(
             &self.env.kind,
@@ -188,8 +194,15 @@ fn run_codex_usage_ping(
     let work_dir =
         std::env::temp_dir().join(format!("codex-account-switcher-ping-{}", Uuid::new_v4()));
     let result = run_codex_usage_ping_in_temp_home(env, snapshot, identity, &work_dir);
-    let _ = fs::remove_dir_all(&work_dir);
-    result
+    let cleanup = remove_temp_auth_home(&work_dir);
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+            "also failed to remove temporary auth home: {cleanup_error:#}"
+        ))),
+    }
 }
 
 fn run_codex_usage_ping_in_temp_home(
@@ -217,6 +230,13 @@ fn run_codex_usage_ping_in_temp_home(
     let mut command = Command::new("codex");
     command
         .env("CODEX_HOME", &temp_env.codex_root)
+        .env("HOME", &temp_env.home_dir)
+        .env("USERPROFILE", &temp_env.home_dir)
+        .env("APPDATA", temp_env.home_dir.join("AppData").join("Roaming"))
+        .env(
+            "LOCALAPPDATA",
+            temp_env.home_dir.join("AppData").join("Local"),
+        )
         .arg("exec")
         .arg("--ephemeral")
         .arg("--ignore-user-config")
@@ -251,6 +271,22 @@ fn run_codex_usage_ping_in_temp_home(
     let refreshed = codex::read_live_auth_bundle(&temp_env)
         .context("failed to read refreshed temporary Codex auth")?;
     Ok((refreshed.snapshot, selected_model))
+}
+
+fn remove_temp_auth_home(path: &Path) -> Result<()> {
+    for attempt in 0..5 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if attempt < 4 => {
+                thread::sleep(StdDuration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to remove {}", path.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: StdDuration) -> Result<ExitStatus> {
