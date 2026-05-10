@@ -278,7 +278,7 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
         } else {
             (
                 format!("Weekly Remaining: {}%", weekly.remaining_percent),
-                format!("Reset: {}", weekly.reset_at.date()),
+                format!("Reset: {}", format_reset_at(weekly.reset_at)),
             )
         }
     } else if account.usage_error.is_some() {
@@ -315,7 +315,7 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
             } else {
                 (
                     format!("Weekly Remaining: {}%", weekly.remaining_percent).len(),
-                    format!("Reset: {}", weekly.reset_at.date()).len(),
+                    format!("Reset: {}", format_reset_at(weekly.reset_at)).len(),
                 )
             }
         } else if account.usage_error.is_some() {
@@ -327,6 +327,15 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
         widths.reset = widths.reset.max(reset);
     }
     widths
+}
+
+fn format_reset_at(reset_at: OffsetDateTime) -> String {
+    format!(
+        "{} {:02}:{:02}",
+        reset_at.date(),
+        reset_at.hour(),
+        reset_at.minute()
+    )
 }
 
 pub(crate) fn build_menu(
@@ -783,7 +792,10 @@ mod tests {
     use crate::app::should_verify_activation_stability;
     use crate::codex::auth_json_fixture;
     use crate::env::AppEnv;
-    use crate::model::{DisplayIdentity, EnvironmentKind, SnapshotBlob};
+    use crate::model::{
+        AccountUsageView, DisplayIdentity, EnvironmentKind, SnapshotBlob, UsageSource,
+        UsageWindowView,
+    };
     use crate::repository::SnapshotRepository;
     use crate::secrets::test_support::MemorySecretStore;
 
@@ -825,6 +837,34 @@ mod tests {
                 usage_error: None,
             }],
         }
+    }
+
+    #[test]
+    fn account_label_includes_reset_time() {
+        let id = Uuid::new_v4();
+        let mut list = sample_list(id, false);
+        list.accounts[0].usage = Some(AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: None,
+            weekly: Some(UsageWindowView {
+                used_percent: 77,
+                remaining_percent: 23,
+                reset_at: OffsetDateTime::UNIX_EPOCH
+                    .replace_date(
+                        time::Date::from_calendar_date(2099, time::Month::May, 12).unwrap(),
+                    )
+                    .replace_time(time::Time::from_hms(13, 56, 0).unwrap()),
+            }),
+            credits: None,
+        });
+
+        let label = render_account_label(
+            &list.accounts[0],
+            account_label_widths(&[&list.accounts[0]]),
+        );
+
+        assert!(label.contains("Reset: 2099-05-12 13:56"));
     }
 
     #[test]
