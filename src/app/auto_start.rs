@@ -19,7 +19,7 @@ use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
 use crate::settings::{load_settings, save_settings};
 
-use super::{App, saved_identity};
+use super::{App, auth_mutation_lock, saved_identity};
 
 pub const AUTO_START_USAGE_WINDOW_POLL_SECONDS: u64 = 300;
 
@@ -62,6 +62,7 @@ where
             return Ok(output);
         }
 
+        let _guard = auth_mutation_lock();
         let accounts = self.repository.list_accounts(&self.env.kind)?;
         output.checked_accounts = accounts.len();
         let now = OffsetDateTime::now_utc();
@@ -116,7 +117,7 @@ where
         }
 
         if let Some(account_id) = original_saved_account_id {
-            if let Err(error) = self.activate_with_running_policy(account_id, false) {
+            if let Err(error) = self.restore_account_for_auto_start(account_id) {
                 codex::restore_snapshot(&self.env, &original.snapshot, &original.identity, false)
                     .with_context(|| {
                     format!("failed to restore original account after activation failed: {error:#}")
@@ -136,9 +137,9 @@ where
         email: &str,
         selected_model: Option<&str>,
     ) -> Result<AutoStartUsageWindowAccountResult> {
-        self.activate_with_running_policy(account_id, false)?;
+        self.restore_account_for_auto_start(account_id)?;
         run_codex_usage_ping(selected_model)?;
-        let saved = self.save_current()?;
+        let saved = self.save_current_unlocked()?;
         let usage = self.usage(Some(saved.account.id))?;
         let now = OffsetDateTime::now_utc();
         let status = match usage.usage.weekly {
@@ -152,6 +153,17 @@ where
             status: status.to_owned(),
             detail: None,
         })
+    }
+
+    fn restore_account_for_auto_start(&self, account_id: Uuid) -> Result<()> {
+        let (snapshot, snapshot_identity, restore_identity) =
+            self.load_activation_target(account_id)?;
+        codex::restore_snapshot(&self.env, &snapshot, &restore_identity, false)
+            .context("failed to restore usage-window account snapshot")?;
+        self.repository
+            .sync_activated_account(&self.env.kind, account_id, &snapshot_identity)
+            .context("restored usage-window account but failed to update local metadata")?;
+        Ok(())
     }
 }
 

@@ -2,6 +2,8 @@ mod auto_start;
 mod service;
 mod tui;
 
+use std::sync::{Mutex, MutexGuard};
+
 use uuid::Uuid;
 
 pub use auto_start::spawn_auto_start_usage_windows_worker;
@@ -15,6 +17,14 @@ use crate::repository::SnapshotRepository;
 pub struct App<S> {
     env: AppEnv,
     repository: SnapshotRepository<S>,
+}
+
+static AUTH_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+pub(super) fn auth_mutation_lock() -> MutexGuard<'static, ()> {
+    AUTH_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Clone, Copy)]

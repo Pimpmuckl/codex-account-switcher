@@ -13,8 +13,8 @@ use crate::secrets::SecretStore;
 use crate::usage::{fetch_usage, usage_target_from_snapshot};
 
 use super::{
-    App, account_view, match_saved_account, saved_identity, should_verify_activation_stability,
-    subject_bound_identity_matches,
+    App, account_view, auth_mutation_lock, match_saved_account, saved_identity,
+    should_verify_activation_stability, subject_bound_identity_matches,
 };
 
 impl<S> App<S>
@@ -59,6 +59,11 @@ where
     }
 
     pub fn save_current(&self) -> Result<SaveOutput> {
+        let _guard = auth_mutation_lock();
+        self.save_current_unlocked()
+    }
+
+    pub(super) fn save_current_unlocked(&self) -> Result<SaveOutput> {
         let live = codex::read_live_auth_bundle(&self.env).with_context(|| {
             format!(
                 "no live Codex auth bundle found at {}",
@@ -92,8 +97,9 @@ where
         account_id: Uuid,
         force_running: bool,
     ) -> Result<ActivateOutput> {
+        let _guard = auth_mutation_lock();
         let warnings = crate::process::detect_running_codex_processes();
-        self.refresh_current_saved_account_before_activation();
+        self.refresh_current_saved_account_before_activation_unlocked();
         let (snapshot, snapshot_identity, restore_identity) =
             self.load_activation_target(account_id)?;
         let verify_stable = should_verify_activation_stability(force_running, &warnings);
@@ -109,7 +115,7 @@ where
         })
     }
 
-    fn refresh_current_saved_account_before_activation(&self) {
+    fn refresh_current_saved_account_before_activation_unlocked(&self) {
         let Ok(saved_accounts) = self.repository.list_accounts(&self.env.kind) else {
             return;
         };
@@ -119,13 +125,13 @@ where
         let Some(_current_saved) = match_saved_account(&saved_accounts, &live.identity) else {
             return;
         };
-        let Ok(saved) = self.save_current() else {
+        let Ok(saved) = self.save_current_unlocked() else {
             return;
         };
         let _ = self.usage(Some(saved.account.id));
     }
 
-    fn load_activation_target(
+    pub(super) fn load_activation_target(
         &self,
         account_id: Uuid,
     ) -> Result<(SnapshotBlob, DisplayIdentity, DisplayIdentity)> {
