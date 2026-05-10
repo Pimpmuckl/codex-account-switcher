@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -8,7 +9,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use uuid::Uuid;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
 use crate::app::App;
@@ -18,6 +19,7 @@ use crate::secrets::SecretStore;
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
+    AutoStartUsageWindowsChecked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +40,7 @@ struct TrayState<'a, S> {
     app: &'a App<S>,
     tray_icon: Option<TrayIcon>,
     commands: HashMap<String, TrayCommand>,
+    event_proxy: EventLoopProxy<UserEvent>,
     exit: TrayExit,
 }
 
@@ -58,14 +61,16 @@ where
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let proxy = event_loop.create_proxy();
+    let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event| {
-        let _ = proxy.send_event(UserEvent::Menu(event));
+        let _ = menu_proxy.send_event(UserEvent::Menu(event));
     }));
 
     let mut state = TrayState {
         app,
         tray_icon: None,
         commands: HashMap::new(),
+        event_proxy: proxy,
         exit: TrayExit::Quit,
     };
     event_loop
@@ -105,7 +110,12 @@ where
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::Menu(event) = event;
+        let UserEvent::Menu(event) = event else {
+            if let Err(error) = self.update_tray_menu() {
+                eprintln!("failed to refresh tray menu: {error:#}");
+            }
+            return;
+        };
         let command = self.commands.get(event.id.as_ref()).copied();
         match command {
             Some(TrayCommand::Activate(account_id)) => {
@@ -119,8 +129,20 @@ where
             Some(TrayCommand::SetAutoStartUsageWindows(enabled)) => {
                 if let Err(error) = self.app.set_auto_start_usage_windows(enabled) {
                     eprintln!("failed to update auto-start usage windows from tray: {error:#}");
-                } else if enabled && let Err(error) = self.app.auto_start_usage_windows_once(true) {
-                    eprintln!("failed to run auto-start usage window check from tray: {error:#}");
+                } else if enabled {
+                    let proxy = self.event_proxy.clone();
+                    let _ = thread::Builder::new()
+                        .name("tray-auto-start-usage-windows".to_owned())
+                        .spawn(move || {
+                            if let Err(error) =
+                                crate::app::run_auto_start_usage_windows_check_now()
+                            {
+                                eprintln!(
+                                    "failed to run auto-start usage window check from tray: {error:#}"
+                                );
+                            }
+                            let _ = proxy.send_event(UserEvent::AutoStartUsageWindowsChecked);
+                        });
                 }
                 if let Err(error) = self.update_tray_menu() {
                     eprintln!("failed to refresh tray menu: {error:#}");

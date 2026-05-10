@@ -154,6 +154,10 @@ pub fn spawn_auto_start_usage_windows_worker() {
     });
 }
 
+pub(crate) fn run_auto_start_usage_windows_check_now() -> Result<()> {
+    run_auto_start_usage_windows_for_detected_env()
+}
+
 fn run_auto_start_usage_windows_for_detected_env() -> Result<()> {
     let env = env::detect()?;
     let repository = SnapshotRepository::new(

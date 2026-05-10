@@ -195,7 +195,7 @@ pub fn run() -> Result<()> {
             } else {
                 app.auto_start_usage_windows_status()?
             };
-            if run {
+            if run && !disable {
                 let output = app.auto_start_usage_windows_once(false)?;
                 if json {
                     print_json(&output)?;
