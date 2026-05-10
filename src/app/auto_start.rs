@@ -1,8 +1,9 @@
 use std::fs;
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -10,16 +11,16 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::codex;
-use crate::env;
+use crate::env::{self, AppEnv};
 use crate::model::{
     AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
-    AutoStartUsageWindowsStatusOutput,
+    AutoStartUsageWindowsStatusOutput, DisplayIdentity, SnapshotBlob,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
 use crate::settings::{load_settings, save_settings};
 
-use super::{App, auth_mutation_lock, saved_identity};
+use super::App;
 
 pub const AUTO_START_USAGE_WINDOW_POLL_SECONDS: u64 = 300;
 
@@ -54,7 +55,6 @@ where
         let mut output = AutoStartUsageWindowsRunOutput {
             enabled,
             checked_accounts: 0,
-            selected_model: None,
             pinged_accounts: Vec::new(),
             skipped: Vec::new(),
         };
@@ -62,7 +62,6 @@ where
             return Ok(output);
         }
 
-        let _guard = auth_mutation_lock();
         let accounts = self.repository.list_accounts(&self.env.kind)?;
         output.checked_accounts = accounts.len();
         let now = OffsetDateTime::now_utc();
@@ -88,44 +87,18 @@ where
             return Ok(output);
         }
 
-        let Some(original) = codex::try_read_live_auth_bundle(&self.env)? else {
-            output
-                .skipped
-                .push("no live account to restore after ping".to_owned());
-            return Ok(output);
-        };
-        let original_saved_account_id = accounts
-            .iter()
-            .find(|account| saved_identity(account).matches(&original.identity))
-            .map(|account| account.id);
-
-        let selected_model = best_available_mini_model();
-        output.selected_model = selected_model.clone();
         for (account_id, email) in due_accounts {
-            let result =
-                match self.ping_usage_window_account(account_id, &email, selected_model.as_deref())
-                {
-                    Ok(result) => result,
-                    Err(error) => AutoStartUsageWindowAccountResult {
-                        account_id,
-                        email,
-                        status: "failed".to_owned(),
-                        detail: Some(format!("{error:#}")),
-                    },
-                };
+            let result = match self.ping_usage_window_account(account_id, &email) {
+                Ok(result) => result,
+                Err(error) => AutoStartUsageWindowAccountResult {
+                    account_id,
+                    email,
+                    status: "failed".to_owned(),
+                    selected_model: None,
+                    detail: Some(format!("{error:#}")),
+                },
+            };
             output.pinged_accounts.push(result);
-        }
-
-        if let Some(account_id) = original_saved_account_id {
-            if let Err(error) = self.restore_account_for_auto_start(account_id) {
-                codex::restore_snapshot(&self.env, &original.snapshot, &original.identity, false)
-                    .with_context(|| {
-                    format!("failed to restore original account after activation failed: {error:#}")
-                })?;
-            }
-        } else {
-            codex::restore_snapshot(&self.env, &original.snapshot, &original.identity, false)
-                .context("failed to restore original account after usage-window ping")?;
         }
 
         Ok(output)
@@ -135,12 +108,20 @@ where
         &self,
         account_id: Uuid,
         email: &str,
-        selected_model: Option<&str>,
     ) -> Result<AutoStartUsageWindowAccountResult> {
-        self.restore_account_for_auto_start(account_id)?;
-        run_codex_usage_ping(selected_model)?;
-        let saved = self.save_current_unlocked()?;
-        let usage = self.usage(Some(saved.account.id))?;
+        let (_, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
+        let identity = codex::identity_from_snapshot(&snapshot)?;
+        let (refreshed_snapshot, selected_model) =
+            run_codex_usage_ping(&self.env, &snapshot, &identity)?;
+        let refreshed_identity = codex::identity_from_snapshot(&refreshed_snapshot)?;
+        self.repository.replace_snapshot(
+            &self.env.kind,
+            account_id,
+            &refreshed_identity,
+            &refreshed_snapshot,
+            None,
+        )?;
+        let usage = self.usage(Some(account_id))?;
         let now = OffsetDateTime::now_utc();
         let status = match usage.usage.weekly {
             Some(weekly) if weekly.reset_at > now => "started",
@@ -151,19 +132,9 @@ where
             account_id,
             email: email.to_owned(),
             status: status.to_owned(),
+            selected_model,
             detail: None,
         })
-    }
-
-    fn restore_account_for_auto_start(&self, account_id: Uuid) -> Result<()> {
-        let (snapshot, snapshot_identity, restore_identity) =
-            self.load_activation_target(account_id)?;
-        codex::restore_snapshot(&self.env, &snapshot, &restore_identity, false)
-            .context("failed to restore usage-window account snapshot")?;
-        self.repository
-            .sync_activated_account(&self.env.kind, account_id, &snapshot_identity)
-            .context("restored usage-window account but failed to update local metadata")?;
-        Ok(())
     }
 }
 
@@ -205,24 +176,52 @@ fn usage_window_needs_ping(reset_at: OffsetDateTime, now: OffsetDateTime) -> boo
     reset_at <= now
 }
 
-fn run_codex_usage_ping(selected_model: Option<&str>) -> Result<()> {
+fn run_codex_usage_ping(
+    env: &AppEnv,
+    snapshot: &SnapshotBlob,
+    identity: &DisplayIdentity,
+) -> Result<(SnapshotBlob, Option<String>)> {
     let work_dir =
         std::env::temp_dir().join(format!("codex-account-switcher-ping-{}", Uuid::new_v4()));
-    fs::create_dir_all(&work_dir)
+    let result = run_codex_usage_ping_in_temp_home(env, snapshot, identity, &work_dir);
+    let _ = fs::remove_dir_all(&work_dir);
+    result
+}
+
+fn run_codex_usage_ping_in_temp_home(
+    env: &AppEnv,
+    snapshot: &SnapshotBlob,
+    identity: &DisplayIdentity,
+    work_dir: &Path,
+) -> Result<(SnapshotBlob, Option<String>)> {
+    fs::create_dir_all(work_dir)
         .with_context(|| format!("failed to create {}", work_dir.display()))?;
+    let temp_env = AppEnv {
+        kind: env.kind.clone(),
+        home_dir: work_dir.to_path_buf(),
+        codex_root: work_dir.join("codex-home"),
+        app_data_dir: work_dir.join("app-data"),
+    };
+    codex::restore_snapshot(&temp_env, snapshot, identity, false)
+        .context("failed to seed temporary Codex auth home")?;
+
     let instruction_file = work_dir.join("instructions.md");
     fs::write(&instruction_file, PING_INSTRUCTIONS)
         .with_context(|| format!("failed to write {}", instruction_file.display()))?;
 
+    let selected_model = best_available_mini_model(&temp_env.codex_root);
     let mut command = Command::new("codex");
     command
+        .env("CODEX_HOME", &temp_env.codex_root)
         .arg("exec")
         .arg("--ephemeral")
         .arg("--ignore-user-config")
         .arg("--ignore-rules")
         .arg("--skip-git-repo-check")
         .arg("--cd")
-        .arg(&work_dir)
+        .arg(work_dir)
+        .arg("-c")
+        .arg("cli_auth_credentials_store=\"file\"")
         .arg("-c")
         .arg(format!(
             "model_instructions_file={}",
@@ -230,29 +229,40 @@ fn run_codex_usage_ping(selected_model: Option<&str>) -> Result<()> {
         ))
         .arg("-c")
         .arg("model_reasoning_effort=\"low\"");
-    if let Some(model) = selected_model {
+    if let Some(model) = selected_model.as_deref() {
         command.arg("-m").arg(model);
     }
     command
         .arg(PING_PROMPT)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     strip_codex_thread_env(&mut command);
 
-    let output = command.output();
-    let _ = fs::remove_dir_all(&work_dir);
-    let output = output.context("failed to run `codex exec`; make sure `codex` is on PATH")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        return Err(anyhow!(
-            "`codex exec` failed with {}: {detail}",
-            output.status
-        ));
+    let status = run_command_with_timeout(&mut command, StdDuration::from_secs(120))
+        .context("failed to run `codex exec`; make sure `codex` is on PATH")?;
+    if !status.success() {
+        return Err(anyhow!("`codex exec` failed with {status}"));
     }
-    Ok(())
+    let refreshed = codex::read_live_auth_bundle(&temp_env)
+        .context("failed to read refreshed temporary Codex auth")?;
+    Ok((refreshed.snapshot, selected_model))
+}
+
+fn run_command_with_timeout(command: &mut Command, timeout: StdDuration) -> Result<ExitStatus> {
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("process timed out after {}s", timeout.as_secs()));
+        }
+        thread::sleep(StdDuration::from_millis(100));
+    }
 }
 
 fn strip_codex_thread_env(command: &mut Command) {
@@ -261,15 +271,18 @@ fn strip_codex_thread_env(command: &mut Command) {
     }
 }
 
-fn best_available_mini_model() -> Option<String> {
+fn best_available_mini_model(codex_home: &Path) -> Option<String> {
     for bundled in [false, true] {
         let mut command = Command::new("codex");
+        command.env("CODEX_HOME", codex_home);
         command.arg("debug").arg("models");
         if bundled {
             command.arg("--bundled");
         }
         strip_codex_thread_env(&mut command);
-        let output = command.output().ok()?;
+        let Ok(output) = command.output() else {
+            continue;
+        };
         if !output.status.success() {
             continue;
         }

@@ -162,7 +162,6 @@ pub struct AutoStartUsageWindowsStatusOutput {
 pub struct AutoStartUsageWindowsRunOutput {
     pub enabled: bool,
     pub checked_accounts: usize,
-    pub selected_model: Option<String>,
     pub pinged_accounts: Vec<AutoStartUsageWindowAccountResult>,
     pub skipped: Vec<String>,
 }
@@ -172,6 +171,7 @@ pub struct AutoStartUsageWindowAccountResult {
     pub account_id: Uuid,
     pub email: String,
     pub status: String,
+    pub selected_model: Option<String>,
     pub detail: Option<String>,
 }
 

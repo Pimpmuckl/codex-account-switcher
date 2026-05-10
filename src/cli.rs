@@ -196,7 +196,7 @@ pub fn run() -> Result<()> {
                 app.auto_start_usage_windows_status()?
             };
             if run {
-                let output = app.auto_start_usage_windows_once(true)?;
+                let output = app.auto_start_usage_windows_once(false)?;
                 if json {
                     print_json(&output)?;
                 } else {
@@ -304,13 +304,17 @@ fn print_auto_start_usage_windows_run(output: &AutoStartUsageWindowsRunOutput) {
         }
     );
     println!("Checked accounts: {}", output.checked_accounts);
-    if let Some(model) = &output.selected_model {
-        println!("Model: {model}");
-    }
     for account in &output.pinged_accounts {
-        match &account.detail {
-            Some(detail) => println!("{}: {} ({detail})", account.email, account.status),
-            None => println!("{}: {}", account.email, account.status),
+        match (&account.selected_model, &account.detail) {
+            (Some(model), Some(detail)) => {
+                println!(
+                    "{}: {} via {model} ({detail})",
+                    account.email, account.status
+                )
+            }
+            (Some(model), None) => println!("{}: {} via {model}", account.email, account.status),
+            (None, Some(detail)) => println!("{}: {} ({detail})", account.email, account.status),
+            (None, None) => println!("{}: {}", account.email, account.status),
         }
     }
     for skipped in &output.skipped {
