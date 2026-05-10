@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::codex;
 use crate::env::{self, AppEnv};
 use crate::model::{
-    AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
+    AUTH_FILES, AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
     AutoStartUsageWindowsStatusOutput, DisplayIdentity, SnapshotBlob,
 };
 use crate::repository::SnapshotRepository;
@@ -202,10 +202,22 @@ fn run_codex_usage_ping(
             snapshot,
             cleanup_warning: None,
         }),
-        (Ok(snapshot), Err(error)) => Ok(CodexUsagePingResult {
-            snapshot,
-            cleanup_warning: Some(format!("temporary auth cleanup failed: {error:#}")),
-        }),
+        (Ok(snapshot), Err(error)) => {
+            scrub_temp_auth_material(&work_dir)
+                .context("temporary auth cleanup failed and auth scrub failed")?;
+            let cleanup_warning = match remove_temp_auth_home(&work_dir) {
+                Ok(()) => {
+                    format!("temporary auth cleanup initially failed, then recovered: {error:#}")
+                }
+                Err(final_error) => format!(
+                    "temporary auth cleanup failed after auth scrub; non-auth temp files may remain: {error:#}; final cleanup failed: {final_error:#}"
+                ),
+            };
+            Ok(CodexUsagePingResult {
+                snapshot,
+                cleanup_warning: Some(cleanup_warning),
+            })
+        }
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup_error)) => Err(error.context(format!(
             "also failed to remove temporary auth home: {cleanup_error:#}"
@@ -293,6 +305,59 @@ fn remove_temp_auth_home(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn scrub_temp_auth_material(work_dir: &Path) -> Result<()> {
+    let codex_home = work_dir.join("codex-home");
+    match fs::remove_dir_all(&codex_home) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
+    }
+
+    let mut errors = Vec::new();
+    for file_name in AUTH_FILES {
+        remove_file_if_exists(&codex_home.join(file_name), &mut errors);
+    }
+    match fs::read_dir(&codex_home) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                if file_name.to_string_lossy().starts_with(".cas-") {
+                    remove_dir_if_exists(&entry.path(), &mut errors);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => errors.push(format!(
+            "failed to inspect {}: {error}",
+            codex_home.display()
+        )),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "failed to scrub temporary auth material: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn remove_file_if_exists(path: &Path, errors: &mut Vec<String>) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => errors.push(format!("failed to remove {}: {error}", path.display())),
+    }
+}
+
+fn remove_dir_if_exists(path: &Path, errors: &mut Vec<String>) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => errors.push(format!("failed to remove {}: {error}", path.display())),
+    }
+}
+
 fn run_command_with_timeout(command: &mut Command, timeout: StdDuration) -> Result<ExitStatus> {
     let mut child = command.spawn()?;
     let started = Instant::now();
@@ -352,5 +417,22 @@ mod tests {
             toml_string_literal(r#"C:\Temp\codex "ping"\instructions.md"#),
             r#""C:\\Temp\\codex \"ping\"\\instructions.md""#
         );
+    }
+
+    #[test]
+    fn scrub_temp_auth_material_removes_managed_auth_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        let backup_dir = codex_home.join(".cas-backup-test");
+        fs::create_dir_all(&backup_dir)?;
+        fs::write(codex_home.join("auth.json"), "{}")?;
+        fs::write(codex_home.join("cap_sid"), "sid")?;
+        fs::write(backup_dir.join("auth.json"), "{}")?;
+        fs::write(backup_dir.join("cap_sid"), "sid")?;
+
+        scrub_temp_auth_material(temp.path())?;
+
+        assert!(!codex_home.exists());
+        Ok(())
     }
 }
