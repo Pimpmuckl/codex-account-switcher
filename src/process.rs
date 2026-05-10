@@ -1,4 +1,4 @@
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::model::RunningCodexProcess;
 
@@ -7,8 +7,15 @@ const EXECUTABLE_WIDTH: usize = 12;
 const ROLE_WIDTH: usize = 14;
 
 pub fn detect_running_codex_processes() -> Vec<RunningCodexProcess> {
-    let mut system = System::new_all();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always)
+            .without_tasks(),
+    );
     let current_pid = std::process::id();
     let mut processes = system
         .processes()
