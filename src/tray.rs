@@ -131,11 +131,12 @@ where
                     eprintln!("failed to update auto-start usage windows from tray: {error:#}");
                 } else if enabled {
                     let proxy = self.event_proxy.clone();
+                    let env = self.app.env().clone();
                     let _ = thread::Builder::new()
                         .name("tray-auto-start-usage-windows".to_owned())
                         .spawn(move || {
                             if let Err(error) =
-                                crate::app::run_auto_start_usage_windows_check_now()
+                                crate::app::run_auto_start_usage_windows_check_now(env)
                             {
                                 eprintln!(
                                     "failed to run auto-start usage window check from tray: {error:#}"

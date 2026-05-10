@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::codex;
-use crate::env::{self, AppEnv};
+use crate::env::AppEnv;
 use crate::model::{
     AUTH_FILES, AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
     AutoStartUsageWindowsStatusOutput, DisplayIdentity, SnapshotBlob,
@@ -61,6 +61,10 @@ where
             return Ok(output);
         }
 
+        let _run_guard = AUTO_START_RUN_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| anyhow!("auto-start usage-window run lock poisoned"))?;
         let accounts = self.repository.list_accounts(&self.env.kind)?;
         output.checked_accounts = accounts.len();
         let now = OffsetDateTime::now_utc();
@@ -110,7 +114,8 @@ where
         let (_, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
         let identity = codex::identity_from_snapshot(&snapshot)?;
         let ping_result = run_codex_usage_ping(&self.env, &snapshot, &identity)?;
-        let (_, current_snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
+        let (current_metadata, current_snapshot) =
+            self.repository.load_snapshot(&self.env.kind, account_id)?;
         if current_snapshot != snapshot {
             return Err(anyhow!(
                 "saved snapshot changed while ping was running; skipped write-back"
@@ -122,7 +127,7 @@ where
             account_id,
             &refreshed_identity,
             &ping_result.snapshot,
-            None,
+            current_metadata.cached_usage,
         )?;
         let usage = self.usage(Some(account_id))?;
         let now = OffsetDateTime::now_utc();
@@ -140,14 +145,16 @@ where
     }
 }
 
-pub fn spawn_auto_start_usage_windows_worker() {
+static AUTO_START_RUN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub fn spawn_auto_start_usage_windows_worker(env: AppEnv) {
     static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
+    STARTED.get_or_init(move || {
         let _ = thread::Builder::new()
             .name("auto-start-usage-windows".to_owned())
-            .spawn(|| {
+            .spawn(move || {
                 loop {
-                    if let Err(error) = run_auto_start_usage_windows_for_detected_env() {
+                    if let Err(error) = run_auto_start_usage_windows_for_env(env.clone()) {
                         eprintln!("auto-start usage-window check failed: {error:#}");
                     }
                     thread::sleep(StdDuration::from_secs(AUTO_START_USAGE_WINDOW_POLL_SECONDS));
@@ -157,12 +164,11 @@ pub fn spawn_auto_start_usage_windows_worker() {
 }
 
 #[cfg(windows)]
-pub(crate) fn run_auto_start_usage_windows_check_now() -> Result<()> {
-    run_auto_start_usage_windows_for_detected_env()
+pub(crate) fn run_auto_start_usage_windows_check_now(env: AppEnv) -> Result<()> {
+    run_auto_start_usage_windows_for_env(env)
 }
 
-fn run_auto_start_usage_windows_for_detected_env() -> Result<()> {
-    let env = env::detect()?;
+fn run_auto_start_usage_windows_for_env(env: AppEnv) -> Result<()> {
     let repository = SnapshotRepository::new(
         &env.app_data_dir,
         MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),

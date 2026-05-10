@@ -25,6 +25,10 @@ where
         Self { env, repository }
     }
 
+    pub(crate) fn env(&self) -> &AppEnv {
+        &self.env
+    }
+
     pub fn status(&self) -> Result<StatusOutput> {
         let saved_accounts = self.repository.list_accounts(&self.env.kind)?;
         let live = codex::try_read_live_auth_bundle(&self.env)?;

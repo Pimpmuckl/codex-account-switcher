@@ -216,7 +216,7 @@ fn run_interactive_app<S>(app: &App<S>) -> Result<()>
 where
     S: crate::secrets::SecretStore,
 {
-    crate::app::spawn_auto_start_usage_windows_worker();
+    crate::app::spawn_auto_start_usage_windows_worker(app.env().clone());
     #[cfg(windows)]
     {
         loop {
