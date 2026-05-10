@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::app::{App, InteractiveMode};
+use crate::app::{App, InteractiveExit, InteractiveMode};
 use crate::env;
 use crate::model::{AccountUsageView, AccountView, RunningCodexProcess, UsageOutput};
 use crate::process::format_process_table;
@@ -63,7 +63,7 @@ pub fn run() -> Result<()> {
     );
     let app = App::new(env, repository);
     match cli.command {
-        None => app.interactive(InteractiveMode::Persistent, false),
+        None => run_interactive_app(&app),
         Some(Command::Status { json }) => {
             let status = app.status()?;
             if json {
@@ -140,7 +140,7 @@ pub fn run() -> Result<()> {
                     app.activate_with_running_policy(account_id, force)?
                 }
                 None => {
-                    app.interactive(InteractiveMode::ActivateOnce, force)?;
+                    let _ = app.interactive(InteractiveMode::ActivateOnce, force)?;
                     return Ok(());
                 }
             };
@@ -158,7 +158,7 @@ pub fn run() -> Result<()> {
             let output = match account_id {
                 Some(account_id) => app.delete(account_id)?,
                 None => {
-                    app.interactive(InteractiveMode::DeleteOnce, false)?;
+                    let _ = app.interactive(InteractiveMode::DeleteOnce, false)?;
                     return Ok(());
                 }
             };
@@ -168,6 +168,25 @@ pub fn run() -> Result<()> {
                 println!("Deleted saved snapshot {}", output.deleted_account_id);
             }
             Ok(())
+        }
+    }
+}
+
+fn run_interactive_app<S>(app: &App<S>) -> Result<()>
+where
+    S: crate::secrets::SecretStore,
+{
+    loop {
+        match app.interactive(InteractiveMode::Persistent, false)? {
+            InteractiveExit::Quit => return Ok(()),
+            #[cfg(windows)]
+            InteractiveExit::SendToTray => {
+                crate::tray::hide_console_window();
+                match crate::tray::run(app)? {
+                    crate::tray::TrayExit::ShowTui => crate::tray::show_console_window(),
+                    crate::tray::TrayExit::Quit => return Ok(()),
+                }
+            }
         }
     }
 }

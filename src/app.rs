@@ -21,6 +21,13 @@ pub enum InteractiveMode {
     DeleteOnce,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteractiveExit {
+    Quit,
+    #[cfg(windows)]
+    SendToTray,
+}
+
 fn account_view(
     account: SavedAccountMetadata,
     active_id: Option<Uuid>,
