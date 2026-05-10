@@ -4,7 +4,10 @@ use dialoguer::{Select, theme::ColorfulTheme};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::model::{AccountView, ListOutput, RunningCodexProcess, SaveAction, StatusOutput};
+use crate::model::{
+    AccountView, AutoStartUsageWindowsRunOutput, ListOutput, RunningCodexProcess, SaveAction,
+    StatusOutput,
+};
 use crate::process::format_process_table;
 use crate::secrets::SecretStore;
 
@@ -33,16 +36,28 @@ where
                     .find(|account| account_view_matches_identity(account, identity))
                     .map(|account| account.id)
             });
+            let auto_start_usage_windows_enabled = matches!(mode, InteractiveMode::Persistent)
+                && self.auto_start_usage_windows_status()?.enabled;
 
-            let menu = build_menu(mode, &status, &list, current_saved);
+            let menu = build_menu(
+                mode,
+                &status,
+                &list,
+                current_saved,
+                auto_start_usage_windows_enabled,
+            );
             let selection = match mode {
                 InteractiveMode::Persistent => {
                     select_persistent_entry(&menu, default_selection, &feedback)?
                 }
                 InteractiveMode::ActivateOnce | InteractiveMode::DeleteOnce => {
                     let labels = menu.labels();
-                    Select::with_theme(&ColorfulTheme::default())
-                        .with_prompt(menu.prompt)
+                    let theme = ColorfulTheme::default();
+                    let mut select = Select::with_theme(&theme);
+                    if !menu.prompt.is_empty() {
+                        select = select.with_prompt(menu.prompt);
+                    }
+                    select
                         .items(&labels)
                         .default(default_selection.min(menu.len().saturating_sub(1)))
                         .interact()?
@@ -178,6 +193,34 @@ where
                 InteractiveAction::ShowStatus => {
                     feedback = interactive_status_lines(&status);
                 }
+                InteractiveAction::SetAutoStartUsageWindows(enabled) => {
+                    match self.set_auto_start_usage_windows(enabled) {
+                        Ok(output) => feedback.push(format!(
+                            "Auto-start usage windows {}.",
+                            if output.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        )),
+                        Err(error) => {
+                            feedback =
+                                error_feedback("Updating auto-start usage windows failed.", error);
+                            continue;
+                        }
+                    }
+                    if enabled {
+                        match self.auto_start_usage_windows_once(true) {
+                            Ok(output) => {
+                                feedback.extend(auto_start_usage_window_feedback(&output))
+                            }
+                            Err(error) => {
+                                feedback =
+                                    error_feedback("Auto-start usage window check failed.", error);
+                            }
+                        }
+                    }
+                }
                 #[cfg(windows)]
                 InteractiveAction::SendToTray => return Ok(InteractiveExit::SendToTray),
                 InteractiveAction::Quit => break,
@@ -194,6 +237,7 @@ pub(crate) enum InteractiveAction {
     Delete(Uuid),
     DeletePrompt,
     ShowStatus,
+    SetAutoStartUsageWindows(bool),
     #[cfg(windows)]
     SendToTray,
     Quit,
@@ -343,6 +387,7 @@ pub(crate) fn build_menu(
     status: &StatusOutput,
     list: &ListOutput,
     current_saved: Option<Uuid>,
+    auto_start_usage_windows_enabled: bool,
 ) -> InteractiveMenu {
     let active_account = current_saved
         .and_then(|saved_id| list.accounts.iter().find(|account| account.id == saved_id));
@@ -409,6 +454,14 @@ pub(crate) fn build_menu(
             });
         }
         actions.push(InteractiveItem {
+            label: if auto_start_usage_windows_enabled {
+                "Disable auto-start usage windows".to_owned()
+            } else {
+                "Enable auto-start usage windows".to_owned()
+            },
+            action: InteractiveAction::SetAutoStartUsageWindows(!auto_start_usage_windows_enabled),
+        });
+        actions.push(InteractiveItem {
             label: "Show status".to_owned(),
             action: InteractiveAction::ShowStatus,
         });
@@ -424,9 +477,7 @@ pub(crate) fn build_menu(
     });
 
     let prompt = match mode {
-        InteractiveMode::Persistent | InteractiveMode::ActivateOnce => {
-            "Which account do you want to activate?"
-        }
+        InteractiveMode::Persistent | InteractiveMode::ActivateOnce => "",
         InteractiveMode::DeleteOnce => "Which saved account do you want to delete?",
     };
 
@@ -513,8 +564,10 @@ fn render_persistent_menu(
         term.write_line("")?;
         lines += 1;
     }
-    term.write_line(&style(menu.prompt).bold().to_string())?;
-    lines += 1;
+    if !menu.prompt.is_empty() {
+        term.write_line(&style(menu.prompt).bold().to_string())?;
+        lines += 1;
+    }
     term.write_line(&render_section_heading("Active Account"))?;
     lines += 1;
     if let Some(current_status_label) = &menu.current_status_label {
@@ -688,6 +741,26 @@ fn interactive_status_lines(status: &StatusOutput) -> Vec<String> {
 fn process_summary_lines(title: &str, processes: &[RunningCodexProcess]) -> Vec<String> {
     let mut lines = vec![format!("{title}:")];
     lines.extend(format_process_table(processes));
+    lines
+}
+
+fn auto_start_usage_window_feedback(output: &AutoStartUsageWindowsRunOutput) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Checked {} saved accounts for due weekly windows.",
+        output.checked_accounts
+    )];
+    if output.pinged_accounts.is_empty() && output.skipped.is_empty() {
+        lines.push("No due weekly windows found.".to_owned());
+    }
+    for account in &output.pinged_accounts {
+        lines.push(match &account.detail {
+            Some(detail) => format!("{}: {} ({detail})", account.email, account.status),
+            None => format!("{}: {}", account.email, account.status),
+        });
+    }
+    for skipped in &output.skipped {
+        lines.push(format!("Skipped: {skipped}"));
+    }
     lines
 }
 
@@ -875,7 +948,9 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, true),
             Some(id),
+            false,
         );
+        assert_eq!(menu.prompt, "");
         assert_eq!(menu.accounts.len(), 0);
         assert_eq!(menu.len(), 1);
         assert!(matches!(menu.action(0), InteractiveAction::Quit));
@@ -889,6 +964,7 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, true),
             Some(id),
+            false,
         );
         assert_eq!(menu.prompt, "Which saved account do you want to delete?");
         assert_eq!(menu.len(), 2);
@@ -905,6 +981,7 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, false),
             Some(id),
+            false,
         );
         assert_eq!(menu.accounts.len(), 1);
         assert!(matches!(menu.action(1), InteractiveAction::SaveCurrent));
@@ -912,6 +989,44 @@ mod tests {
             menu.actions[0].label,
             "Refresh saved snapshot for person@example.com"
         );
+    }
+
+    #[test]
+    fn persistent_menu_shows_auto_start_usage_window_toggle() {
+        let id = Uuid::new_v4();
+        let disabled_menu = build_menu(
+            InteractiveMode::Persistent,
+            &sample_status(Some(id)),
+            &sample_list(id, false),
+            Some(id),
+            false,
+        );
+        let disabled_toggle = disabled_menu
+            .actions
+            .iter()
+            .find(|item| item.label == "Enable auto-start usage windows")
+            .expect("enable toggle");
+        assert!(matches!(
+            disabled_toggle.action,
+            InteractiveAction::SetAutoStartUsageWindows(true)
+        ));
+
+        let enabled_menu = build_menu(
+            InteractiveMode::Persistent,
+            &sample_status(Some(id)),
+            &sample_list(id, false),
+            Some(id),
+            true,
+        );
+        let enabled_toggle = enabled_menu
+            .actions
+            .iter()
+            .find(|item| item.label == "Disable auto-start usage windows")
+            .expect("disable toggle");
+        assert!(matches!(
+            enabled_toggle.action,
+            InteractiveAction::SetAutoStartUsageWindows(false)
+        ));
     }
 
     #[test]
@@ -937,6 +1052,7 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, false),
             Some(id),
+            false,
         );
         assert_eq!(jump_section(&menu, 0), 1);
         assert_eq!(jump_section(&menu, 1), 0);
@@ -950,6 +1066,7 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, true),
             Some(id),
+            false,
         );
         assert_eq!(menu.accounts.len(), 0);
         let current = menu
@@ -987,6 +1104,7 @@ mod tests {
             &status,
             &sample_list(id, false),
             None,
+            false,
         );
         assert_eq!(
             menu.current_status_label.as_deref(),
@@ -1036,7 +1154,7 @@ mod tests {
         let app = App::new(env, repo);
         let status = app.status().expect("status");
         let list = app.list().expect("list");
-        let menu = build_menu(InteractiveMode::Persistent, &status, &list, None);
+        let menu = build_menu(InteractiveMode::Persistent, &status, &list, None, false);
         assert_eq!(menu.accounts.len(), 1);
         assert!(menu.actions.iter().any(|item| item.label == "Show status"));
     }

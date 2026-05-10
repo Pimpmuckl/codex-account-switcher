@@ -30,6 +30,7 @@ codex-account-switcher save [--json]
 codex-account-switcher usage [ACCOUNT_ID] [--json]
 codex-account-switcher activate [ACCOUNT_ID] [--force] [--json]
 codex-account-switcher delete [ACCOUNT_ID] [--json]
+codex-account-switcher auto-start-usage-windows [--enable|--disable] [--run] [--json]
 ```
 
 ## Behavior
@@ -40,6 +41,7 @@ codex-account-switcher delete [ACCOUNT_ID] [--json]
 - `usage` fetches current usage for the live account or for a saved account by id.
 - `activate` restores a saved snapshot. Reliable swaps require all Codex processes to be closed first; `--force` lets the command attempt activation anyway, but it still fails if the restored files do not stay stable.
 - `delete` removes the saved snapshot from the switcher store only.
+- `auto-start-usage-windows` is opt-in from the CLI, TUI, or tray checkmark. When enabled, the interactive app refreshes saved weekly windows every 5 minutes and starts due windows with a minimal `codex exec` ping when Codex is on `PATH`.
 
 Saved snapshot data lives in the app-data directory for the current environment:
 
@@ -113,3 +115,4 @@ cargo fmt --check
 - Saved snapshots are keyed by the current environment and current account identity.
 - Plan metadata is best effort and may be blank if the token does not expose a recognizable value.
 - Usage enrichment depends on saved `auth.json` tokens still being present and accepted by the Codex/OpenAI usage endpoints.
+- Auto-starting usage windows can ping while Codex processes are running; active Codex sessions keep their auth cached, and the switcher restores the previous live account afterward.

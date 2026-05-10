@@ -153,6 +153,28 @@ pub struct UsageOutput {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct AutoStartUsageWindowsStatusOutput {
+    pub enabled: bool,
+    pub poll_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AutoStartUsageWindowsRunOutput {
+    pub enabled: bool,
+    pub checked_accounts: usize,
+    pub pinged_accounts: Vec<AutoStartUsageWindowAccountResult>,
+    pub skipped: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AutoStartUsageWindowAccountResult {
+    pub account_id: Uuid,
+    pub email: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct SaveOutput {
     pub account: AccountView,
     pub action: SaveAction,

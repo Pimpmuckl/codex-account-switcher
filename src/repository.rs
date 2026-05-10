@@ -41,7 +41,7 @@ where
             .into_iter()
             .filter(|account| &account.environment == environment)
             .collect::<Vec<_>>();
-        accounts.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        accounts.sort_by_key(|account| std::cmp::Reverse(account.updated_at));
         Ok(accounts)
     }
 
