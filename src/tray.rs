@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use anyhow::{Context, Result};
-use time::OffsetDateTime;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use uuid::Uuid;
@@ -42,13 +41,6 @@ struct TrayState<'a, S> {
     commands: HashMap<String, TrayCommand>,
     event_proxy: EventLoopProxy<UserEvent>,
     exit: TrayExit,
-}
-
-#[derive(Clone, Copy, Default)]
-struct TrayLabelWidths {
-    plan: usize,
-    status: usize,
-    usage: usize,
 }
 
 pub(crate) fn run<S>(app: &App<S>) -> Result<TrayExit>
@@ -180,24 +172,25 @@ where
         let menu = Menu::new();
         self.commands.clear();
 
-        let active = status
+        menu.append(&MenuItem::new("Active:", false, None))?;
+        let active_label = status
             .current_account
             .as_ref()
             .map(active_account_label)
-            .unwrap_or_else(|| "Active Account: not logged in".to_owned());
-        menu.append(&MenuItem::new(active, false, None))?;
+            .unwrap_or_else(|| "not logged in".to_owned());
+        menu.append(&MenuItem::new(active_label, false, None))?;
         menu.append(&PredefinedMenuItem::separator())?;
 
+        menu.append(&MenuItem::new("Saved:", false, None))?;
         if list.accounts.is_empty() {
             menu.append(&MenuItem::new("No saved accounts", false, None))?;
         } else {
-            let widths = tray_label_widths(&list.accounts);
             for account in &list.accounts {
                 let id = format!("activate:{}", account.id);
                 let enabled = !account.is_active;
                 let item = MenuItem::with_id(
                     MenuId::new(&id),
-                    saved_account_label(account, widths),
+                    saved_account_label(account),
                     enabled,
                     None,
                 );
@@ -255,78 +248,11 @@ where
 }
 
 fn active_account_label(account: &DisplayIdentity) -> String {
-    let mut label = format!("Active Account: {}", account.email);
-    if let Some(plan) = &account.plan_label {
-        label.push_str(&format!("\tPlan: {plan}"));
-    }
-    label
+    account.email.clone()
 }
 
-fn saved_account_label(account: &AccountView, widths: TrayLabelWidths) -> String {
-    let plan = format!(
-        "{:<width$}",
-        account
-            .plan_label
-            .as_ref()
-            .map(|plan| format!("Plan: {plan}"))
-            .unwrap_or_default(),
-        width = widths.plan
-    );
-    let status = format!(
-        "{:<width$}",
-        if account.is_active { "Active" } else { "" },
-        width = widths.status
-    );
-    let usage = format!(
-        "{:<width$}",
-        account_usage_label(account),
-        width = widths.usage
-    );
-
-    let details = [plan, status, usage]
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("  ");
-    if details.is_empty() {
-        account.email.clone()
-    } else {
-        format!("{}\t{details}", account.email)
-    }
-}
-
-fn tray_label_widths(accounts: &[AccountView]) -> TrayLabelWidths {
-    let mut widths = TrayLabelWidths::default();
-    for account in accounts {
-        widths.plan = widths.plan.max(
-            account
-                .plan_label
-                .as_ref()
-                .map(|plan| format!("Plan: {plan}").len())
-                .unwrap_or(0),
-        );
-        widths.status = widths
-            .status
-            .max(if account.is_active { "Active".len() } else { 0 });
-        widths.usage = widths.usage.max(account_usage_label(account).len());
-    }
-    widths
-}
-
-fn account_usage_label(account: &AccountView) -> String {
-    if let Some(usage) = &account.usage
-        && let Some(weekly) = &usage.weekly
-    {
-        if weekly.reset_at <= OffsetDateTime::now_utc() {
-            "Weekly Remaining: passed".to_owned()
-        } else {
-            format!("Weekly Remaining: {}%", weekly.remaining_percent)
-        }
-    } else if account.usage_error.is_some() {
-        "Usage unavailable".to_owned()
-    } else {
-        String::new()
-    }
+fn saved_account_label(account: &AccountView) -> String {
+    account.email.clone()
 }
 
 fn load_codex_icon() -> Icon {
@@ -435,9 +361,10 @@ fn fallback_icon() -> Icon {
 mod tests {
     use super::*;
     use crate::model::EnvironmentKind;
+    use time::OffsetDateTime;
 
     #[test]
-    fn saved_account_label_marks_active_account() {
+    fn saved_account_label_uses_email_only() {
         let id = Uuid::new_v4();
         let account = AccountView {
             id,
@@ -453,16 +380,11 @@ mod tests {
             usage: None,
             usage_error: None,
         };
-        let accounts = vec![account.clone()];
-
-        assert_eq!(
-            saved_account_label(&account, tray_label_widths(&accounts)),
-            "person@example.com\tPlan: Pro  Active"
-        );
+        assert_eq!(saved_account_label(&account), "person@example.com");
     }
 
     #[test]
-    fn active_account_label_includes_plan_when_present() {
+    fn active_account_label_uses_email_only() {
         let account = DisplayIdentity {
             email: "person@example.com".to_owned(),
             subject: None,
@@ -470,42 +392,6 @@ mod tests {
             plan_label: Some("Plus".to_owned()),
         };
 
-        assert_eq!(
-            active_account_label(&account),
-            "Active Account: person@example.com\tPlan: Plus"
-        );
-    }
-
-    #[test]
-    fn saved_account_labels_pad_columns() {
-        let first = AccountView {
-            id: Uuid::new_v4(),
-            email: "a@example.com".to_owned(),
-            subject: None,
-            name: None,
-            plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
-            is_active: false,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-            last_activated_at: None,
-            usage: None,
-            usage_error: None,
-        };
-        let second = AccountView {
-            email: "longer.person@example.com".to_owned(),
-            plan_label: Some("Enterprise".to_owned()),
-            is_active: true,
-            ..first.clone()
-        };
-        let accounts = vec![first, second];
-        let widths = tray_label_widths(&accounts);
-        let first_label = saved_account_label(&accounts[0], widths);
-        let second_label = saved_account_label(&accounts[1], widths);
-
-        assert!(first_label.starts_with("a@example.com\t"));
-        assert!(first_label.contains(&format!("{:<width$}", "Plan: Pro", width = widths.plan)));
-        assert!(second_label.starts_with("longer.person@example.com\t"));
-        assert!(second_label.contains("  Active"));
+        assert_eq!(active_account_label(&account), "person@example.com");
     }
 }
