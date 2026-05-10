@@ -219,9 +219,25 @@ fn run_codex_usage_ping(
             })
         }
         (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
-            "also failed to remove temporary auth home: {cleanup_error:#}"
-        ))),
+        (Err(error), Err(cleanup_error)) => {
+            let mut combined = error.context(format!(
+                "also failed to remove temporary auth home: {cleanup_error:#}"
+            ));
+            match scrub_temp_auth_material(&work_dir) {
+                Ok(()) => {
+                    if let Err(final_error) = remove_temp_auth_home(&work_dir) {
+                        combined = combined.context(format!(
+                            "temporary auth scrub succeeded but final cleanup failed: {final_error:#}"
+                        ));
+                    }
+                }
+                Err(scrub_error) => {
+                    combined =
+                        combined.context(format!("temporary auth scrub failed: {scrub_error:#}"));
+                }
+            }
+            Err(combined)
+        }
     }
 }
 
