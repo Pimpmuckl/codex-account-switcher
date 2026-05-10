@@ -171,7 +171,6 @@ pub struct AutoStartUsageWindowAccountResult {
     pub account_id: Uuid,
     pub email: String,
     pub status: String,
-    pub selected_model: Option<String>,
     pub detail: Option<String>,
 }
 

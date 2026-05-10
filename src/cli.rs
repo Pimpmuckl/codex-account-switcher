@@ -305,16 +305,9 @@ fn print_auto_start_usage_windows_run(output: &AutoStartUsageWindowsRunOutput) {
     );
     println!("Checked accounts: {}", output.checked_accounts);
     for account in &output.pinged_accounts {
-        match (&account.selected_model, &account.detail) {
-            (Some(model), Some(detail)) => {
-                println!(
-                    "{}: {} via {model} ({detail})",
-                    account.email, account.status
-                )
-            }
-            (Some(model), None) => println!("{}: {} via {model}", account.email, account.status),
-            (None, Some(detail)) => println!("{}: {} ({detail})", account.email, account.status),
-            (None, None) => println!("{}: {}", account.email, account.status),
+        match &account.detail {
+            Some(detail) => println!("{}: {} ({detail})", account.email, account.status),
+            None => println!("{}: {}", account.email, account.status),
         }
     }
     for skipped in &output.skipped {

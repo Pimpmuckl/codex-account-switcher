@@ -6,7 +6,6 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -94,7 +93,6 @@ where
                     account_id,
                     email,
                     status: "failed".to_owned(),
-                    selected_model: None,
                     detail: Some(format!("{error:#}")),
                 },
             };
@@ -111,20 +109,19 @@ where
     ) -> Result<AutoStartUsageWindowAccountResult> {
         let (_, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
         let identity = codex::identity_from_snapshot(&snapshot)?;
-        let (refreshed_snapshot, selected_model) =
-            run_codex_usage_ping(&self.env, &snapshot, &identity)?;
+        let ping_result = run_codex_usage_ping(&self.env, &snapshot, &identity)?;
         let (_, current_snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
         if current_snapshot != snapshot {
             return Err(anyhow!(
                 "saved snapshot changed while ping was running; skipped write-back"
             ));
         }
-        let refreshed_identity = codex::identity_from_snapshot(&refreshed_snapshot)?;
+        let refreshed_identity = codex::identity_from_snapshot(&ping_result.snapshot)?;
         self.repository.replace_snapshot(
             &self.env.kind,
             account_id,
             &refreshed_identity,
-            &refreshed_snapshot,
+            &ping_result.snapshot,
             None,
         )?;
         let usage = self.usage(Some(account_id))?;
@@ -138,8 +135,7 @@ where
             account_id,
             email: email.to_owned(),
             status: status.to_owned(),
-            selected_model,
-            detail: None,
+            detail: ping_result.cleanup_warning,
         })
     }
 }
@@ -186,18 +182,29 @@ fn usage_window_needs_ping(reset_at: OffsetDateTime, now: OffsetDateTime) -> boo
     reset_at <= now
 }
 
+struct CodexUsagePingResult {
+    snapshot: SnapshotBlob,
+    cleanup_warning: Option<String>,
+}
+
 fn run_codex_usage_ping(
     env: &AppEnv,
     snapshot: &SnapshotBlob,
     identity: &DisplayIdentity,
-) -> Result<(SnapshotBlob, Option<String>)> {
+) -> Result<CodexUsagePingResult> {
     let work_dir =
         std::env::temp_dir().join(format!("codex-account-switcher-ping-{}", Uuid::new_v4()));
     let result = run_codex_usage_ping_in_temp_home(env, snapshot, identity, &work_dir);
     let cleanup = remove_temp_auth_home(&work_dir);
     match (result, cleanup) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error),
+        (Ok(snapshot), Ok(())) => Ok(CodexUsagePingResult {
+            snapshot,
+            cleanup_warning: None,
+        }),
+        (Ok(snapshot), Err(error)) => Ok(CodexUsagePingResult {
+            snapshot,
+            cleanup_warning: Some(format!("temporary auth cleanup failed: {error:#}")),
+        }),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup_error)) => Err(error.context(format!(
             "also failed to remove temporary auth home: {cleanup_error:#}"
@@ -210,7 +217,7 @@ fn run_codex_usage_ping_in_temp_home(
     snapshot: &SnapshotBlob,
     identity: &DisplayIdentity,
     work_dir: &Path,
-) -> Result<(SnapshotBlob, Option<String>)> {
+) -> Result<SnapshotBlob> {
     fs::create_dir_all(work_dir)
         .with_context(|| format!("failed to create {}", work_dir.display()))?;
     let temp_env = AppEnv {
@@ -226,7 +233,6 @@ fn run_codex_usage_ping_in_temp_home(
     fs::write(&instruction_file, PING_INSTRUCTIONS)
         .with_context(|| format!("failed to write {}", instruction_file.display()))?;
 
-    let selected_model = best_available_mini_model(&temp_env.codex_root);
     let mut command = Command::new("codex");
     command
         .env("CODEX_HOME", &temp_env.codex_root)
@@ -253,9 +259,6 @@ fn run_codex_usage_ping_in_temp_home(
         ))
         .arg("-c")
         .arg("model_reasoning_effort=\"low\"");
-    if let Some(model) = selected_model.as_deref() {
-        command.arg("-m").arg(model);
-    }
     command
         .arg(PING_PROMPT)
         .stdin(Stdio::null())
@@ -270,7 +273,7 @@ fn run_codex_usage_ping_in_temp_home(
     }
     let refreshed = codex::read_live_auth_bundle(&temp_env)
         .context("failed to read refreshed temporary Codex auth")?;
-    Ok((refreshed.snapshot, selected_model))
+    Ok(refreshed.snapshot)
 }
 
 fn remove_temp_auth_home(path: &Path) -> Result<()> {
@@ -311,60 +314,6 @@ fn strip_codex_thread_env(command: &mut Command) {
     }
 }
 
-fn best_available_mini_model(codex_home: &Path) -> Option<String> {
-    for bundled in [false, true] {
-        let mut command = Command::new("codex");
-        command.env("CODEX_HOME", codex_home);
-        command.arg("debug").arg("models");
-        if bundled {
-            command.arg("--bundled");
-        }
-        strip_codex_thread_env(&mut command);
-        let Ok(output) = command.output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let raw = String::from_utf8_lossy(&output.stdout);
-        if let Some(model) = select_mini_model_from_catalog(&raw) {
-            return Some(model);
-        }
-    }
-    None
-}
-
-fn select_mini_model_from_catalog(raw: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-    let models = if let Some(models) = value.get("models").and_then(Value::as_array) {
-        models
-    } else {
-        value.as_array()?
-    };
-    let mut candidates = models
-        .iter()
-        .enumerate()
-        .filter_map(|(position, model)| {
-            let slug = model
-                .get("slug")
-                .or_else(|| model.get("id"))
-                .and_then(Value::as_str)?;
-            if !slug.ends_with("-mini")
-                || model.get("supported_in_api").and_then(Value::as_bool) == Some(false)
-            {
-                return None;
-            }
-            let priority = model
-                .get("priority")
-                .and_then(Value::as_i64)
-                .unwrap_or(i64::MAX);
-            Some((priority, position, slug.to_owned()))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|(priority, position, _)| (*priority, *position));
-    candidates.into_iter().map(|(_, _, slug)| slug).next()
-}
-
 fn toml_string_literal(value: &str) -> String {
     let mut literal = String::from("\"");
     for character in value.chars() {
@@ -394,35 +343,6 @@ mod tests {
         assert!(usage_window_needs_ping(now, now));
         assert!(usage_window_needs_ping(now - Duration::minutes(1), now));
         assert!(!usage_window_needs_ping(now + Duration::minutes(1), now));
-    }
-
-    #[test]
-    fn mini_model_selector_prefers_lowest_priority_available_mini() {
-        let raw = r#"{
-          "models": [
-            {"slug": "gpt-5.5", "priority": 1, "supported_in_api": true},
-            {"slug": "gpt-5.3-mini", "priority": 20, "supported_in_api": true},
-            {"slug": "gpt-5.4-mini", "priority": 10, "supported_in_api": true}
-          ]
-        }"#;
-
-        assert_eq!(
-            select_mini_model_from_catalog(raw).as_deref(),
-            Some("gpt-5.4-mini")
-        );
-    }
-
-    #[test]
-    fn mini_model_selector_skips_api_unsupported_models() {
-        let raw = r#"[
-          {"slug": "gpt-hidden-mini", "priority": 1, "supported_in_api": false},
-          {"slug": "gpt-visible-mini", "priority": 2, "supported_in_api": true}
-        ]"#;
-
-        assert_eq!(
-            select_mini_model_from_catalog(raw).as_deref(),
-            Some("gpt-visible-mini")
-        );
     }
 
     #[test]
