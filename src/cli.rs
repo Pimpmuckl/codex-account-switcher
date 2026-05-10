@@ -217,17 +217,25 @@ where
     S: crate::secrets::SecretStore,
 {
     crate::app::spawn_auto_start_usage_windows_worker();
-    loop {
-        match app.interactive(InteractiveMode::Persistent, false)? {
-            InteractiveExit::Quit => return Ok(()),
-            #[cfg(windows)]
-            InteractiveExit::SendToTray => {
-                crate::tray::hide_console_window();
-                match crate::tray::run(app)? {
-                    crate::tray::TrayExit::ShowTui => crate::tray::show_console_window(),
-                    crate::tray::TrayExit::Quit => return Ok(()),
+    #[cfg(windows)]
+    {
+        loop {
+            match app.interactive(InteractiveMode::Persistent, false)? {
+                InteractiveExit::Quit => return Ok(()),
+                InteractiveExit::SendToTray => {
+                    crate::tray::hide_console_window();
+                    match crate::tray::run(app)? {
+                        crate::tray::TrayExit::ShowTui => crate::tray::show_console_window(),
+                        crate::tray::TrayExit::Quit => return Ok(()),
+                    }
                 }
             }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        match app.interactive(InteractiveMode::Persistent, false)? {
+            InteractiveExit::Quit => Ok(()),
         }
     }
 }

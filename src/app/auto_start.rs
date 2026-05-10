@@ -156,6 +156,7 @@ pub fn spawn_auto_start_usage_windows_worker() {
     });
 }
 
+#[cfg(windows)]
 pub(crate) fn run_auto_start_usage_windows_check_now() -> Result<()> {
     run_auto_start_usage_windows_for_detected_env()
 }
