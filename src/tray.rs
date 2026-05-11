@@ -184,11 +184,7 @@ where
             .current_account_saved_id
             .and_then(|id| list.accounts.iter().find(|account| account.id == id));
         let active_account_id = active_account.map(|account| account.id);
-        let saved_accounts = list
-            .accounts
-            .iter()
-            .filter(|account| Some(account.id) != active_account_id)
-            .collect::<Vec<_>>();
+        let saved_accounts = tray_saved_accounts(&list.accounts, active_account_id);
         let label_accounts = active_account
             .into_iter()
             .chain(saved_accounts.iter().copied())
@@ -292,6 +288,16 @@ fn tray_account_label(account: &AccountView, widths: TrayLabelWidths) -> String 
     tray_row_label(&account.email, [plan, remaining, reset], None)
 }
 
+fn tray_saved_accounts(
+    accounts: &[AccountView],
+    active_account_id: Option<Uuid>,
+) -> Vec<&AccountView> {
+    accounts
+        .iter()
+        .filter(|account| Some(account.id) != active_account_id && !account.is_active)
+        .collect()
+}
+
 fn tray_row_label<const N: usize>(
     email: &str,
     details: [String; N],
@@ -306,8 +312,16 @@ fn tray_row_label<const N: usize>(
     if details.is_empty() {
         email.to_owned()
     } else {
-        format!("{email}\t{details}")
+        format!(
+            "{}{separator}{details}",
+            email,
+            separator = tray_detail_separator()
+        )
     }
+}
+
+fn tray_detail_separator() -> &'static str {
+    if cfg!(windows) { "\t" } else { "  " }
 }
 
 fn format_plan_label(plan: Option<&str>, widths: TrayLabelWidths) -> String {
@@ -517,7 +531,10 @@ mod tests {
 
         assert_eq!(
             tray_account_label(&account, tray_label_widths(&[&account])),
-            "person@example.com\tPlan: Pro  Weekly Remaining: \u{2007}17%  Reset: 2099-05-12 00:52"
+            format!(
+                "person@example.com{}Plan: Pro  Weekly Remaining: \u{2007}17%  Reset: 2099-05-12 00:52",
+                tray_detail_separator()
+            )
         );
     }
 
@@ -526,6 +543,36 @@ mod tests {
         assert_eq!(format_remaining_percent(2), "\u{2007}\u{2007}2");
         assert_eq!(format_remaining_percent(89), "\u{2007}89");
         assert_eq!(format_remaining_percent(100), "100");
+    }
+
+    #[test]
+    fn tray_saved_accounts_excludes_active_flag_even_without_active_id() {
+        let active = AccountView {
+            id: Uuid::new_v4(),
+            email: "active@example.com".to_owned(),
+            subject: Some("sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            environment: EnvironmentKind::Windows,
+            is_active: true,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: None,
+            usage_error: None,
+        };
+        let inactive = AccountView {
+            id: Uuid::new_v4(),
+            email: "inactive@example.com".to_owned(),
+            is_active: false,
+            ..active.clone()
+        };
+        let accounts = vec![active, inactive];
+
+        let saved_accounts = tray_saved_accounts(&accounts, None);
+
+        assert_eq!(saved_accounts.len(), 1);
+        assert_eq!(saved_accounts[0].email, "inactive@example.com");
     }
 
     #[test]
@@ -568,7 +615,10 @@ mod tests {
 
         assert_eq!(
             active_account_label(&account, Some(&saved_account), widths),
-            "person@example.com\tPlan: ProLite  Weekly Remaining: \u{2007}17%  Reset: 2099-05-12 00:52"
+            format!(
+                "person@example.com{}Plan: ProLite  Weekly Remaining: \u{2007}17%  Reset: 2099-05-12 00:52",
+                tray_detail_separator()
+            )
         );
     }
 
@@ -583,7 +633,10 @@ mod tests {
 
         assert_eq!(
             active_account_label(&account, None, TrayLabelWidths::default()),
-            "person@example.com\tPlan: Plus  [not saved]"
+            format!(
+                "person@example.com{}Plan: Plus  [not saved]",
+                tray_detail_separator()
+            )
         );
     }
 }
