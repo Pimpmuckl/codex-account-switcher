@@ -180,9 +180,11 @@ where
         let menu = Menu::new();
         self.commands.clear();
 
-        let active_account = status
-            .current_account_saved_id
-            .and_then(|id| list.accounts.iter().find(|account| account.id == id));
+        let active_account = find_active_tray_account(
+            status.current_account.as_ref(),
+            status.current_account_saved_id,
+            &list.accounts,
+        );
         let active_account_id = active_account.map(|account| account.id);
         let saved_accounts = tray_saved_accounts(&list.accounts, active_account_id);
         let label_accounts = active_account
@@ -294,8 +296,31 @@ fn tray_saved_accounts(
 ) -> Vec<&AccountView> {
     accounts
         .iter()
-        .filter(|account| Some(account.id) != active_account_id && !account.is_active)
+        .filter(|account| Some(account.id) != active_account_id)
         .collect()
+}
+
+fn find_active_tray_account<'a>(
+    current_account: Option<&DisplayIdentity>,
+    current_saved_id: Option<Uuid>,
+    accounts: &'a [AccountView],
+) -> Option<&'a AccountView> {
+    current_saved_id
+        .and_then(|id| accounts.iter().find(|account| account.id == id))
+        .or_else(|| {
+            current_account.and_then(|current| {
+                accounts
+                    .iter()
+                    .find(|account| account.is_active && account_matches_identity(account, current))
+            })
+        })
+}
+
+fn account_matches_identity(account: &AccountView, identity: &DisplayIdentity) -> bool {
+    match (&account.subject, &identity.subject) {
+        (Some(left), Some(right)) => left == right,
+        _ => account.email.eq_ignore_ascii_case(&identity.email),
+    }
 }
 
 fn tray_row_label<const N: usize>(
@@ -546,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn tray_saved_accounts_excludes_active_flag_even_without_active_id() {
+    fn tray_saved_accounts_keeps_active_flag_without_rendered_active_id() {
         let active = AccountView {
             id: Uuid::new_v4(),
             email: "active@example.com".to_owned(),
@@ -571,8 +596,43 @@ mod tests {
 
         let saved_accounts = tray_saved_accounts(&accounts, None);
 
-        assert_eq!(saved_accounts.len(), 1);
-        assert_eq!(saved_accounts[0].email, "inactive@example.com");
+        assert_eq!(saved_accounts.len(), 2);
+        assert_eq!(saved_accounts[0].email, "active@example.com");
+        assert_eq!(saved_accounts[1].email, "inactive@example.com");
+    }
+
+    #[test]
+    fn active_account_fallback_requires_live_identity_match() {
+        let account = AccountView {
+            id: Uuid::new_v4(),
+            email: "active@example.com".to_owned(),
+            subject: Some("sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            environment: EnvironmentKind::Windows,
+            is_active: true,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: None,
+            usage_error: None,
+        };
+        let matching_identity = DisplayIdentity {
+            email: "active@example.com".to_owned(),
+            subject: Some("sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+        };
+        let mismatched_identity = DisplayIdentity {
+            email: "other@example.com".to_owned(),
+            subject: Some("other-sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+        };
+        let accounts = vec![account];
+
+        assert!(find_active_tray_account(Some(&matching_identity), None, &accounts).is_some());
+        assert!(find_active_tray_account(Some(&mismatched_identity), None, &accounts).is_none());
     }
 
     #[test]
