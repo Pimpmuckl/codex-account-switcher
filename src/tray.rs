@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use anyhow::{Context, Result};
+use time::OffsetDateTime;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use uuid::Uuid;
@@ -27,6 +28,13 @@ enum TrayCommand {
     SetAutoStartUsageWindows(bool),
     ShowTui,
     Quit,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TrayLabelWidths {
+    plan: usize,
+    remaining: usize,
+    reset: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,32 +180,47 @@ where
         let menu = Menu::new();
         self.commands.clear();
 
-        menu.append(&MenuItem::new("Active:", false, None))?;
+        let active_account = status
+            .current_account_saved_id
+            .and_then(|id| list.accounts.iter().find(|account| account.id == id));
+        let active_account_id = active_account.map(|account| account.id);
+        let saved_accounts = list
+            .accounts
+            .iter()
+            .filter(|account| Some(account.id) != active_account_id)
+            .collect::<Vec<_>>();
+        let label_accounts = active_account
+            .into_iter()
+            .chain(saved_accounts.iter().copied())
+            .collect::<Vec<_>>();
+        let mut widths = tray_label_widths(&label_accounts);
+        if let Some(current) = &status.current_account {
+            widths.include_plan(current.plan_label.as_deref());
+        }
+
+        menu.append(&MenuItem::new("Active Account", false, None))?;
         let active_label = status
             .current_account
             .as_ref()
-            .map(active_account_label)
+            .map(|account| active_account_label(account, active_account, widths))
             .unwrap_or_else(|| "not logged in".to_owned());
-        menu.append(&MenuItem::new(active_label, false, None))?;
+        menu.append(&MenuItem::new(format!("  {active_label}"), false, None))?;
         menu.append(&PredefinedMenuItem::separator())?;
 
-        menu.append(&MenuItem::new("Saved:", false, None))?;
-        if list.accounts.is_empty() {
+        menu.append(&MenuItem::new("Saved Accounts", false, None))?;
+        if saved_accounts.is_empty() {
             menu.append(&MenuItem::new("No saved accounts", false, None))?;
         } else {
-            for account in &list.accounts {
+            for account in saved_accounts {
                 let id = format!("activate:{}", account.id);
-                let enabled = !account.is_active;
                 let item = MenuItem::with_id(
                     MenuId::new(&id),
-                    saved_account_label(account),
-                    enabled,
+                    format!("  {}", tray_account_label(account, widths)),
+                    true,
                     None,
                 );
                 menu.append(&item)?;
-                if enabled {
-                    self.commands.insert(id, TrayCommand::Activate(account.id));
-                }
+                self.commands.insert(id, TrayCommand::Activate(account.id));
             }
         }
 
@@ -247,12 +270,111 @@ where
     }
 }
 
-fn active_account_label(account: &DisplayIdentity) -> String {
-    account.email.clone()
+fn active_account_label(
+    account: &DisplayIdentity,
+    saved_account: Option<&AccountView>,
+    widths: TrayLabelWidths,
+) -> String {
+    let plan = format_plan_label(account.plan_label.as_deref(), widths);
+    let (remaining, reset) = saved_account.map(account_usage_labels).unwrap_or_default();
+    let remaining = format!("{:<width$}", remaining, width = widths.remaining);
+    let reset = format!("{:<width$}", reset, width = widths.reset);
+    let saved_marker = saved_account.is_none().then_some("[not saved]");
+    tray_row_label(&account.email, [plan, remaining, reset], saved_marker)
 }
 
-fn saved_account_label(account: &AccountView) -> String {
-    account.email.clone()
+fn tray_account_label(account: &AccountView, widths: TrayLabelWidths) -> String {
+    let plan = format_plan_label(account.plan_label.as_deref(), widths);
+    let (remaining, reset) = account_usage_labels(account);
+    let remaining = format!("{:<width$}", remaining, width = widths.remaining);
+    let reset = format!("{:<width$}", reset, width = widths.reset);
+
+    tray_row_label(&account.email, [plan, remaining, reset], None)
+}
+
+fn tray_row_label<const N: usize>(
+    email: &str,
+    details: [String; N],
+    marker: Option<&str>,
+) -> String {
+    let details = details
+        .into_iter()
+        .chain(marker.map(str::to_owned))
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("  ");
+    if details.is_empty() {
+        email.to_owned()
+    } else {
+        format!("{email}\t{details}")
+    }
+}
+
+fn format_plan_label(plan: Option<&str>, widths: TrayLabelWidths) -> String {
+    format!(
+        "{:<width$}",
+        plan.map(|plan| format!("Plan: {plan}")).unwrap_or_default(),
+        width = widths.plan
+    )
+}
+
+fn tray_label_widths(accounts: &[&AccountView]) -> TrayLabelWidths {
+    let mut widths = TrayLabelWidths::default();
+    for account in accounts {
+        widths.include_plan(account.plan_label.as_deref());
+        let (remaining, reset) = account_usage_labels(account);
+        widths.remaining = widths.remaining.max(visible_width(&remaining));
+        widths.reset = widths.reset.max(visible_width(&reset));
+    }
+    widths
+}
+
+impl TrayLabelWidths {
+    fn include_plan(&mut self, plan: Option<&str>) {
+        self.plan = self.plan.max(
+            plan.map(|plan| visible_width(&format!("Plan: {plan}")))
+                .unwrap_or_default(),
+        );
+    }
+}
+
+fn account_usage_labels(account: &AccountView) -> (String, String) {
+    if let Some(usage) = &account.usage
+        && let Some(weekly) = &usage.weekly
+    {
+        if weekly.reset_at <= OffsetDateTime::now_utc() {
+            ("Weekly Remaining: passed".to_owned(), String::new())
+        } else {
+            (
+                format!(
+                    "Weekly Remaining: {}%",
+                    format_remaining_percent(weekly.remaining_percent)
+                ),
+                format!("Reset: {}", format_reset_at(weekly.reset_at)),
+            )
+        }
+    } else if account.usage_error.is_some() {
+        ("Usage unavailable".to_owned(), String::new())
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+fn format_remaining_percent(percent: u8) -> String {
+    format!("{percent:>3}").replace(' ', "\u{2007}")
+}
+
+fn visible_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn format_reset_at(reset_at: OffsetDateTime) -> String {
+    format!(
+        "{} {:02}:{:02}",
+        reset_at.date(),
+        reset_at.hour(),
+        reset_at.minute()
+    )
 }
 
 fn load_codex_icon() -> Icon {
@@ -360,14 +482,13 @@ fn fallback_icon() -> Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::EnvironmentKind;
-    use time::OffsetDateTime;
+    use crate::model::{AccountUsageView, EnvironmentKind, UsageSource, UsageWindowView};
+    use time::{Date, Month, OffsetDateTime, Time};
 
     #[test]
-    fn saved_account_label_uses_email_only() {
-        let id = Uuid::new_v4();
-        let account = AccountView {
-            id,
+    fn tray_account_label_includes_usage_table_columns() {
+        let mut account = AccountView {
+            id: Uuid::new_v4(),
             email: "person@example.com".to_owned(),
             subject: Some("sub".to_owned()),
             name: None,
@@ -380,11 +501,79 @@ mod tests {
             usage: None,
             usage_error: None,
         };
-        assert_eq!(saved_account_label(&account), "person@example.com");
+        account.usage = Some(AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: None,
+            weekly: Some(UsageWindowView {
+                used_percent: 83,
+                remaining_percent: 17,
+                reset_at: OffsetDateTime::UNIX_EPOCH
+                    .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
+                    .replace_time(Time::from_hms(0, 52, 0).unwrap()),
+            }),
+            credits: None,
+        });
+
+        assert_eq!(
+            tray_account_label(&account, tray_label_widths(&[&account])),
+            "person@example.com\tPlan: Pro  Weekly Remaining: \u{2007}17%  Reset: 2099-05-12 00:52"
+        );
     }
 
     #[test]
-    fn active_account_label_uses_email_only() {
+    fn remaining_percent_uses_fixed_width_visual_slot() {
+        assert_eq!(format_remaining_percent(2), "\u{2007}\u{2007}2");
+        assert_eq!(format_remaining_percent(89), "\u{2007}89");
+        assert_eq!(format_remaining_percent(100), "100");
+    }
+
+    #[test]
+    fn active_account_label_keeps_live_identity_and_saved_usage() {
+        let mut saved_account = AccountView {
+            id: Uuid::new_v4(),
+            email: "stale@example.com".to_owned(),
+            subject: Some("sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            environment: EnvironmentKind::Windows,
+            is_active: true,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: None,
+            usage_error: None,
+        };
+        saved_account.usage = Some(AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: None,
+            weekly: Some(UsageWindowView {
+                used_percent: 83,
+                remaining_percent: 17,
+                reset_at: OffsetDateTime::UNIX_EPOCH
+                    .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
+                    .replace_time(Time::from_hms(0, 52, 0).unwrap()),
+            }),
+            credits: None,
+        });
+        let account = DisplayIdentity {
+            email: "person@example.com".to_owned(),
+            subject: None,
+            name: None,
+            plan_label: Some("ProLite".to_owned()),
+        };
+        let mut widths = tray_label_widths(&[&saved_account]);
+        widths.include_plan(account.plan_label.as_deref());
+
+        assert_eq!(
+            active_account_label(&account, Some(&saved_account), widths),
+            "person@example.com\tPlan: ProLite  Weekly Remaining: \u{2007}17%  Reset: 2099-05-12 00:52"
+        );
+    }
+
+    #[test]
+    fn active_account_label_marks_unsaved_current_account() {
         let account = DisplayIdentity {
             email: "person@example.com".to_owned(),
             subject: None,
@@ -392,6 +581,9 @@ mod tests {
             plan_label: Some("Plus".to_owned()),
         };
 
-        assert_eq!(active_account_label(&account), "person@example.com");
+        assert_eq!(
+            active_account_label(&account, None, TrayLabelWidths::default()),
+            "person@example.com\tPlan: Plus  [not saved]"
+        );
     }
 }

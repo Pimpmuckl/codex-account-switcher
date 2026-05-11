@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.4 - 2026-05-11
+
+### Fixed
+
+- Restored the Windows tray account table so active and saved accounts show plan, weekly remaining percentage, and weekly reset time again.
+- Improved tray table alignment in native Windows menus by using the menu detail column plus fixed-width percentage formatting.
+- Kept active-account display informational while saved-account rows remain clickable switch targets.
+
 ## v0.1.3 - 2026-05-10
 
 ### Added
