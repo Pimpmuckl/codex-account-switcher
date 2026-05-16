@@ -4,9 +4,11 @@ mod tui;
 
 use uuid::Uuid;
 
-#[cfg(windows)]
-pub(crate) use auto_start::run_auto_start_usage_windows_check_now;
 pub use auto_start::spawn_auto_start_usage_windows_worker;
+#[cfg(windows)]
+pub(crate) use auto_start::{
+    run_auto_start_usage_windows_check_now, subscribe_auto_start_usage_windows_checks,
+};
 
 use crate::env::AppEnv;
 use crate::model::{

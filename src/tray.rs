@@ -65,6 +65,7 @@ where
     MenuEvent::set_event_handler(Some(move |event| {
         let _ = menu_proxy.send_event(UserEvent::Menu(event));
     }));
+    spawn_auto_start_usage_windows_menu_refresh(proxy.clone());
 
     let mut state = TrayState {
         app,
@@ -77,6 +78,22 @@ where
         .run_app(&mut state)
         .context("tray event loop failed")?;
     Ok(state.exit)
+}
+
+fn spawn_auto_start_usage_windows_menu_refresh(proxy: EventLoopProxy<UserEvent>) {
+    let receiver = crate::app::subscribe_auto_start_usage_windows_checks();
+    let _ = thread::Builder::new()
+        .name("tray-auto-start-usage-windows-menu-refresh".to_owned())
+        .spawn(move || {
+            while receiver.recv().is_ok() {
+                if proxy
+                    .send_event(UserEvent::AutoStartUsageWindowsChecked)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 }
 
 impl<S> ApplicationHandler<UserEvent> for TrayState<'_, S>
