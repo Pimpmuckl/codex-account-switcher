@@ -10,7 +10,7 @@ use crate::model::{
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::SecretStore;
-use crate::usage::{fetch_usage, usage_target_from_snapshot};
+use crate::usage::{fetch_usage, usage_error_message, usage_target_from_snapshot};
 
 use super::{
     App, account_view, match_saved_account, saved_identity, should_verify_activation_stability,
@@ -173,7 +173,17 @@ where
                     UsageSource::SavedAccessToken,
                     true,
                 )?;
-                let (output, refreshed_snapshot) = fetch_usage(target)?;
+                let (output, refreshed_snapshot) = match fetch_usage(target) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = self.repository.record_usage_error(
+                            &self.env.kind,
+                            account_id,
+                            usage_error_message(&error),
+                        );
+                        return Err(error);
+                    }
+                };
                 self.repository.replace_snapshot(
                     &self.env.kind,
                     account_id,
@@ -190,6 +200,7 @@ where
                         self.env.codex_root.display()
                     )
                 })?;
+                let live_identity = live.identity.clone();
                 let live_snapshot = live.snapshot.clone();
                 let target = usage_target_from_snapshot(
                     self.env.kind.clone(),
@@ -197,16 +208,52 @@ where
                     UsageSource::LiveAccessToken,
                     true,
                 )?;
-                let (output, refreshed_snapshot) = fetch_usage(target)?;
+                let (output, refreshed_snapshot) = match fetch_usage(target) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.record_usage_error_for_identity(&live_identity, &error);
+                        return Err(error);
+                    }
+                };
                 if refreshed_snapshot != live_snapshot
                     && live_bundle_still_matches_snapshot(&self.env, &live_snapshot)
                 {
                     codex::restore_snapshot(&self.env, &refreshed_snapshot, &output.account, false)
                         .context("refreshed live auth but failed to update local auth files")?;
                 }
+                if let Some(account_id) = self.saved_account_id_for_identity(&live_identity) {
+                    self.repository.replace_snapshot(
+                        &self.env.kind,
+                        account_id,
+                        &output.account,
+                        &refreshed_snapshot,
+                        Some(output.usage.clone()),
+                    )?;
+                }
                 Ok(output)
             }
         }
+    }
+
+    fn saved_account_id_for_identity(&self, identity: &DisplayIdentity) -> Option<Uuid> {
+        self.repository
+            .list_accounts(&self.env.kind)
+            .ok()
+            .and_then(|accounts| match_saved_account(&accounts, identity).map(|account| account.id))
+    }
+
+    fn record_usage_error_for_identity(&self, identity: &DisplayIdentity, error: &anyhow::Error) {
+        let Ok(accounts) = self.repository.list_accounts(&self.env.kind) else {
+            return;
+        };
+        let Some(account) = match_saved_account(&accounts, identity) else {
+            return;
+        };
+        let _ = self.repository.record_usage_error(
+            &self.env.kind,
+            account.id,
+            usage_error_message(error),
+        );
     }
 
     pub fn delete(&self, account_id: Uuid) -> Result<DeleteOutput> {
@@ -237,8 +284,12 @@ mod tests {
 
     use super::*;
     use crate::codex::auth_json_fixture;
+    use time::OffsetDateTime;
+
     use crate::model::SnapshotFile;
-    use crate::model::{DisplayIdentity, EnvironmentKind};
+    use crate::model::{
+        AccountUsageView, DisplayIdentity, EnvironmentKind, UsageSource, UsageWindowView,
+    };
     use crate::secrets::test_support::MemorySecretStore;
 
     #[test]
@@ -314,6 +365,134 @@ mod tests {
         assert_eq!(output.accounts.len(), 1);
         assert_eq!(output.accounts[0].email, "saved@example.com");
         assert!(!output.accounts[0].is_active);
+    }
+
+    #[test]
+    fn list_surfaces_cached_usage_error() {
+        let temp = tempdir().expect("tempdir");
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+        let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
+        let saved = repo
+            .save_snapshot(
+                &env.kind,
+                &DisplayIdentity {
+                    email: "expired@example.com".to_owned(),
+                    subject: Some("sub-1".to_owned()),
+                    name: None,
+                    plan_label: Some("Pro".to_owned()),
+                },
+                &SnapshotBlob {
+                    schema_version: 1,
+                    files: vec![],
+                },
+            )
+            .expect("save")
+            .0;
+        repo.replace_snapshot(
+            &env.kind,
+            saved.id,
+            &DisplayIdentity {
+                email: "expired@example.com".to_owned(),
+                subject: Some("sub-1".to_owned()),
+                name: None,
+                plan_label: Some("Pro".to_owned()),
+            },
+            &SnapshotBlob {
+                schema_version: 1,
+                files: vec![],
+            },
+            Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: None,
+                weekly: Some(UsageWindowView {
+                    used_percent: 0,
+                    remaining_percent: 100,
+                    reset_at: OffsetDateTime::UNIX_EPOCH,
+                }),
+                credits: None,
+            }),
+        )
+        .expect("replace");
+        repo.record_usage_error(
+            &env.kind,
+            saved.id,
+            "Login required: Codex auth expired or was logged out.".to_owned(),
+        )
+        .expect("record usage error");
+
+        let app = App::new(env, repo);
+        let output = app.list().expect("list");
+
+        assert_eq!(
+            output.accounts[0].usage_error.as_deref(),
+            Some("Login required: Codex auth expired or was logged out.")
+        );
+        assert!(output.accounts[0].usage.is_none());
+    }
+
+    #[test]
+    fn list_keeps_cached_usage_for_transient_usage_error() {
+        let temp = tempdir().expect("tempdir");
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+        let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
+        let identity = DisplayIdentity {
+            email: "person@example.com".to_owned(),
+            subject: Some("sub-1".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+        };
+        let snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![],
+        };
+        let saved = repo
+            .save_snapshot(&env.kind, &identity, &snapshot)
+            .expect("save")
+            .0;
+        repo.replace_snapshot(
+            &env.kind,
+            saved.id,
+            &identity,
+            &snapshot,
+            Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: None,
+                weekly: Some(UsageWindowView {
+                    used_percent: 10,
+                    remaining_percent: 90,
+                    reset_at: OffsetDateTime::UNIX_EPOCH,
+                }),
+                credits: None,
+            }),
+        )
+        .expect("replace");
+        repo.record_usage_error(
+            &env.kind,
+            saved.id,
+            "Usage unavailable: failed to query Codex usage".to_owned(),
+        )
+        .expect("record usage error");
+
+        let app = App::new(env, repo);
+        let output = app.list().expect("list");
+
+        assert!(output.accounts[0].usage.is_some());
+        assert_eq!(
+            output.accounts[0].usage_error.as_deref(),
+            Some("Usage unavailable: failed to query Codex usage")
+        );
     }
 
     #[test]

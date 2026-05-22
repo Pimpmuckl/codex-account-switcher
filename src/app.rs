@@ -4,15 +4,18 @@ mod tui;
 
 use uuid::Uuid;
 
-#[cfg(windows)]
-pub(crate) use auto_start::run_auto_start_usage_windows_check_now;
 pub use auto_start::spawn_auto_start_usage_windows_worker;
+#[cfg(windows)]
+pub(crate) use auto_start::{
+    run_auto_start_usage_windows_check_now, subscribe_auto_start_usage_windows_checks,
+};
 
 use crate::env::AppEnv;
 use crate::model::{
     AccountUsageView, AccountView, DisplayIdentity, RunningCodexProcess, SavedAccountMetadata,
 };
 use crate::repository::SnapshotRepository;
+use crate::usage::usage_error_requires_login;
 
 pub struct App<S> {
     env: AppEnv,
@@ -39,6 +42,15 @@ fn account_view(
     usage: Option<AccountUsageView>,
     usage_error: Option<String>,
 ) -> AccountView {
+    let usage_error = usage_error.or(account.cached_usage_error);
+    let usage = if usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        None
+    } else {
+        usage.or(account.cached_usage)
+    };
     AccountView {
         id: account.id,
         email: account.email,
@@ -50,7 +62,7 @@ fn account_view(
         created_at: account.created_at,
         updated_at: account.updated_at,
         last_activated_at: account.last_activated_at,
-        usage: usage.or(account.cached_usage),
+        usage,
         usage_error,
     }
 }
