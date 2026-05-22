@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::Sender;
+#[cfg(windows)]
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};

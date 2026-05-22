@@ -103,6 +103,8 @@ pub struct SavedAccountMetadata {
     pub last_activated_at: Option<OffsetDateTime>,
     #[serde(default)]
     pub cached_usage: Option<AccountUsageView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_usage_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

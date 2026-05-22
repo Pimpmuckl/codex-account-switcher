@@ -12,6 +12,7 @@ use crate::model::{
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
 use crate::secrets::MigratingSecretStore;
+use crate::usage::{usage_error_label, usage_error_requires_login};
 
 #[derive(Parser)]
 #[command(
@@ -263,7 +264,16 @@ fn render_account_summary(account: &AccountView) -> String {
         account.email,
         if account.is_active { " [active]" } else { "" }
     );
-    if let Some(usage) = &account.usage
+    if account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        line.push_str(&format!(
+            " [{}]",
+            usage_error_label(account.usage_error.as_deref().unwrap_or_default()).to_lowercase()
+        ));
+    } else if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
         if weekly.reset_at <= OffsetDateTime::now_utc() {
@@ -275,8 +285,8 @@ fn render_account_summary(account: &AccountView) -> String {
                 weekly.reset_at.date()
             ));
         }
-    } else if account.usage_error.is_some() {
-        line.push_str(" [usage unavailable]");
+    } else if let Some(error) = &account.usage_error {
+        line.push_str(&format!(" [{}]", usage_error_label(error).to_lowercase()));
     }
     line
 }

@@ -11,6 +11,7 @@ use crate::model::{
     AccountUsageView, DisplayIdentity, EnvironmentKind, SavedAccountMetadata, SnapshotBlob,
 };
 use crate::secrets::SecretStore;
+use crate::usage::usage_error_requires_login;
 use codec::{decode_snapshot, encode_snapshot};
 use index_store::MetadataIndexStore;
 
@@ -82,6 +83,7 @@ where
             account.subject = identity.subject.clone();
             account.name = identity.name.clone();
             account.plan_label = identity.plan_label.clone();
+            account.cached_usage_error = None;
             account.updated_at = now;
             (account.clone(), false)
         } else {
@@ -98,6 +100,7 @@ where
                 updated_at: now,
                 last_activated_at: None,
                 cached_usage: None,
+                cached_usage_error: None,
             };
             index.accounts.push(metadata.clone());
             (metadata, true)
@@ -151,9 +154,37 @@ where
         account.name = identity.name.clone();
         account.plan_label = identity.plan_label.clone();
         account.cached_usage = usage;
+        account.cached_usage_error = None;
         let metadata = account.clone();
         self.secret_store
             .save(&metadata.secret_key, &encoded_snapshot)?;
+        self.index_store.save_index(&index)?;
+        Ok(metadata)
+    }
+
+    pub fn record_usage_error(
+        &self,
+        environment: &EnvironmentKind,
+        account_id: Uuid,
+        usage_error: String,
+    ) -> Result<SavedAccountMetadata> {
+        let mut index = self.index_store.load_index()?;
+        let position = index
+            .accounts
+            .iter()
+            .position(|account| account.id == account_id && &account.environment == environment)
+            .ok_or_else(|| anyhow!("saved account {account_id} not found"))?;
+        let account = &mut index.accounts[position];
+        if account
+            .cached_usage_error
+            .as_deref()
+            .is_some_and(usage_error_requires_login)
+            && !usage_error_requires_login(&usage_error)
+        {
+            return Ok(account.clone());
+        }
+        account.cached_usage_error = Some(usage_error);
+        let metadata = account.clone();
         self.index_store.save_index(&index)?;
         Ok(metadata)
     }
@@ -747,6 +778,82 @@ mod tests {
         assert_eq!(loaded.files.len(), snapshot.files.len());
         assert_eq!(loaded.files[0].bytes_base64, "auth-payload");
         assert_eq!(loaded.files[1].bytes_base64, "cap-payload");
+    }
+
+    #[test]
+    fn usage_error_is_persisted_and_cleared_by_snapshot_refresh() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+        let env = EnvironmentKind::Windows;
+        let snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![],
+        };
+        let saved = repo
+            .save_snapshot(&env, &identity("person@example.com", "sub-1"), &snapshot)
+            .expect("save")
+            .0;
+
+        repo.record_usage_error(&env, saved.id, "Login required".to_owned())
+            .expect("record error");
+        assert_eq!(
+            repo.get_account(&env, saved.id)
+                .expect("get")
+                .expect("account")
+                .cached_usage_error
+                .as_deref(),
+            Some("Login required")
+        );
+
+        repo.replace_snapshot(
+            &env,
+            saved.id,
+            &identity("person@example.com", "sub-1"),
+            &snapshot,
+            None,
+        )
+        .expect("replace");
+
+        assert!(
+            repo.get_account(&env, saved.id)
+                .expect("get")
+                .expect("account")
+                .cached_usage_error
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn transient_usage_error_does_not_replace_login_required_marker() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+        let env = EnvironmentKind::Windows;
+        let snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![],
+        };
+        let saved = repo
+            .save_snapshot(&env, &identity("person@example.com", "sub-1"), &snapshot)
+            .expect("save")
+            .0;
+
+        repo.record_usage_error(&env, saved.id, "Login required".to_owned())
+            .expect("record login error");
+        repo.record_usage_error(
+            &env,
+            saved.id,
+            "Usage unavailable: failed to query Codex usage".to_owned(),
+        )
+        .expect("record transient error");
+
+        assert_eq!(
+            repo.get_account(&env, saved.id)
+                .expect("get")
+                .expect("account")
+                .cached_usage_error
+                .as_deref(),
+            Some("Login required")
+        );
     }
 
     #[test]

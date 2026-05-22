@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.5 - 2026-05-22
+
+### Added
+
+- Added saved-account stale-login detection for expired or reused refresh tokens. Failed saved-account usage refreshes now persist a `Login required` marker so the CLI, TUI, and Windows tray can show which account needs a fresh sign-in.
+
+### Fixed
+
+- Prefer the stale-login marker over older cached weekly usage so expired accounts do not look healthy just because a previous usage snapshot still exists.
+- Refresh the Windows tray menu after background auto-start usage checks so tray rows reflect refreshed usage and login-required state without reopening the app.
+
 ## v0.1.4 - 2026-05-11
 
 ### Fixed

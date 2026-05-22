@@ -58,6 +58,36 @@ pub fn fetch_usage(target: UsageTarget) -> Result<(UsageOutput, SnapshotBlob)> {
     ))
 }
 
+pub fn usage_error_message(error: &anyhow::Error) -> String {
+    let rendered = format!("{error:#}");
+    if usage_error_requires_login(&rendered) {
+        "Login required: Codex auth expired or was logged out. Log in with this account again, then refresh/save it.".to_owned()
+    } else {
+        let detail = rendered.lines().next().unwrap_or("unknown error");
+        format!("Usage unavailable: {detail}")
+    }
+}
+
+pub fn usage_error_label(error: &str) -> &'static str {
+    if usage_error_requires_login(error) {
+        "Login required"
+    } else {
+        "Usage unavailable"
+    }
+}
+
+pub fn usage_error_requires_login(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("login required")
+        || error.contains("usage authorization failed")
+        || error.contains("snapshot refresh token missing")
+        || (error.contains("token refresh failed")
+            && (error.contains("invalid_grant")
+                || error.contains("refresh token")
+                || error.contains("log out")
+                || error.contains("sign in")))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredAuth {
     tokens: StoredTokens,
@@ -371,4 +401,30 @@ pub fn usage_target_from_snapshot(
         source,
         allow_refresh,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::*;
+
+    #[test]
+    fn reused_refresh_token_error_is_login_required() {
+        let error = anyhow!(
+            "token refresh failed with 400 Bad Request: {{\"error\":\"invalid_grant\",\"error_description\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}}"
+        );
+        let message = usage_error_message(&error);
+
+        assert_eq!(usage_error_label(&message), "Login required");
+        assert!(message.contains("Log in with this account again"));
+    }
+
+    #[test]
+    fn non_auth_usage_error_stays_usage_unavailable() {
+        let message = usage_error_message(&anyhow!("failed to query Codex usage"));
+
+        assert_eq!(usage_error_label(&message), "Usage unavailable");
+        assert_eq!(message, "Usage unavailable: failed to query Codex usage");
+    }
 }

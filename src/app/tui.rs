@@ -10,6 +10,7 @@ use crate::model::{
 };
 use crate::process::format_process_table;
 use crate::secrets::SecretStore;
+use crate::usage::{usage_error_label, usage_error_requires_login};
 
 use super::{App, InteractiveExit, InteractiveMode, account_view_matches_identity};
 
@@ -314,7 +315,16 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
         width = widths.plan
     );
 
-    let (remaining, reset) = if let Some(usage) = &account.usage
+    let (remaining, reset) = if account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        (
+            usage_error_label(account.usage_error.as_deref().unwrap_or_default()).to_owned(),
+            String::new(),
+        )
+    } else if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
         if weekly.reset_at <= OffsetDateTime::now_utc() {
@@ -325,8 +335,8 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
                 format!("Reset: {}", format_reset_at(weekly.reset_at)),
             )
         }
-    } else if account.usage_error.is_some() {
-        ("Usage unavailable".to_owned(), String::new())
+    } else if let Some(error) = &account.usage_error {
+        (usage_error_label(error).to_owned(), String::new())
     } else {
         (String::new(), String::new())
     };
@@ -351,7 +361,16 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
                 .map(|plan| format!("Plan: {plan}").len())
                 .unwrap_or(0),
         );
-        let (remaining, reset) = if let Some(usage) = &account.usage
+        let (remaining, reset) = if account
+            .usage_error
+            .as_deref()
+            .is_some_and(usage_error_requires_login)
+        {
+            (
+                usage_error_label(account.usage_error.as_deref().unwrap_or_default()).len(),
+                0,
+            )
+        } else if let Some(usage) = &account.usage
             && let Some(weekly) = &usage.weekly
         {
             if weekly.reset_at <= OffsetDateTime::now_utc() {
@@ -362,8 +381,8 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
                     format!("Reset: {}", format_reset_at(weekly.reset_at)).len(),
                 )
             }
-        } else if account.usage_error.is_some() {
-            ("Usage unavailable".len(), 0)
+        } else if let Some(error) = &account.usage_error {
+            (usage_error_label(error).len(), 0)
         } else {
             (0, 0)
         };
@@ -938,6 +957,68 @@ mod tests {
         );
 
         assert!(label.contains("Reset: 2099-05-12 13:56"));
+    }
+
+    #[test]
+    fn account_label_marks_login_required_usage_error() {
+        let id = Uuid::new_v4();
+        let mut list = sample_list(id, false);
+        list.accounts[0].usage = Some(AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: None,
+            weekly: Some(UsageWindowView {
+                used_percent: 0,
+                remaining_percent: 100,
+                reset_at: OffsetDateTime::UNIX_EPOCH
+                    .replace_date(
+                        time::Date::from_calendar_date(2099, time::Month::May, 12).unwrap(),
+                    )
+                    .replace_time(time::Time::from_hms(13, 56, 0).unwrap()),
+            }),
+            credits: None,
+        });
+        list.accounts[0].usage_error = Some("Login required: Codex auth expired.".to_owned());
+
+        let label = render_account_label(
+            &list.accounts[0],
+            account_label_widths(&[&list.accounts[0]]),
+        );
+
+        assert!(label.contains("Login required"));
+        assert!(!label.contains("Usage unavailable"));
+        assert!(!label.contains("Weekly Remaining"));
+    }
+
+    #[test]
+    fn account_label_keeps_cached_usage_for_transient_usage_error() {
+        let id = Uuid::new_v4();
+        let mut list = sample_list(id, false);
+        list.accounts[0].usage = Some(AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: None,
+            weekly: Some(UsageWindowView {
+                used_percent: 10,
+                remaining_percent: 90,
+                reset_at: OffsetDateTime::UNIX_EPOCH
+                    .replace_date(
+                        time::Date::from_calendar_date(2099, time::Month::May, 12).unwrap(),
+                    )
+                    .replace_time(time::Time::from_hms(13, 56, 0).unwrap()),
+            }),
+            credits: None,
+        });
+        list.accounts[0].usage_error =
+            Some("Usage unavailable: failed to query Codex usage".to_owned());
+
+        let label = render_account_label(
+            &list.accounts[0],
+            account_label_widths(&[&list.accounts[0]]),
+        );
+
+        assert!(label.contains("Weekly Remaining: 90%"));
+        assert!(!label.contains("Usage unavailable"));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use winit::window::WindowId;
 use crate::app::App;
 use crate::model::{AccountView, DisplayIdentity};
 use crate::secrets::SecretStore;
+use crate::usage::{usage_error_label, usage_error_requires_login};
 
 #[derive(Debug)]
 enum UserEvent {
@@ -395,7 +396,16 @@ impl TrayLabelWidths {
 }
 
 fn account_usage_labels(account: &AccountView) -> (String, String) {
-    if let Some(usage) = &account.usage
+    if account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        (
+            usage_error_label(account.usage_error.as_deref().unwrap_or_default()).to_owned(),
+            String::new(),
+        )
+    } else if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
         if weekly.reset_at <= OffsetDateTime::now_utc() {
@@ -409,8 +419,8 @@ fn account_usage_labels(account: &AccountView) -> (String, String) {
                 format!("Reset: {}", format_reset_at(weekly.reset_at)),
             )
         }
-    } else if account.usage_error.is_some() {
-        ("Usage unavailable".to_owned(), String::new())
+    } else if let Some(error) = &account.usage_error {
+        (usage_error_label(error).to_owned(), String::new())
     } else {
         (String::new(), String::new())
     }
@@ -578,6 +588,42 @@ mod tests {
                 tray_detail_separator()
             )
         );
+    }
+
+    #[test]
+    fn tray_account_label_marks_login_required_usage_error() {
+        let account = AccountView {
+            id: Uuid::new_v4(),
+            email: "person@example.com".to_owned(),
+            subject: Some("sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            environment: EnvironmentKind::Windows,
+            is_active: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: None,
+                weekly: Some(UsageWindowView {
+                    used_percent: 0,
+                    remaining_percent: 100,
+                    reset_at: OffsetDateTime::UNIX_EPOCH
+                        .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
+                        .replace_time(Time::from_hms(13, 56, 0).unwrap()),
+                }),
+                credits: None,
+            }),
+            usage_error: Some("Login required: Codex auth expired.".to_owned()),
+        };
+
+        let label = tray_account_label(&account, tray_label_widths(&[&account]));
+
+        assert!(label.contains("Login required"));
+        assert!(!label.contains("Usage unavailable"));
+        assert!(!label.contains("Weekly Remaining"));
     }
 
     #[test]
