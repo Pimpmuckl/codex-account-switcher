@@ -10,6 +10,7 @@ use crate::model::{
 };
 use crate::process::format_process_table;
 use crate::secrets::SecretStore;
+use crate::time_display::format_local_reset_at;
 use crate::usage::{usage_error_label, usage_error_requires_login};
 
 use super::{App, InteractiveExit, InteractiveMode, account_view_matches_identity};
@@ -332,7 +333,7 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
         } else {
             (
                 format!("Weekly Remaining: {}%", weekly.remaining_percent),
-                format!("Reset: {}", format_reset_at(weekly.reset_at)),
+                format!("Reset: {}", format_local_reset_at(weekly.reset_at)),
             )
         }
     } else if let Some(error) = &account.usage_error {
@@ -378,7 +379,7 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
             } else {
                 (
                     format!("Weekly Remaining: {}%", weekly.remaining_percent).len(),
-                    format!("Reset: {}", format_reset_at(weekly.reset_at)).len(),
+                    format!("Reset: {}", format_local_reset_at(weekly.reset_at)).len(),
                 )
             }
         } else if let Some(error) = &account.usage_error {
@@ -390,15 +391,6 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
         widths.reset = widths.reset.max(reset);
     }
     widths
-}
-
-fn format_reset_at(reset_at: OffsetDateTime) -> String {
-    format!(
-        "{} {:02}:{:02}",
-        reset_at.date(),
-        reset_at.hour(),
-        reset_at.minute()
-    )
 }
 
 pub(crate) fn build_menu(
@@ -935,6 +927,9 @@ mod tests {
     fn account_label_includes_reset_time() {
         let id = Uuid::new_v4();
         let mut list = sample_list(id, false);
+        let reset_at = OffsetDateTime::UNIX_EPOCH
+            .replace_date(time::Date::from_calendar_date(2099, time::Month::May, 12).unwrap())
+            .replace_time(time::Time::from_hms(13, 56, 0).unwrap());
         list.accounts[0].usage = Some(AccountUsageView {
             source: UsageSource::SavedAccessToken,
             fetched_at: OffsetDateTime::UNIX_EPOCH,
@@ -942,11 +937,7 @@ mod tests {
             weekly: Some(UsageWindowView {
                 used_percent: 77,
                 remaining_percent: 23,
-                reset_at: OffsetDateTime::UNIX_EPOCH
-                    .replace_date(
-                        time::Date::from_calendar_date(2099, time::Month::May, 12).unwrap(),
-                    )
-                    .replace_time(time::Time::from_hms(13, 56, 0).unwrap()),
+                reset_at,
             }),
             credits: None,
         });
@@ -956,7 +947,7 @@ mod tests {
             account_label_widths(&[&list.accounts[0]]),
         );
 
-        assert!(label.contains("Reset: 2099-05-12 13:56"));
+        assert!(label.contains(&format!("Reset: {}", format_local_reset_at(reset_at))));
     }
 
     #[test]

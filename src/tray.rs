@@ -15,6 +15,7 @@ use winit::window::WindowId;
 use crate::app::App;
 use crate::model::{AccountView, DisplayIdentity};
 use crate::secrets::SecretStore;
+use crate::time_display::format_local_reset_at;
 use crate::usage::{usage_error_label, usage_error_requires_login};
 
 #[derive(Debug)]
@@ -416,7 +417,7 @@ fn account_usage_labels(account: &AccountView) -> (String, String) {
                     "Weekly Remaining: {}%",
                     format_remaining_percent(weekly.remaining_percent)
                 ),
-                format!("Reset: {}", format_reset_at(weekly.reset_at)),
+                format!("Reset: {}", format_local_reset_at(weekly.reset_at)),
             )
         }
     } else if let Some(error) = &account.usage_error {
@@ -432,15 +433,6 @@ fn format_remaining_percent(percent: u8) -> String {
 
 fn visible_width(text: &str) -> usize {
     text.chars().count()
-}
-
-fn format_reset_at(reset_at: OffsetDateTime) -> String {
-    format!(
-        "{} {:02}:{:02}",
-        reset_at.date(),
-        reset_at.hour(),
-        reset_at.minute()
-    )
 }
 
 fn load_codex_icon() -> Icon {
@@ -553,6 +545,9 @@ mod tests {
 
     #[test]
     fn tray_account_label_includes_usage_table_columns() {
+        let reset_at = OffsetDateTime::UNIX_EPOCH
+            .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
+            .replace_time(Time::from_hms(0, 52, 0).unwrap());
         let mut account = AccountView {
             id: Uuid::new_v4(),
             email: "person@example.com".to_owned(),
@@ -574,9 +569,7 @@ mod tests {
             weekly: Some(UsageWindowView {
                 used_percent: 83,
                 remaining_percent: 17,
-                reset_at: OffsetDateTime::UNIX_EPOCH
-                    .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
-                    .replace_time(Time::from_hms(0, 52, 0).unwrap()),
+                reset_at,
             }),
             credits: None,
         });
@@ -584,8 +577,9 @@ mod tests {
         assert_eq!(
             tray_account_label(&account, tray_label_widths(&[&account])),
             format!(
-                "person@example.com{}Plan: Pro  Weekly Remaining: \u{2007}17%  Reset: 2099-05-12 00:52",
-                tray_detail_separator()
+                "person@example.com{}Plan: Pro  Weekly Remaining: \u{2007}17%  Reset: {}",
+                tray_detail_separator(),
+                format_local_reset_at(reset_at)
             )
         );
     }
@@ -700,6 +694,9 @@ mod tests {
 
     #[test]
     fn active_account_label_keeps_live_identity_and_saved_usage() {
+        let reset_at = OffsetDateTime::UNIX_EPOCH
+            .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
+            .replace_time(Time::from_hms(0, 52, 0).unwrap());
         let mut saved_account = AccountView {
             id: Uuid::new_v4(),
             email: "stale@example.com".to_owned(),
@@ -721,9 +718,7 @@ mod tests {
             weekly: Some(UsageWindowView {
                 used_percent: 83,
                 remaining_percent: 17,
-                reset_at: OffsetDateTime::UNIX_EPOCH
-                    .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
-                    .replace_time(Time::from_hms(0, 52, 0).unwrap()),
+                reset_at,
             }),
             credits: None,
         });
@@ -739,8 +734,9 @@ mod tests {
         assert_eq!(
             active_account_label(&account, Some(&saved_account), widths),
             format!(
-                "person@example.com{}Plan: ProLite  Weekly Remaining: \u{2007}17%  Reset: 2099-05-12 00:52",
-                tray_detail_separator()
+                "person@example.com{}Plan: ProLite  Weekly Remaining: \u{2007}17%  Reset: {}",
+                tray_detail_separator(),
+                format_local_reset_at(reset_at)
             )
         );
     }

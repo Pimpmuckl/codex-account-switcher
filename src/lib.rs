@@ -9,6 +9,7 @@ pub mod process;
 pub mod repository;
 pub mod secrets;
 pub mod settings;
+mod time_display;
 #[cfg(windows)]
 pub mod tray;
 pub mod usage;
