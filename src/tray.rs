@@ -445,14 +445,17 @@ fn load_codex_icon() -> Icon {
         .unwrap_or_else(fallback_icon)
 }
 
+#[cfg(windows)]
 pub(crate) fn hide_console_window() {
     release_console();
 }
 
+#[cfg(windows)]
 pub(crate) fn show_console_window() {
     allocate_console();
 }
 
+#[cfg(windows)]
 fn release_console() {
     use windows_sys::Win32::System::Console::FreeConsole;
 
@@ -461,6 +464,7 @@ fn release_console() {
     }
 }
 
+#[cfg(windows)]
 fn allocate_console() {
     use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
@@ -487,6 +491,7 @@ fn candidate_icon_paths() -> Vec<PathBuf> {
         paths.push(dir.join("icon.ico"));
         paths.push(dir.join("icon.png"));
     }
+    #[cfg(windows)]
     if let Some(program_files) = std::env::var_os("ProgramFiles") {
         let windows_apps = PathBuf::from(program_files).join("WindowsApps");
         if let Ok(entries) = std::fs::read_dir(windows_apps) {
@@ -498,6 +503,15 @@ fn candidate_icon_paths() -> Vec<PathBuf> {
                 }
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let codex_app = PathBuf::from("/Applications/Codex.app");
+        paths.push(codex_app.join("Contents/Resources/icon.png"));
+        paths.push(codex_app.join("Contents/Resources/icon.icns"));
+        paths.push(codex_app.join("Contents/Resources/AppIcon.icns"));
+        // Also check the bundled asset
+        paths.push(codex_app.join("Contents/Frameworks/Codex Framework.framework/Resources/icon.png"));
     }
     paths
 }

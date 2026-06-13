@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::Sender;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -151,7 +151,7 @@ where
 static AUTO_START_RUN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static AUTO_START_CHECK_LISTENERS: OnceLock<Mutex<Vec<Sender<()>>>> = OnceLock::new();
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn subscribe_auto_start_usage_windows_checks() -> Receiver<()> {
     let (sender, receiver) = mpsc::channel();
     let mut listeners = AUTO_START_CHECK_LISTENERS
@@ -190,7 +190,7 @@ fn notify_auto_start_usage_windows_checked() {
     listeners.retain(|listener| listener.send(()).is_ok());
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn run_auto_start_usage_windows_check_now(env: AppEnv) -> Result<()> {
     run_auto_start_usage_windows_for_env(env)
 }
@@ -460,7 +460,7 @@ mod tests {
         assert!(!usage_window_needs_ping(now + Duration::minutes(1), now));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn auto_start_check_notification_reaches_listener() {
         let receiver = subscribe_auto_start_usage_windows_checks();
