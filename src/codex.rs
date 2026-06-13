@@ -56,6 +56,7 @@ pub fn read_live_auth_bundle(env: &AppEnv) -> Result<LiveAuthBundle> {
 }
 
 pub fn identity_from_snapshot(snapshot: &SnapshotBlob) -> Result<DisplayIdentity> {
+    validate_managed_snapshot(snapshot)?;
     let auth_file = snapshot
         .files
         .iter()
@@ -73,7 +74,7 @@ pub fn restore_snapshot(
     expected_identity: &DisplayIdentity,
     verify_stable: bool,
 ) -> Result<()> {
-    ensure_snapshot_complete(snapshot)?;
+    validate_managed_snapshot(snapshot)?;
     fs::create_dir_all(&env.codex_root)
         .with_context(|| format!("failed to create {}", env.codex_root.display()))?;
     let backup_dir = env
@@ -142,11 +143,49 @@ pub fn verify_live_snapshot_stable(
     )
 }
 
-fn ensure_snapshot_complete(snapshot: &SnapshotBlob) -> Result<()> {
+pub(crate) fn validate_managed_snapshot(snapshot: &SnapshotBlob) -> Result<()> {
+    if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
+        bail!(
+            "unsupported snapshot schema version {} (expected {SNAPSHOT_SCHEMA_VERSION})",
+            snapshot.schema_version
+        );
+    }
+
+    let mut seen = Vec::with_capacity(AUTH_FILES.len());
+    for file in &snapshot.files {
+        validate_snapshot_file_name(&file.name)?;
+        if !AUTH_FILES.contains(&file.name.as_str()) {
+            bail!(
+                "snapshot contains unexpected managed auth file {}",
+                file.name
+            );
+        }
+        if seen.contains(&file.name.as_str()) {
+            bail!(
+                "snapshot contains duplicate managed auth file {}",
+                file.name
+            );
+        }
+        seen.push(file.name.as_str());
+    }
+
     for file_name in AUTH_FILES {
-        if !snapshot.files.iter().any(|file| file.name == file_name) {
+        if !seen.contains(&file_name) {
             return Err(anyhow!("snapshot missing managed auth file {file_name}"));
         }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_file_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || Path::new(name).is_absolute()
+    {
+        bail!("snapshot contains invalid managed auth file name {name:?}");
     }
     Ok(())
 }
@@ -300,6 +339,61 @@ mod tests {
     use super::*;
     use crate::model::EnvironmentKind;
 
+    fn test_env(temp: &tempfile::TempDir) -> Result<AppEnv> {
+        let codex_root = temp.path().join(".codex");
+        fs::create_dir_all(&codex_root)?;
+        Ok(AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root,
+            app_data_dir: temp.path().join("data"),
+        })
+    }
+
+    fn snapshot_file(name: &str, content: impl AsRef<[u8]>) -> SnapshotFile {
+        SnapshotFile {
+            name: name.to_owned(),
+            bytes_base64: STANDARD.encode(content),
+        }
+    }
+
+    fn snapshot(files: Vec<SnapshotFile>) -> SnapshotBlob {
+        SnapshotBlob {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            files,
+        }
+    }
+
+    fn identity(email: &str, subject: &str) -> DisplayIdentity {
+        DisplayIdentity {
+            email: email.to_owned(),
+            subject: Some(subject.to_owned()),
+            name: Some("Tester".to_owned()),
+            plan_label: Some("Pro".to_owned()),
+        }
+    }
+
+    fn live_env() -> Result<(tempfile::TempDir, AppEnv, String)> {
+        let temp = tempdir()?;
+        let env = test_env(&temp)?;
+        let live_auth = auth_json_fixture("live@example.com", "live-sub", Some("pro"));
+        fs::write(env.codex_root.join("auth.json"), &live_auth)?;
+        fs::write(env.codex_root.join("cap_sid"), "live-sid")?;
+        Ok((temp, env, live_auth))
+    }
+
+    fn assert_live_auth_unchanged(env: &AppEnv, live_auth: &str) -> Result<()> {
+        assert_eq!(
+            fs::read_to_string(env.codex_root.join("auth.json"))?,
+            live_auth
+        );
+        assert_eq!(
+            fs::read_to_string(env.codex_root.join("cap_sid"))?,
+            "live-sid"
+        );
+        Ok(())
+    }
+
     #[test]
     fn reads_bundle_and_restores_it() -> Result<()> {
         let temp = tempdir()?;
@@ -325,6 +419,113 @@ mod tests {
         restore_snapshot(&env, &bundle.snapshot, &bundle.identity, false)?;
         let restored = read_live_auth_bundle(&env)?;
         assert_eq!(restored.identity.email, "person@example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_missing_cap_sid_before_touching_live_auth() -> Result<()> {
+        let (_temp, env, live_auth) = live_env()?;
+        let snapshot = snapshot(vec![snapshot_file(
+            "auth.json",
+            auth_json_fixture("saved@example.com", "saved-sub", Some("pro")),
+        )]);
+
+        let error = restore_snapshot(
+            &env,
+            &snapshot,
+            &identity("saved@example.com", "saved-sub"),
+            false,
+        )
+        .expect_err("missing cap_sid should fail");
+
+        assert!(format!("{error:#}").contains("snapshot missing managed auth file cap_sid"));
+        assert_live_auth_unchanged(&env, &live_auth)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_auth_json() -> Result<()> {
+        let (_temp, env, live_auth) = live_env()?;
+        let snapshot = snapshot(vec![
+            snapshot_file(
+                "auth.json",
+                auth_json_fixture("first@example.com", "first-sub", Some("pro")),
+            ),
+            snapshot_file(
+                "auth.json",
+                auth_json_fixture("second@example.com", "second-sub", Some("pro")),
+            ),
+            snapshot_file("cap_sid", "saved-sid"),
+        ]);
+
+        let error = restore_snapshot(
+            &env,
+            &snapshot,
+            &identity("first@example.com", "first-sub"),
+            false,
+        )
+        .expect_err("duplicate auth.json should fail");
+
+        assert!(
+            format!("{error:#}")
+                .contains("snapshot contains duplicate managed auth file auth.json")
+        );
+        assert_live_auth_unchanged(&env, &live_auth)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_unexpected_snapshot_file() -> Result<()> {
+        let (_temp, env, live_auth) = live_env()?;
+        let snapshot = snapshot(vec![
+            snapshot_file(
+                "auth.json",
+                auth_json_fixture("saved@example.com", "saved-sub", Some("pro")),
+            ),
+            snapshot_file("cap_sid", "saved-sid"),
+            snapshot_file("notes.txt", "extra"),
+        ]);
+
+        let error = restore_snapshot(
+            &env,
+            &snapshot,
+            &identity("saved@example.com", "saved-sub"),
+            false,
+        )
+        .expect_err("unexpected file should fail");
+
+        assert!(
+            format!("{error:#}")
+                .contains("snapshot contains unexpected managed auth file notes.txt")
+        );
+        assert_live_auth_unchanged(&env, &live_auth)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_parent_path_before_staging_files() -> Result<()> {
+        let (temp, env, live_auth) = live_env()?;
+        let snapshot = snapshot(vec![
+            snapshot_file(
+                "auth.json",
+                auth_json_fixture("saved@example.com", "saved-sub", Some("pro")),
+            ),
+            snapshot_file("cap_sid", "saved-sid"),
+            snapshot_file("../outside.txt", "outside"),
+        ]);
+
+        let error = restore_snapshot(
+            &env,
+            &snapshot,
+            &identity("saved@example.com", "saved-sub"),
+            false,
+        )
+        .expect_err("parent path should fail");
+
+        assert!(format!("{error:#}").contains("invalid managed auth file name"));
+        assert!(!env.codex_root.join("outside.txt").exists());
+        assert!(!temp.path().join("outside.txt").exists());
+        assert_live_auth_unchanged(&env, &live_auth)?;
         Ok(())
     }
 

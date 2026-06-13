@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
+use crate::codex::validate_managed_snapshot;
 use crate::identity::parse_identity_from_auth_json;
 use crate::model::{
     AccountUsageView, CreditsView, DisplayIdentity, EnvironmentKind, SnapshotBlob, UsageOutput,
@@ -185,14 +186,7 @@ impl UsageResponse {
 }
 
 fn snapshot_auth(snapshot: &SnapshotBlob) -> Result<SnapshotAuth> {
-    let auth_file = snapshot
-        .files
-        .iter()
-        .find(|file| file.name == "auth.json")
-        .context("snapshot missing auth.json")?;
-    let auth_json = STANDARD
-        .decode(&auth_file.bytes_base64)
-        .context("failed to decode snapshot auth.json")?;
+    let auth_json = snapshot_auth_json(snapshot)?;
     let stored: StoredAuth =
         serde_json::from_slice(&auth_json).context("failed to parse snapshot auth.json")?;
     Ok(SnapshotAuth {
@@ -203,6 +197,18 @@ fn snapshot_auth(snapshot: &SnapshotBlob) -> Result<SnapshotAuth> {
         last_refresh: parse_last_refresh(stored.last_refresh.as_deref())?,
         changed: false,
     })
+}
+
+fn snapshot_auth_json(snapshot: &SnapshotBlob) -> Result<Vec<u8>> {
+    validate_managed_snapshot(snapshot)?;
+    let auth_file = snapshot
+        .files
+        .iter()
+        .find(|file| file.name == "auth.json")
+        .context("snapshot missing auth.json")?;
+    STANDARD
+        .decode(&auth_file.bytes_base64)
+        .context("failed to decode snapshot auth.json")
 }
 
 fn update_snapshot_auth(snapshot: &SnapshotBlob, auth: &SnapshotAuth) -> Result<SnapshotBlob> {
@@ -385,14 +391,7 @@ pub fn usage_target_from_snapshot(
     source: UsageSource,
     allow_refresh: bool,
 ) -> Result<UsageTarget> {
-    let auth_file = snapshot
-        .files
-        .iter()
-        .find(|file| file.name == "auth.json")
-        .context("snapshot missing auth.json")?;
-    let auth_json = STANDARD
-        .decode(&auth_file.bytes_base64)
-        .context("failed to decode snapshot auth.json")?;
+    let auth_json = snapshot_auth_json(&snapshot)?;
     let identity = parse_identity_from_auth_json(&auth_json)?;
     Ok(UsageTarget {
         environment,
@@ -406,8 +405,17 @@ pub fn usage_target_from_snapshot(
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
+    use base64::Engine;
 
     use super::*;
+    use crate::model::{SNAPSHOT_SCHEMA_VERSION, SnapshotFile};
+
+    fn snapshot_file(name: &str, content: impl AsRef<[u8]>) -> SnapshotFile {
+        SnapshotFile {
+            name: name.to_owned(),
+            bytes_base64: STANDARD.encode(content),
+        }
+    }
 
     #[test]
     fn reused_refresh_token_error_is_login_required() {
@@ -426,5 +434,33 @@ mod tests {
 
         assert_eq!(usage_error_label(&message), "Usage unavailable");
         assert_eq!(message, "Usage unavailable: failed to query Codex usage");
+    }
+
+    #[test]
+    fn snapshot_auth_rejects_duplicate_auth_json_before_selecting_token() {
+        let stored_auth = serde_json::json!({
+            "tokens": {
+                "access_token": "first-token",
+                "refresh_token": null,
+                "id_token": null,
+                "account_id": null
+            }
+        })
+        .to_string();
+        let snapshot = SnapshotBlob {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            files: vec![
+                snapshot_file("auth.json", stored_auth),
+                snapshot_file("auth.json", "not-json"),
+                snapshot_file("cap_sid", "sid"),
+            ],
+        };
+
+        let error = snapshot_auth(&snapshot).expect_err("duplicate auth.json should fail");
+
+        assert!(
+            format!("{error:#}")
+                .contains("snapshot contains duplicate managed auth file auth.json")
+        );
     }
 }
