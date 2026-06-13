@@ -18,6 +18,8 @@ static CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 static USAGE_ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
 static REFRESH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 static TOKEN_REFRESH_INTERVAL: LazyLock<Duration> = LazyLock::new(|| Duration::days(8));
+const ERROR_CATEGORY_LIMIT: usize = 160;
+const USAGE_ERROR_MESSAGE_LIMIT: usize = 200;
 
 #[derive(Clone, Debug)]
 pub struct UsageTarget {
@@ -65,6 +67,10 @@ pub fn usage_error_message(error: &anyhow::Error) -> String {
         "Login required: Codex auth expired or was logged out. Log in with this account again, then refresh/save it.".to_owned()
     } else {
         let detail = rendered.lines().next().unwrap_or("unknown error");
+        let detail = sanitize_error_detail(
+            detail,
+            USAGE_ERROR_MESSAGE_LIMIT.saturating_sub("Usage unavailable: ".len()),
+        );
         format!("Usage unavailable: {detail}")
     }
 }
@@ -148,6 +154,13 @@ struct RefreshResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     id_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorResponse {
+    error: Option<String>,
+    error_description: Option<String>,
+    message: Option<String>,
 }
 
 impl UsageResponse {
@@ -252,7 +265,10 @@ fn fetch_usage_response(access_token: &str, account_id: Option<&str>) -> Result<
     }
     if status.as_u16() >= 400 {
         let body = response.body_mut().read_to_string().unwrap_or_default();
-        bail!("usage request failed with {status}: {body}");
+        bail!(
+            "{}",
+            sanitized_http_error("usage request", status, &body, false)
+        );
     }
     response
         .body_mut()
@@ -297,7 +313,10 @@ fn refresh_auth(auth: &SnapshotAuth) -> Result<SnapshotAuth> {
     let status = response.status();
     if status.as_u16() >= 400 {
         let body = response.body_mut().read_to_string().unwrap_or_default();
-        bail!("token refresh failed with {status}: {body}");
+        bail!(
+            "{}",
+            sanitized_http_error("token refresh", status, &body, true)
+        );
     }
     let refreshed = response
         .body_mut()
@@ -385,6 +404,136 @@ fn format_last_refresh(value: OffsetDateTime) -> String {
         .unwrap_or_else(|_| value.unix_timestamp().to_string())
 }
 
+fn sanitized_http_error(
+    operation: &str,
+    status: impl std::fmt::Display,
+    body: &str,
+    classify_refresh_login: bool,
+) -> String {
+    let mut message = format!("{operation} failed with {status}");
+    if let Some(category) = sanitized_error_category(body, classify_refresh_login) {
+        message.push_str(": ");
+        message.push_str(&category);
+    }
+    sanitize_error_detail(&message, USAGE_ERROR_MESSAGE_LIMIT)
+}
+
+fn sanitized_error_category(body: &str, classify_refresh_login: bool) -> Option<String> {
+    let error = match serde_json::from_str::<ErrorResponse>(body) {
+        Ok(error) => error,
+        Err(_) if classify_refresh_login && is_refresh_login_error(body) => {
+            return Some("login required: token refresh response requested sign in".to_owned());
+        }
+        Err(_) => return None,
+    };
+    let code = error
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let description = error
+        .error_description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            error
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+
+    if classify_refresh_login {
+        if code.is_some_and(|value| value.eq_ignore_ascii_case("invalid_grant")) {
+            return Some("invalid_grant refresh token invalid; login required".to_owned());
+        }
+        if description.is_some_and(is_refresh_login_error) {
+            return Some("login required: token refresh response requested sign in".to_owned());
+        }
+    }
+
+    code.map(|value| sanitize_error_detail(value, ERROR_CATEGORY_LIMIT))
+}
+
+fn is_refresh_login_error(description: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    description.contains("invalid_grant")
+        || description.contains("log out")
+        || description.contains("sign in")
+        || description.contains("login required")
+        || description.contains("refresh token")
+            && (description.contains("invalid")
+                || description.contains("reused")
+                || description.contains("already used")
+                || description.contains("expired")
+                || description.contains("revoked"))
+}
+
+fn sanitize_error_detail(detail: &str, limit: usize) -> String {
+    let single_line = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = redact_json_tokens(&single_line);
+    truncate_chars(&redacted, limit)
+}
+
+fn redact_json_tokens(input: &str) -> String {
+    let Some(start) = input.find(['{', '[']) else {
+        return input.to_owned();
+    };
+    let Some(end) = input.rfind(['}', ']']) else {
+        return input.to_owned();
+    };
+    if end <= start {
+        return input.to_owned();
+    }
+
+    let json = &input[start..=end];
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return input.to_owned();
+    };
+    redact_json_value(&mut value);
+    format!("{}{}{}", &input[..start], value, &input[end + 1..])
+}
+
+fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if is_secret_field(key) {
+                    *value = serde_json::Value::String("[redacted]".to_owned());
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_field(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "access_token" | "refresh_token" | "id_token" | "authorization"
+    )
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_owned();
+    }
+    if limit <= 3 {
+        return ".".repeat(limit);
+    }
+    let mut truncated = value.chars().take(limit - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 pub fn usage_target_from_snapshot(
     environment: EnvironmentKind,
     snapshot: SnapshotBlob,
@@ -420,12 +569,82 @@ mod tests {
     #[test]
     fn reused_refresh_token_error_is_login_required() {
         let error = anyhow!(
-            "token refresh failed with 400 Bad Request: {{\"error\":\"invalid_grant\",\"error_description\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}}"
+            "{}",
+            sanitized_http_error(
+                "token refresh",
+                "400 Bad Request",
+                r#"{"error":"invalid_grant","error_description":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}"#,
+                true,
+            )
         );
         let message = usage_error_message(&error);
 
         assert_eq!(usage_error_label(&message), "Login required");
         assert!(message.contains("Log in with this account again"));
+    }
+
+    #[test]
+    fn refresh_description_only_login_error_is_login_required() {
+        let error = anyhow!(
+            "{}",
+            sanitized_http_error(
+                "token refresh",
+                "400 Bad Request",
+                r#"{"message":"Please log out and sign in again."}"#,
+                true,
+            )
+        );
+        let message = usage_error_message(&error);
+
+        assert_eq!(usage_error_label(&message), "Login required");
+        assert!(message.contains("Log in with this account again"));
+    }
+
+    #[test]
+    fn blank_refresh_description_falls_back_to_login_message() {
+        let error = anyhow!(
+            "{}",
+            sanitized_http_error(
+                "token refresh",
+                "400 Bad Request",
+                r#"{"error_description":"   ","message":"Please sign in again."}"#,
+                true,
+            )
+        );
+        let message = usage_error_message(&error);
+
+        assert_eq!(usage_error_label(&message), "Login required");
+        assert!(message.contains("Log in with this account again"));
+    }
+
+    #[test]
+    fn long_refresh_description_login_error_keeps_login_marker() {
+        let body = format!(
+            r#"{{"message":"{} Please sign in again."}}"#,
+            "x".repeat(220)
+        );
+        let error = anyhow!(
+            "{}",
+            sanitized_http_error("token refresh", "400 Bad Request", &body, true)
+        );
+        let message = usage_error_message(&error);
+
+        assert_eq!(usage_error_label(&message), "Login required");
+        assert!(message.contains("Log in with this account again"));
+    }
+
+    #[test]
+    fn non_json_refresh_login_error_is_login_required_without_raw_body() {
+        let body = "refresh token was already used; please sign in again; secret-refresh-value";
+        let error = anyhow!(
+            "{}",
+            sanitized_http_error("token refresh", "400 Bad Request", body, true)
+        );
+        let message = usage_error_message(&error);
+
+        assert_eq!(usage_error_label(&message), "Login required");
+        assert!(message.contains("Log in with this account again"));
+        assert!(!message.contains("secret-refresh-value"));
     }
 
     #[test]
@@ -462,5 +681,43 @@ mod tests {
             format!("{error:#}")
                 .contains("snapshot contains duplicate managed auth file auth.json")
         );
+    }
+
+    #[test]
+    fn usage_error_message_redacts_and_bounds_token_json() {
+        let body = format!(
+            r#"{{"access_token":"secret-access","refresh_token":"secret-refresh","id_token":"secret-id","Authorization":"Bearer secret-auth","message":"{}"}}"#,
+            "x".repeat(500)
+        );
+        let error = anyhow!("usage request failed with 500 Internal Server Error: {body}");
+        let message = usage_error_message(&error);
+
+        assert!(message.len() <= USAGE_ERROR_MESSAGE_LIMIT);
+        assert!(!message.contains('\n'));
+        assert!(!message.contains("secret-access"));
+        assert!(!message.contains("secret-refresh"));
+        assert!(!message.contains("secret-id"));
+        assert!(!message.contains("secret-auth"));
+    }
+
+    #[test]
+    fn generic_http_error_keeps_status_without_raw_body() {
+        let error = anyhow!(
+            "{}",
+            sanitized_http_error(
+                "usage request",
+                "500 Internal Server Error",
+                "<html>raw upstream outage body</html>",
+                false,
+            )
+        );
+        let message = usage_error_message(&error);
+
+        assert_eq!(
+            message,
+            "Usage unavailable: usage request failed with 500 Internal Server Error"
+        );
+        assert!(message.contains("500 Internal Server Error"));
+        assert!(!message.contains("raw upstream outage body"));
     }
 }
