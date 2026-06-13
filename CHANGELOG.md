@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.6 - 2026-06-13
+
+### Fixed
+
+- Validate saved auth snapshots before activation so incomplete or corrupt snapshot files cannot be restored into the live Codex home.
+- Recover interrupted auth restores more reliably by tracking restore transactions and cleaning abandoned restore artifacts before future reads.
+- Sanitize persisted usage-refresh errors so local metadata does not retain raw API response text.
+- Recover settings from interrupted writes by falling back to the last valid backup when the primary settings file is incomplete.
+
 ## v0.1.5 - 2026-05-22
 
 ### Added
