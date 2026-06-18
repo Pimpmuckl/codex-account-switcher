@@ -223,7 +223,7 @@ where
                         }
                     }
                 }
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "macos"))]
                 InteractiveAction::SendToTray => return Ok(InteractiveExit::SendToTray),
                 InteractiveAction::Quit => break,
             }
@@ -240,7 +240,7 @@ pub(crate) enum InteractiveAction {
     DeletePrompt,
     ShowStatus,
     SetAutoStartUsageWindows(bool),
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     SendToTray,
     Quit,
 }
@@ -476,7 +476,7 @@ pub(crate) fn build_menu(
             label: "Show status".to_owned(),
             action: InteractiveAction::ShowStatus,
         });
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         actions.push(InteractiveItem {
             label: "Send to Tray".to_owned(),
             action: InteractiveAction::SendToTray,

@@ -218,22 +218,26 @@ where
     S: crate::secrets::SecretStore,
 {
     crate::app::spawn_auto_start_usage_windows_worker(app.env().clone());
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         loop {
             match app.interactive(InteractiveMode::Persistent, false)? {
                 InteractiveExit::Quit => return Ok(()),
                 InteractiveExit::SendToTray => {
+                    #[cfg(windows)]
                     crate::tray::hide_console_window();
                     match crate::tray::run(app)? {
-                        crate::tray::TrayExit::ShowTui => crate::tray::show_console_window(),
+                        crate::tray::TrayExit::ShowTui => {
+                            #[cfg(windows)]
+                            crate::tray::show_console_window();
+                        }
                         crate::tray::TrayExit::Quit => return Ok(()),
                     }
                 }
             }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         match app.interactive(InteractiveMode::Persistent, false)? {
             InteractiveExit::Quit => Ok(()),

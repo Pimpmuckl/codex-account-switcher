@@ -10,6 +10,6 @@ pub mod repository;
 pub mod secrets;
 pub mod settings;
 mod time_display;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod tray;
 pub mod usage;
