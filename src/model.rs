@@ -234,9 +234,11 @@ impl AccountUsageView {
                 return true;
             }
         }
-        if let Some(credits) = &self.credits {
-            if !credits.unlimited && !credits.has_credits {
-                return true;
+        if self.five_hour.is_none() && self.weekly.is_none() {
+            if let Some(credits) = &self.credits {
+                if !credits.unlimited && !credits.has_credits {
+                    return true;
+                }
             }
         }
         false
