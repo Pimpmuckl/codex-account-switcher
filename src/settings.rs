@@ -10,6 +10,8 @@ use crate::file_store::replace_file_with_recovery;
 pub struct AppSettings {
     #[serde(default)]
     pub auto_start_usage_windows: bool,
+    #[serde(default)]
+    pub auto_switch_on_limit: bool,
 }
 
 pub fn load_settings(app_data_dir: &Path) -> Result<AppSettings> {
@@ -50,6 +52,7 @@ mod tests {
         let settings = load_settings(temp.path()).expect("load settings");
 
         assert!(!settings.auto_start_usage_windows);
+        assert!(!settings.auto_switch_on_limit);
     }
 
     #[test]
@@ -59,6 +62,7 @@ mod tests {
             temp.path(),
             &AppSettings {
                 auto_start_usage_windows: true,
+                auto_switch_on_limit: true,
             },
         )
         .expect("save settings");
@@ -66,6 +70,7 @@ mod tests {
         let settings = load_settings(temp.path()).expect("load settings");
 
         assert!(settings.auto_start_usage_windows);
+        assert!(settings.auto_switch_on_limit);
     }
 
     #[test]
@@ -77,5 +82,6 @@ mod tests {
         let settings = load_settings(temp.path()).expect("load settings");
 
         assert!(!settings.auto_start_usage_windows);
+        assert!(!settings.auto_switch_on_limit);
     }
 }

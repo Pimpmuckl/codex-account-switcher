@@ -5,7 +5,7 @@ mod tui;
 use uuid::Uuid;
 
 pub use auto_start::spawn_auto_start_usage_windows_worker;
-#[cfg(windows)]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) use auto_start::{
     run_auto_start_usage_windows_check_now, subscribe_auto_start_usage_windows_checks,
 };
@@ -32,7 +32,7 @@ pub enum InteractiveMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteractiveExit {
     Quit,
-    #[cfg(windows)]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     SendToTray,
 }
 

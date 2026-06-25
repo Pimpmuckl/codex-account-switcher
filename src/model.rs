@@ -161,6 +161,11 @@ pub struct AutoStartUsageWindowsStatusOutput {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct AutoSwitchOnLimitStatusOutput {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct AutoStartUsageWindowsRunOutput {
     pub enabled: bool,
     pub checked_accounts: usize,
@@ -215,6 +220,27 @@ pub struct AccountUsageView {
     pub five_hour: Option<UsageWindowView>,
     pub weekly: Option<UsageWindowView>,
     pub credits: Option<CreditsView>,
+}
+
+impl AccountUsageView {
+    pub fn is_out_of_quota(&self, now: OffsetDateTime) -> bool {
+        if let Some(five_hour) = &self.five_hour {
+            if five_hour.remaining_percent == 0 && five_hour.reset_at > now {
+                return true;
+            }
+        }
+        if let Some(weekly) = &self.weekly {
+            if weekly.remaining_percent == 0 && weekly.reset_at > now {
+                return true;
+            }
+        }
+        if let Some(credits) = &self.credits {
+            if !credits.unlimited && !credits.has_credits {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

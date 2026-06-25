@@ -446,13 +446,16 @@ fn load_codex_icon() -> Icon {
 }
 
 pub(crate) fn hide_console_window() {
+    #[cfg(target_os = "windows")]
     release_console();
 }
 
 pub(crate) fn show_console_window() {
+    #[cfg(target_os = "windows")]
     allocate_console();
 }
 
+#[cfg(target_os = "windows")]
 fn release_console() {
     use windows_sys::Win32::System::Console::FreeConsole;
 
@@ -461,6 +464,7 @@ fn release_console() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn allocate_console() {
     use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
@@ -487,14 +491,17 @@ fn candidate_icon_paths() -> Vec<PathBuf> {
         paths.push(dir.join("icon.ico"));
         paths.push(dir.join("icon.png"));
     }
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        let windows_apps = PathBuf::from(program_files).join("WindowsApps");
-        if let Ok(entries) = std::fs::read_dir(windows_apps) {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.starts_with("OpenAI.Codex_") {
-                    paths.push(entry.path().join("app").join("resources").join("icon.ico"));
-                    paths.push(entry.path().join("app").join("assets").join("icon.png"));
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            let windows_apps = PathBuf::from(program_files).join("WindowsApps");
+            if let Ok(entries) = std::fs::read_dir(windows_apps) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if file_name.starts_with("OpenAI.Codex_") {
+                        paths.push(entry.path().join("app").join("resources").join("icon.ico"));
+                        paths.push(entry.path().join("app").join("assets").join("icon.png"));
+                    }
                 }
             }
         }

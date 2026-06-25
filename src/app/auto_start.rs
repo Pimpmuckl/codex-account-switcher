@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::Sender;
-#[cfg(windows)]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -16,7 +16,8 @@ use crate::codex;
 use crate::env::AppEnv;
 use crate::model::{
     AUTH_FILES, AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
-    AutoStartUsageWindowsStatusOutput, DisplayIdentity, SnapshotBlob,
+    AutoStartUsageWindowsStatusOutput, AutoSwitchOnLimitStatusOutput, DisplayIdentity,
+    SnapshotBlob,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
@@ -48,12 +49,85 @@ where
         Ok(auto_start_status_output(enabled))
     }
 
+    pub fn auto_switch_on_limit_status(&self) -> Result<AutoSwitchOnLimitStatusOutput> {
+        let settings = load_settings(&self.env.app_data_dir)?;
+        Ok(AutoSwitchOnLimitStatusOutput {
+            enabled: settings.auto_switch_on_limit,
+        })
+    }
+
+    pub fn set_auto_switch_on_limit(
+        &self,
+        enabled: bool,
+    ) -> Result<AutoSwitchOnLimitStatusOutput> {
+        let mut settings = load_settings(&self.env.app_data_dir)?;
+        settings.auto_switch_on_limit = enabled;
+        save_settings(&self.env.app_data_dir, &settings)?;
+        Ok(AutoSwitchOnLimitStatusOutput { enabled })
+    }
+
+    pub fn auto_switch_on_limit_once(&self) -> Result<Option<Uuid>> {
+        let settings = load_settings(&self.env.app_data_dir)?;
+        if !settings.auto_switch_on_limit {
+            return Ok(None);
+        }
+        let status = self.status()?;
+        let Some(current_id) = status.current_account_saved_id else {
+            return Ok(None);
+        };
+        let accounts = self.repository.list_accounts(&self.env.kind)?;
+        let Some(current_account) = accounts.iter().find(|a| a.id == current_id) else {
+            return Ok(None);
+        };
+        let now = OffsetDateTime::now_utc();
+        let current_out = current_account
+            .cached_usage
+            .as_ref()
+            .is_some_and(|usage| usage.is_out_of_quota(now))
+            || current_account
+                .cached_usage_error
+                .as_ref()
+                .is_some_and(|err| crate::usage::usage_error_requires_login(err));
+        if !current_out {
+            return Ok(None);
+        }
+        let mut candidates = Vec::new();
+        for account in &accounts {
+            if account.id == current_id {
+                continue;
+            }
+            if let Some(err) = &account.cached_usage_error {
+                if crate::usage::usage_error_requires_login(err) {
+                    continue;
+                }
+            }
+            let is_ok = match &account.cached_usage {
+                Some(usage) => !usage.is_out_of_quota(now),
+                None => true,
+            };
+            if is_ok {
+                candidates.push(account);
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        candidates.sort_by(|a, b| {
+            let a_rem = a.cached_usage.as_ref().and_then(|u| u.weekly.as_ref()).map(|w| w.remaining_percent).unwrap_or(50);
+            let b_rem = b.cached_usage.as_ref().and_then(|u| u.weekly.as_ref()).map(|w| w.remaining_percent).unwrap_or(50);
+            b_rem.cmp(&a_rem)
+        });
+        let target_id = candidates[0].id;
+        self.activate_with_running_policy(target_id, true)?;
+        Ok(Some(target_id))
+    }
+
     pub fn auto_start_usage_windows_once(
         &self,
         require_enabled: bool,
     ) -> Result<AutoStartUsageWindowsRunOutput> {
         let settings = load_settings(&self.env.app_data_dir)?;
-        let enabled = settings.auto_start_usage_windows;
+        let enabled = settings.auto_start_usage_windows || settings.auto_switch_on_limit;
         let mut output = AutoStartUsageWindowsRunOutput {
             enabled,
             checked_accounts: 0,
@@ -89,21 +163,24 @@ where
                     .push(format!("{}: usage unavailable: {error:#}", account.email)),
             }
         }
-        if due_accounts.is_empty() {
-            return Ok(output);
+
+        if !due_accounts.is_empty() {
+            for (account_id, email) in due_accounts {
+                let result = match self.ping_usage_window_account(account_id, &email) {
+                    Ok(result) => result,
+                    Err(error) => AutoStartUsageWindowAccountResult {
+                        account_id,
+                        email,
+                        status: "failed".to_owned(),
+                        detail: Some(format!("{error:#}")),
+                    },
+                };
+                output.pinged_accounts.push(result);
+            }
         }
 
-        for (account_id, email) in due_accounts {
-            let result = match self.ping_usage_window_account(account_id, &email) {
-                Ok(result) => result,
-                Err(error) => AutoStartUsageWindowAccountResult {
-                    account_id,
-                    email,
-                    status: "failed".to_owned(),
-                    detail: Some(format!("{error:#}")),
-                },
-            };
-            output.pinged_accounts.push(result);
+        if let Err(error) = self.auto_switch_on_limit_once() {
+            eprintln!("Auto-switch on limit check failed: {error:#}");
         }
 
         Ok(output)
@@ -151,7 +228,7 @@ where
 static AUTO_START_RUN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static AUTO_START_CHECK_LISTENERS: OnceLock<Mutex<Vec<Sender<()>>>> = OnceLock::new();
 
-#[cfg(windows)]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) fn subscribe_auto_start_usage_windows_checks() -> Receiver<()> {
     let (sender, receiver) = mpsc::channel();
     let mut listeners = AUTO_START_CHECK_LISTENERS
@@ -190,7 +267,7 @@ fn notify_auto_start_usage_windows_checked() {
     listeners.retain(|listener| listener.send(()).is_ok());
 }
 
-#[cfg(windows)]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) fn run_auto_start_usage_windows_check_now(env: AppEnv) -> Result<()> {
     run_auto_start_usage_windows_for_env(env)
 }
@@ -460,7 +537,7 @@ mod tests {
         assert!(!usage_window_needs_ping(now + Duration::minutes(1), now));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
     fn auto_start_check_notification_reaches_listener() {
         let receiver = subscribe_auto_start_usage_windows_checks();
@@ -494,6 +571,144 @@ mod tests {
         scrub_temp_auth_material(temp.path())?;
 
         assert!(!codex_home.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn auto_switch_on_limit_once_switches_when_out_of_quota() -> Result<()> {
+        use base64::Engine;
+        use crate::model::{EnvironmentKind, DisplayIdentity, SnapshotBlob};
+
+        let temp = tempfile::tempdir()?;
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+        std::fs::create_dir_all(&env.codex_root)?;
+        std::fs::write(
+            env.codex_root.join("auth.json"),
+            crate::codex::auth_json_fixture("active@example.com", "sub-active", Some("pro")),
+        )?;
+        std::fs::write(env.codex_root.join("cap_sid"), "sid-active")?;
+
+        let active_snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![
+                crate::model::SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(
+                        crate::codex::auth_json_fixture("active@example.com", "sub-active", Some("pro")),
+                    ),
+                },
+                crate::model::SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode("sid-active"),
+                },
+            ],
+        };
+
+        let candidate_snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![
+                crate::model::SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(
+                        crate::codex::auth_json_fixture("candidate@example.com", "sub-candidate", Some("pro")),
+                    ),
+                },
+                crate::model::SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode("sid-candidate"),
+                },
+            ],
+        };
+
+        let repo = SnapshotRepository::new(&env.app_data_dir, crate::secrets::test_support::MemorySecretStore::default());
+        let saved_active = repo.save_snapshot(
+            &env.kind,
+            &DisplayIdentity {
+                email: "active@example.com".to_owned(),
+                subject: Some("sub-active".to_owned()),
+                name: None,
+                plan_label: Some("Pro".to_owned()),
+            },
+            &active_snapshot,
+        )?.0;
+
+        let saved_candidate = repo.save_snapshot(
+            &env.kind,
+            &DisplayIdentity {
+                email: "candidate@example.com".to_owned(),
+                subject: Some("sub-candidate".to_owned()),
+                name: None,
+                plan_label: Some("Pro".to_owned()),
+            },
+            &candidate_snapshot,
+        )?.0;
+
+        let now = OffsetDateTime::now_utc();
+        repo.replace_snapshot(
+            &env.kind,
+            saved_active.id,
+            &DisplayIdentity {
+                email: "active@example.com".to_owned(),
+                subject: Some("sub-active".to_owned()),
+                name: None,
+                plan_label: Some("Pro".to_owned()),
+            },
+            &active_snapshot,
+            Some(crate::model::AccountUsageView {
+                source: crate::model::UsageSource::SavedAccessToken,
+                fetched_at: now,
+                five_hour: Some(crate::model::UsageWindowView {
+                    used_percent: 100,
+                    remaining_percent: 0,
+                    reset_at: now + Duration::hours(1),
+                }),
+                weekly: None,
+                credits: None,
+            }),
+        )?;
+
+        repo.replace_snapshot(
+            &env.kind,
+            saved_candidate.id,
+            &DisplayIdentity {
+                email: "candidate@example.com".to_owned(),
+                subject: Some("sub-candidate".to_owned()),
+                name: None,
+                plan_label: Some("Pro".to_owned()),
+            },
+            &candidate_snapshot,
+            Some(crate::model::AccountUsageView {
+                source: crate::model::UsageSource::SavedAccessToken,
+                fetched_at: now,
+                five_hour: Some(crate::model::UsageWindowView {
+                    used_percent: 0,
+                    remaining_percent: 100,
+                    reset_at: now + Duration::hours(1),
+                }),
+                weekly: None,
+                credits: None,
+            }),
+        )?;
+
+        let app = App::new(env.clone(), repo);
+
+        let switched = app.auto_switch_on_limit_once()?;
+        assert!(switched.is_none());
+        let current = crate::codex::read_live_auth_bundle(&env)?;
+        assert_eq!(current.identity.email, "active@example.com");
+
+        app.set_auto_switch_on_limit(true)?;
+
+        let switched = app.auto_switch_on_limit_once()?;
+        assert_eq!(switched, Some(saved_candidate.id));
+        let current = crate::codex::read_live_auth_bundle(&env)?;
+        assert_eq!(current.identity.email, "candidate@example.com");
+
         Ok(())
     }
 }
