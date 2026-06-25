@@ -66,6 +66,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Exec {
+        account: String,
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -207,6 +212,18 @@ pub fn run() -> Result<()> {
                 print_json(&status)?;
             } else {
                 print_auto_start_usage_windows_status(&status);
+            }
+            Ok(())
+        }
+        Some(Command::Exec { account, command }) => {
+            let target_account = app.find_account_by_id_or_email(&account)?;
+            let status = app.exec_with_temporary_account(target_account.id, &command)?;
+            if !status.success() {
+                if let Some(code) = status.code() {
+                    std::process::exit(code);
+                } else {
+                    std::process::exit(1);
+                }
             }
             Ok(())
         }

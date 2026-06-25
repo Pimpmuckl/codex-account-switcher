@@ -263,6 +263,72 @@ where
             deleted_account_id: account_id,
         })
     }
+
+    pub fn find_account_by_id_or_email(&self, query: &str) -> Result<crate::model::SavedAccountMetadata> {
+        let accounts = self.repository.list_accounts(&self.env.kind)?;
+        if let Ok(id) = Uuid::parse_str(query) {
+            if let Some(account) = accounts.iter().find(|a| a.id == id) {
+                return Ok(account.clone());
+            }
+        }
+        let query_lower = query.to_ascii_lowercase();
+        let matched = accounts
+            .into_iter()
+            .find(|a| a.email.to_ascii_lowercase() == query_lower);
+        matched.ok_or_else(|| anyhow::anyhow!("no saved account found matching '{}'", query))
+    }
+
+    pub fn exec_with_temporary_account(
+        &self,
+        account_id: Uuid,
+        command: &[String],
+    ) -> Result<std::process::ExitStatus> {
+        if command.is_empty() {
+            anyhow::bail!("no command specified to execute");
+        }
+        let original_bundle = codex::try_read_live_auth_bundle(&self.env)?;
+        let _guard = ActiveSnapshotGuard {
+            env: &self.env,
+            original_bundle,
+            active_now: true,
+        };
+        let (snapshot, _snapshot_identity, restore_identity) =
+            self.load_activation_target(account_id)?;
+        codex::restore_snapshot(&self.env, &snapshot, &restore_identity, false)
+            .context("failed to temporarily restore target account snapshot")?;
+
+        let mut child = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .spawn()
+            .with_context(|| format!("failed to start command '{}'", command[0]))?;
+        let status = child.wait().context("failed to wait for child process")?;
+        Ok(status)
+    }
+}
+
+struct ActiveSnapshotGuard<'a> {
+    env: &'a AppEnv,
+    original_bundle: Option<crate::codex::LiveAuthBundle>,
+    active_now: bool,
+}
+
+impl<'a> Drop for ActiveSnapshotGuard<'a> {
+    fn drop(&mut self) {
+        if self.active_now {
+            if let Some(original) = &self.original_bundle {
+                let _ = crate::codex::restore_snapshot(
+                    self.env,
+                    &original.snapshot,
+                    &original.identity,
+                    false,
+                );
+            } else {
+                for file_name in crate::model::AUTH_FILES {
+                    let _ = std::fs::remove_file(self.env.codex_root.join(file_name));
+                }
+            }
+        }
+    }
 }
 
 fn live_bundle_still_matches_snapshot(env: &AppEnv, snapshot: &SnapshotBlob) -> bool {
@@ -684,5 +750,112 @@ mod tests {
         let output = app.activate(saved.id).expect("activate");
         assert_eq!(output.account.email, "new@example.com");
         assert_eq!(output.account.subject.as_deref(), Some("sub-new"));
+    }
+
+    #[test]
+    fn find_account_by_id_or_email_works() {
+        let temp = tempdir().expect("tempdir");
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+        let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
+        let saved = repo
+            .save_snapshot(
+                &env.kind,
+                &DisplayIdentity {
+                    email: "test@example.com".to_owned(),
+                    subject: Some("sub-test".to_owned()),
+                    name: Some("Test".to_owned()),
+                    plan_label: Some("Pro".to_owned()),
+                },
+                &SnapshotBlob {
+                    schema_version: 1,
+                    files: vec![],
+                },
+            )
+            .expect("save")
+            .0;
+
+        let app = App::new(env, repo);
+        
+        // Find by exact email
+        let found = app.find_account_by_id_or_email("test@example.com").expect("found");
+        assert_eq!(found.id, saved.id);
+
+        // Find by case-insensitive email
+        let found = app.find_account_by_id_or_email("TEST@EXAMPLE.COM").expect("found");
+        assert_eq!(found.id, saved.id);
+
+        // Find by UUID
+        let found = app.find_account_by_id_or_email(&saved.id.to_string()).expect("found");
+        assert_eq!(found.id, saved.id);
+
+        // Not found
+        assert!(app.find_account_by_id_or_email("other@example.com").is_err());
+    }
+
+    #[test]
+    fn exec_with_temporary_account_restores_original_bundle() {
+        let temp = tempdir().expect("tempdir");
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+        std::fs::create_dir_all(&env.codex_root).expect("codex root");
+        std::fs::write(
+            env.codex_root.join("auth.json"),
+            auth_json_fixture("original@example.com", "sub-orig", Some("pro")),
+        )
+        .expect("auth");
+        std::fs::write(env.codex_root.join("cap_sid"), "sid-orig").expect("cap");
+
+        let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
+        let saved = repo
+            .save_snapshot(
+                &env.kind,
+                &DisplayIdentity {
+                    email: "temp@example.com".to_owned(),
+                    subject: Some("sub-temp".to_owned()),
+                    name: Some("Temp".to_owned()),
+                    plan_label: Some("Plus".to_owned()),
+                },
+                &SnapshotBlob {
+                    schema_version: 1,
+                    files: vec![
+                        SnapshotFile {
+                            name: "auth.json".to_owned(),
+                            bytes_base64: base64::engine::general_purpose::STANDARD.encode(
+                                auth_json_fixture("temp@example.com", "sub-temp", Some("plus")),
+                            ),
+                        },
+                        SnapshotFile {
+                            name: "cap_sid".to_owned(),
+                            bytes_base64: base64::engine::general_purpose::STANDARD.encode("sid-temp"),
+                        },
+                    ],
+                },
+            )
+            .expect("save")
+            .0;
+
+        let app = App::new(env.clone(), repo);
+
+        // Run a simple command (e.g. echo "hello")
+        #[cfg(windows)]
+        let command = vec!["cmd".to_owned(), "/c".to_owned(), "echo hello".to_owned()];
+        #[cfg(not(windows))]
+        let command = vec!["echo".to_owned(), "hello".to_owned()];
+
+        let status = app.exec_with_temporary_account(saved.id, &command).expect("exec");
+        assert!(status.success());
+
+        // Verify the original account is restored
+        let live = crate::codex::read_live_auth_bundle(&env).expect("live bundle");
+        assert_eq!(live.identity.email, "original@example.com");
     }
 }
