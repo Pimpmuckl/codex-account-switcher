@@ -6,12 +6,14 @@ use uuid::Uuid;
 use crate::app::{App, InteractiveExit, InteractiveMode};
 use crate::env;
 use crate::model::{
-    AccountUsageView, AccountView, AutoStartUsageWindowsRunOutput,
-    AutoStartUsageWindowsStatusOutput, RunningCodexProcess, UsageOutput,
+    AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountUsageView, AccountView,
+    AutoStartUsageWindowsRunOutput, AutoStartUsageWindowsStatusOutput, QUOTA_PAST_RESET_LABEL,
+    RunningCodexProcess, UsageOutput,
 };
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
 use crate::secrets::MigratingSecretStore;
+use crate::time_display::format_local_reset_at;
 use crate::usage::{usage_error_label, usage_error_requires_login};
 
 #[derive(Parser)]
@@ -252,7 +254,11 @@ pub fn run() -> Result<()> {
             } else {
                 println!(
                     "Auto-switch on limit: {}",
-                    if status.enabled { "enabled" } else { "disabled" }
+                    if status.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
                 );
             }
             Ok(())
@@ -359,12 +365,12 @@ fn render_account_summary(account: &AccountView) -> String {
         && let Some(weekly) = &usage.weekly
     {
         if weekly.reset_at <= OffsetDateTime::now_utc() {
-            line.push_str(" [weekly reset passed]");
+            line.push_str(&format!(" [weekly: {QUOTA_PAST_RESET_LABEL}]"));
         } else {
             line.push_str(&format!(
                 " [weekly remaining: {}%, reset {}]",
                 weekly.remaining_percent,
-                weekly.reset_at.date()
+                format_local_reset_at(weekly.reset_at)
             ));
         }
     } else if let Some(error) = &account.usage_error {
@@ -384,7 +390,8 @@ fn print_usage_output(output: &UsageOutput) {
 
 fn print_auto_start_usage_windows_status(output: &AutoStartUsageWindowsStatusOutput) {
     println!(
-        "Auto-start usage windows: {}",
+        "{}: {}",
+        AUTO_REFRESH_QUOTA_ON_RESET_LABEL,
         if output.enabled {
             "enabled"
         } else {
@@ -396,7 +403,8 @@ fn print_auto_start_usage_windows_status(output: &AutoStartUsageWindowsStatusOut
 
 fn print_auto_start_usage_windows_run(output: &AutoStartUsageWindowsRunOutput) {
     println!(
-        "Auto-start usage windows: {}",
+        "{}: {}",
+        AUTO_REFRESH_QUOTA_ON_RESET_LABEL,
         if output.enabled {
             "enabled"
         } else {
@@ -417,17 +425,19 @@ fn print_auto_start_usage_windows_run(output: &AutoStartUsageWindowsRunOutput) {
 
 fn print_usage_summary(usage: &AccountUsageView) {
     println!("Source: {}", format!("{:?}", usage.source).to_lowercase());
-    println!("Fetched at: {}", usage.fetched_at);
+    println!("Fetched at: {}", format_local_reset_at(usage.fetched_at));
     if let Some(five_hour) = &usage.five_hour {
         println!(
             "5h remaining: {}% (reset {})",
-            five_hour.remaining_percent, five_hour.reset_at
+            five_hour.remaining_percent,
+            format_local_reset_at(five_hour.reset_at)
         );
     }
     if let Some(weekly) = &usage.weekly {
         println!(
             "Weekly remaining: {}% (reset {})",
-            weekly.remaining_percent, weekly.reset_at
+            weekly.remaining_percent,
+            format_local_reset_at(weekly.reset_at)
         );
     }
     if let Some(credits) = &usage.credits {

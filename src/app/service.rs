@@ -62,6 +62,25 @@ where
         })
     }
 
+    pub fn begin_add_account_session(&self) -> Result<()> {
+        codex::begin_add_account_session(&self.env)
+    }
+
+    pub fn save_during_add_account_session(&self) -> Result<SaveOutput> {
+        if !codex::add_account_session_active(&self.env) {
+            anyhow::bail!("no add account session in progress");
+        }
+        if !self.env.codex_root.join("auth.json").exists() {
+            anyhow::bail!("not logged in yet — complete Codex login first");
+        }
+        codex::ensure_cap_sid_exists(&self.env)?;
+        self.save_current()
+    }
+
+    pub fn cancel_add_account_session(&self) -> Result<()> {
+        codex::cancel_add_account_session(&self.env)
+    }
+
     pub fn save_current(&self) -> Result<SaveOutput> {
         let live = codex::read_live_auth_bundle(&self.env).with_context(|| {
             format!(
@@ -264,12 +283,15 @@ where
         })
     }
 
-    pub fn find_account_by_id_or_email(&self, query: &str) -> Result<crate::model::SavedAccountMetadata> {
+    pub fn find_account_by_id_or_email(
+        &self,
+        query: &str,
+    ) -> Result<crate::model::SavedAccountMetadata> {
         let accounts = self.repository.list_accounts(&self.env.kind)?;
-        if let Ok(id) = Uuid::parse_str(query) {
-            if let Some(account) = accounts.iter().find(|a| a.id == id) {
-                return Ok(account.clone());
-            }
+        if let Ok(id) = Uuid::parse_str(query)
+            && let Some(account) = accounts.iter().find(|a| a.id == id)
+        {
+            return Ok(account.clone());
         }
         let query_lower = query.to_ascii_lowercase();
         let matched = accounts
@@ -780,21 +802,30 @@ mod tests {
             .0;
 
         let app = App::new(env, repo);
-        
+
         // Find by exact email
-        let found = app.find_account_by_id_or_email("test@example.com").expect("found");
+        let found = app
+            .find_account_by_id_or_email("test@example.com")
+            .expect("found");
         assert_eq!(found.id, saved.id);
 
         // Find by case-insensitive email
-        let found = app.find_account_by_id_or_email("TEST@EXAMPLE.COM").expect("found");
+        let found = app
+            .find_account_by_id_or_email("TEST@EXAMPLE.COM")
+            .expect("found");
         assert_eq!(found.id, saved.id);
 
         // Find by UUID
-        let found = app.find_account_by_id_or_email(&saved.id.to_string()).expect("found");
+        let found = app
+            .find_account_by_id_or_email(&saved.id.to_string())
+            .expect("found");
         assert_eq!(found.id, saved.id);
 
         // Not found
-        assert!(app.find_account_by_id_or_email("other@example.com").is_err());
+        assert!(
+            app.find_account_by_id_or_email("other@example.com")
+                .is_err()
+        );
     }
 
     #[test]
@@ -835,7 +866,8 @@ mod tests {
                         },
                         SnapshotFile {
                             name: "cap_sid".to_owned(),
-                            bytes_base64: base64::engine::general_purpose::STANDARD.encode("sid-temp"),
+                            bytes_base64: base64::engine::general_purpose::STANDARD
+                                .encode("sid-temp"),
                         },
                     ],
                 },
@@ -851,7 +883,9 @@ mod tests {
         #[cfg(not(windows))]
         let command = vec!["echo".to_owned(), "hello".to_owned()];
 
-        let status = app.exec_with_temporary_account(saved.id, &command).expect("exec");
+        let status = app
+            .exec_with_temporary_account(saved.id, &command)
+            .expect("exec");
         assert!(status.success());
 
         // Verify the original account is restored

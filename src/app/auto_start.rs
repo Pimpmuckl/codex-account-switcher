@@ -56,10 +56,7 @@ where
         })
     }
 
-    pub fn set_auto_switch_on_limit(
-        &self,
-        enabled: bool,
-    ) -> Result<AutoSwitchOnLimitStatusOutput> {
+    pub fn set_auto_switch_on_limit(&self, enabled: bool) -> Result<AutoSwitchOnLimitStatusOutput> {
         let mut settings = load_settings(&self.env.app_data_dir)?;
         settings.auto_switch_on_limit = enabled;
         save_settings(&self.env.app_data_dir, &settings)?;
@@ -137,11 +134,15 @@ where
         if !settings.auto_switch_on_limit {
             return Ok(None);
         }
+        let accounts = self.repository.list_accounts(&self.env.kind)?;
+        for account in &accounts {
+            let _ = self.usage(Some(account.id));
+        }
+        let accounts = self.repository.list_accounts(&self.env.kind)?;
         let status = self.status()?;
         let Some(current_id) = status.current_account_saved_id else {
             return Ok(None);
         };
-        let accounts = self.repository.list_accounts(&self.env.kind)?;
         let Some(current_account) = accounts.iter().find(|a| a.id == current_id) else {
             return Ok(None);
         };
@@ -162,10 +163,10 @@ where
             if account.id == current_id {
                 continue;
             }
-            if let Some(err) = &account.cached_usage_error {
-                if crate::usage::usage_error_requires_login(err) {
-                    continue;
-                }
+            if let Some(err) = &account.cached_usage_error
+                && crate::usage::usage_error_requires_login(err)
+            {
+                continue;
             }
             let is_ok = match &account.cached_usage {
                 Some(usage) => !usage.is_out_of_quota(now),
@@ -179,8 +180,18 @@ where
             return Ok(None);
         }
         candidates.sort_by(|a, b| {
-            let a_rem = a.cached_usage.as_ref().and_then(|u| u.weekly.as_ref()).map(|w| w.remaining_percent).unwrap_or(50);
-            let b_rem = b.cached_usage.as_ref().and_then(|u| u.weekly.as_ref()).map(|w| w.remaining_percent).unwrap_or(50);
+            let a_rem = a
+                .cached_usage
+                .as_ref()
+                .and_then(|u| u.weekly.as_ref())
+                .map(|w| w.remaining_percent)
+                .unwrap_or(50);
+            let b_rem = b
+                .cached_usage
+                .as_ref()
+                .and_then(|u| u.weekly.as_ref())
+                .map(|w| w.remaining_percent)
+                .unwrap_or(50);
             b_rem.cmp(&a_rem)
         });
         let target_id = candidates[0].id;
@@ -190,37 +201,48 @@ where
         if was_running {
             #[cfg(target_os = "macos")]
             {
-                let _ = std::process::Command::new("osascript").args(["-e", "quit app \"Codex\""]).output();
-                let _ = std::process::Command::new("pkill").args(["-x", "Codex"]).output();
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", "quit app \"Codex\""])
+                    .output();
+                let _ = std::process::Command::new("pkill")
+                    .args(["-x", "Codex"])
+                    .output();
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
             #[cfg(target_os = "windows")]
             {
-                let _ = std::process::Command::new("taskkill").args(["/f", "/im", "Codex.exe"]).output();
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/f", "/im", "Codex.exe"])
+                    .output();
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
         }
 
         self.activate_with_running_policy(target_id, true)?;
 
+        let email = candidates[0].email.clone();
+        let plan = candidates[0].plan_label.as_deref().unwrap_or("Free");
+        let msg = if was_running {
+            format!(
+                "Auto-switched to account {email} ({plan}) due to quota limit. Codex restarted."
+            )
+        } else {
+            format!("Auto-switched to account {email} ({plan}) due to quota limit.")
+        };
+        notify_auto_switch(&msg);
+
         if was_running {
             #[cfg(target_os = "macos")]
             {
-                let _ = std::process::Command::new("open").args(["-a", "Codex"]).spawn();
-                let email = candidates[0].email.clone();
-                let plan = candidates[0].plan_label.as_deref().unwrap_or("Free");
-                let msg = format!("Auto-switched to account {email} ({plan}) due to quota limit. Codex restarted.");
-                let _ = std::process::Command::new("osascript")
-                    .arg("-e")
-                    .arg(format!(
-                        "display notification \"{}\" with title \"Codex Switcher\"",
-                        msg.replace('"', "\\\"")
-                    ))
+                let _ = std::process::Command::new("open")
+                    .args(["-a", "Codex"])
                     .spawn();
             }
             #[cfg(target_os = "windows")]
             {
-                let _ = std::process::Command::new("cmd").args(["/c", "start", "", "Codex"]).spawn();
+                let _ = std::process::Command::new("cmd")
+                    .args(["/c", "start", "", "Codex"])
+                    .spawn();
             }
         }
 
@@ -396,6 +418,19 @@ fn auto_start_status_output(enabled: bool) -> AutoStartUsageWindowsStatusOutput 
 
 fn usage_window_needs_ping(reset_at: OffsetDateTime, now: OffsetDateTime) -> bool {
     reset_at <= now
+}
+
+fn notify_auto_switch(body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "display notification \"{}\" with title \"Codex Switcher\"",
+                body.replace('"', "\\\"")
+            ))
+            .spawn();
+    }
 }
 
 struct CodexUsagePingResult {
@@ -681,8 +716,8 @@ mod tests {
 
     #[test]
     fn auto_switch_on_limit_once_switches_when_out_of_quota() -> Result<()> {
+        use crate::model::{DisplayIdentity, EnvironmentKind, SnapshotBlob};
         use base64::Engine;
-        use crate::model::{EnvironmentKind, DisplayIdentity, SnapshotBlob};
 
         let temp = tempfile::tempdir()?;
         let env = AppEnv {
@@ -704,7 +739,11 @@ mod tests {
                 crate::model::SnapshotFile {
                     name: "auth.json".to_owned(),
                     bytes_base64: base64::engine::general_purpose::STANDARD.encode(
-                        crate::codex::auth_json_fixture("active@example.com", "sub-active", Some("pro")),
+                        crate::codex::auth_json_fixture(
+                            "active@example.com",
+                            "sub-active",
+                            Some("pro"),
+                        ),
                     ),
                 },
                 crate::model::SnapshotFile {
@@ -720,7 +759,11 @@ mod tests {
                 crate::model::SnapshotFile {
                     name: "auth.json".to_owned(),
                     bytes_base64: base64::engine::general_purpose::STANDARD.encode(
-                        crate::codex::auth_json_fixture("candidate@example.com", "sub-candidate", Some("pro")),
+                        crate::codex::auth_json_fixture(
+                            "candidate@example.com",
+                            "sub-candidate",
+                            Some("pro"),
+                        ),
                     ),
                 },
                 crate::model::SnapshotFile {
@@ -730,28 +773,35 @@ mod tests {
             ],
         };
 
-        let repo = SnapshotRepository::new(&env.app_data_dir, crate::secrets::test_support::MemorySecretStore::default());
-        let saved_active = repo.save_snapshot(
-            &env.kind,
-            &DisplayIdentity {
-                email: "active@example.com".to_owned(),
-                subject: Some("sub-active".to_owned()),
-                name: None,
-                plan_label: Some("Pro".to_owned()),
-            },
-            &active_snapshot,
-        )?.0;
+        let repo = SnapshotRepository::new(
+            &env.app_data_dir,
+            crate::secrets::test_support::MemorySecretStore::default(),
+        );
+        let saved_active = repo
+            .save_snapshot(
+                &env.kind,
+                &DisplayIdentity {
+                    email: "active@example.com".to_owned(),
+                    subject: Some("sub-active".to_owned()),
+                    name: None,
+                    plan_label: Some("Pro".to_owned()),
+                },
+                &active_snapshot,
+            )?
+            .0;
 
-        let saved_candidate = repo.save_snapshot(
-            &env.kind,
-            &DisplayIdentity {
-                email: "candidate@example.com".to_owned(),
-                subject: Some("sub-candidate".to_owned()),
-                name: None,
-                plan_label: Some("Pro".to_owned()),
-            },
-            &candidate_snapshot,
-        )?.0;
+        let saved_candidate = repo
+            .save_snapshot(
+                &env.kind,
+                &DisplayIdentity {
+                    email: "candidate@example.com".to_owned(),
+                    subject: Some("sub-candidate".to_owned()),
+                    name: None,
+                    plan_label: Some("Pro".to_owned()),
+                },
+                &candidate_snapshot,
+            )?
+            .0;
 
         let now = OffsetDateTime::now_utc();
         repo.replace_snapshot(

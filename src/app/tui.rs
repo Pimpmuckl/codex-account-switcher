@@ -5,8 +5,8 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::model::{
-    AccountView, AutoStartUsageWindowsRunOutput, ListOutput, RunningCodexProcess, SaveAction,
-    StatusOutput,
+    AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountView, AutoStartUsageWindowsRunOutput, ListOutput,
+    QUOTA_PAST_RESET_LABEL, RunningCodexProcess, SaveAction, StatusOutput,
 };
 use crate::process::format_process_table;
 use crate::secrets::SecretStore;
@@ -204,7 +204,8 @@ where
                 InteractiveAction::SetAutoStartUsageWindows(enabled) => {
                     match self.set_auto_start_usage_windows(enabled) {
                         Ok(output) => feedback.push(format!(
-                            "Auto-start usage windows {}.",
+                            "{} {}.",
+                            AUTO_REFRESH_QUOTA_ON_RESET_LABEL,
                             if output.enabled {
                                 "enabled"
                             } else {
@@ -212,8 +213,10 @@ where
                             }
                         )),
                         Err(error) => {
-                            feedback =
-                                error_feedback("Updating auto-start usage windows failed.", error);
+                            feedback = error_feedback(
+                                &format!("Updating {AUTO_REFRESH_QUOTA_ON_RESET_LABEL} failed."),
+                                error,
+                            );
                             continue;
                         }
                     }
@@ -224,7 +227,7 @@ where
                             }
                             Err(error) => {
                                 feedback =
-                                    error_feedback("Auto-start usage window check failed.", error);
+                                    error_feedback("Weekly quota refresh check failed.", error);
                             }
                         }
                     }
@@ -246,11 +249,9 @@ where
                         }
                     }
                     if enabled {
-                        match self.auto_switch_on_limit_once() {
-                            Ok(Some(target_id)) => {
-                                feedback.push(format!("Auto-switched to account ID {}.", target_id));
-                            }
-                            Ok(None) => {}
+                        match crate::app::run_auto_start_usage_windows_check_now(self.env().clone())
+                        {
+                            Ok(()) => feedback.push("Quota check completed.".to_owned()),
                             Err(error) => {
                                 feedback =
                                     error_feedback("Initial auto-switch check failed.", error);
@@ -269,8 +270,7 @@ where
                             }
                         )),
                         Err(error) => {
-                            feedback =
-                                error_feedback("Updating launch at startup failed.", error);
+                            feedback = error_feedback("Updating launch at startup failed.", error);
                             continue;
                         }
                     }
@@ -302,11 +302,25 @@ pub(crate) enum InteractiveAction {
 pub(crate) struct InteractiveItem {
     pub(crate) label: String,
     pub(crate) action: InteractiveAction,
+    pub(crate) tone: MenuLabelTone,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MenuLabelTone {
+    #[default]
+    Normal,
+    Active,
+    Warning,
+    Critical,
+    LoginRequired,
 }
 
 pub(crate) struct InteractiveMenu {
     pub(crate) prompt: &'static str,
+    pub(crate) environment: String,
+    pub(crate) process_warning_count: usize,
     pub(crate) current_status_label: Option<String>,
+    pub(crate) current_status_tone: MenuLabelTone,
     pub(crate) accounts: Vec<InteractiveItem>,
     pub(crate) actions: Vec<InteractiveItem>,
 }
@@ -353,8 +367,49 @@ impl InteractiveMenu {
         }
     }
 
+    fn tone(&self, index: usize) -> MenuLabelTone {
+        if index < self.accounts.len() {
+            self.accounts[index].tone
+        } else {
+            self.actions[index - self.accounts.len()].tone
+        }
+    }
+
     fn first_action_index(&self) -> Option<usize> {
         (!self.actions.is_empty()).then_some(self.accounts.len())
+    }
+}
+
+fn account_menu_tone(account: &AccountView) -> MenuLabelTone {
+    if account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        return MenuLabelTone::LoginRequired;
+    }
+    if let Some(usage) = &account.usage {
+        let now = OffsetDateTime::now_utc();
+        if usage.is_out_of_quota(now) {
+            return MenuLabelTone::Critical;
+        }
+        let lowest = [usage.five_hour.as_ref(), usage.weekly.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|window| window.reset_at > now)
+            .map(|window| window.remaining_percent)
+            .min();
+        if lowest.is_some_and(|percent| percent <= 10) {
+            return MenuLabelTone::Critical;
+        }
+        if lowest.is_some_and(|percent| percent <= 25) {
+            return MenuLabelTone::Warning;
+        }
+    }
+    if account.is_active {
+        MenuLabelTone::Active
+    } else {
+        MenuLabelTone::Normal
     }
 }
 
@@ -379,17 +434,24 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
             usage_error_label(account.usage_error.as_deref().unwrap_or_default()).to_owned(),
             String::new(),
         )
-    } else if let Some(usage) = &account.usage
-        && let Some(weekly) = &usage.weekly
-    {
-        if weekly.reset_at <= OffsetDateTime::now_utc() {
-            ("Weekly Remaining: passed".to_owned(), String::new())
-        } else {
-            (
-                format!("Weekly Remaining: {}%", weekly.remaining_percent),
-                format!("Reset: {}", format_local_reset_at(weekly.reset_at)),
-            )
+    } else if let Some(usage) = &account.usage {
+        let now = OffsetDateTime::now_utc();
+        let mut parts = Vec::new();
+        let mut reset_value = String::new();
+        if let Some(five_hour) = &usage.five_hour
+            && five_hour.reset_at > now
+        {
+            parts.push(format!("5h Remaining: {}%", five_hour.remaining_percent));
         }
+        if let Some(weekly) = &usage.weekly {
+            if weekly.reset_at <= now {
+                parts.push(format!("Weekly: {QUOTA_PAST_RESET_LABEL}"));
+            } else {
+                parts.push(format!("Weekly Remaining: {}%", weekly.remaining_percent));
+                reset_value = format!("Reset: {}", format_local_reset_at(weekly.reset_at));
+            }
+        }
+        (parts.join("  "), reset_value)
     } else if let Some(error) = &account.usage_error {
         (usage_error_label(error).to_owned(), String::new())
     } else {
@@ -425,17 +487,27 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
                 usage_error_label(account.usage_error.as_deref().unwrap_or_default()).len(),
                 0,
             )
-        } else if let Some(usage) = &account.usage
-            && let Some(weekly) = &usage.weekly
-        {
-            if weekly.reset_at <= OffsetDateTime::now_utc() {
-                ("Weekly Remaining: passed".len(), 0)
-            } else {
-                (
-                    format!("Weekly Remaining: {}%", weekly.remaining_percent).len(),
-                    format!("Reset: {}", format_local_reset_at(weekly.reset_at)).len(),
-                )
+        } else if let Some(usage) = &account.usage {
+            let now = OffsetDateTime::now_utc();
+            let mut remaining = 0;
+            let mut reset = 0;
+            if let Some(five_hour) = &usage.five_hour
+                && five_hour.reset_at > now
+            {
+                remaining =
+                    remaining.max(format!("5h Remaining: {}%", five_hour.remaining_percent).len());
             }
+            if let Some(weekly) = &usage.weekly {
+                if weekly.reset_at <= now {
+                    remaining =
+                        remaining.max(format!("Weekly: {QUOTA_PAST_RESET_LABEL}").len());
+                } else {
+                    remaining = remaining
+                        .max(format!("Weekly Remaining: {}%", weekly.remaining_percent).len());
+                    reset = format!("Reset: {}", format_local_reset_at(weekly.reset_at)).len();
+                }
+            }
+            (remaining, reset)
         } else if let Some(error) = &account.usage_error {
             (usage_error_label(error).len(), 0)
         } else {
@@ -483,10 +555,14 @@ pub(crate) fn build_menu(
                 }
                 InteractiveMode::DeleteOnce => InteractiveAction::Delete(account.id),
             },
+            tone: account_menu_tone(account),
         });
     }
 
     let mut actions = Vec::new();
+    let current_status_tone = active_account
+        .map(account_menu_tone)
+        .unwrap_or(MenuLabelTone::Normal);
     let current_status_label = active_account
         .map(|account| render_account_label(account, widths))
         .or_else(|| {
@@ -512,21 +588,24 @@ pub(crate) fn build_menu(
                     format!("Add current account {} to switcher", current.email)
                 },
                 action: InteractiveAction::SaveCurrent,
+                tone: MenuLabelTone::Normal,
             });
         }
         if !list.accounts.is_empty() {
             actions.push(InteractiveItem {
                 label: "Delete saved account".to_owned(),
                 action: InteractiveAction::DeletePrompt,
+                tone: MenuLabelTone::Normal,
             });
         }
         actions.push(InteractiveItem {
             label: if auto_start_usage_windows_enabled {
-                "Disable auto-start usage windows".to_owned()
+                format!("Disable {AUTO_REFRESH_QUOTA_ON_RESET_LABEL}")
             } else {
-                "Enable auto-start usage windows".to_owned()
+                format!("Enable {AUTO_REFRESH_QUOTA_ON_RESET_LABEL}")
             },
             action: InteractiveAction::SetAutoStartUsageWindows(!auto_start_usage_windows_enabled),
+            tone: MenuLabelTone::Normal,
         });
         actions.push(InteractiveItem {
             label: if auto_switch_on_limit_enabled {
@@ -535,6 +614,7 @@ pub(crate) fn build_menu(
                 "Enable auto-switch on limit".to_owned()
             },
             action: InteractiveAction::SetAutoSwitchOnLimit(!auto_switch_on_limit_enabled),
+            tone: MenuLabelTone::Normal,
         });
         actions.push(InteractiveItem {
             label: if launch_at_startup_enabled {
@@ -543,10 +623,12 @@ pub(crate) fn build_menu(
                 "Enable launch at startup".to_owned()
             },
             action: InteractiveAction::SetLaunchAtStartup(!launch_at_startup_enabled),
+            tone: MenuLabelTone::Normal,
         });
         actions.push(InteractiveItem {
             label: "Show status".to_owned(),
             action: InteractiveAction::ShowStatus,
+            tone: MenuLabelTone::Normal,
         });
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         actions.push(InteractiveItem {
@@ -556,11 +638,13 @@ pub(crate) fn build_menu(
                 "Send to Tray".to_owned()
             },
             action: InteractiveAction::SendToTray,
+            tone: MenuLabelTone::Normal,
         });
     }
     actions.push(InteractiveItem {
         label: "Quit".to_owned(),
         action: InteractiveAction::Quit,
+        tone: MenuLabelTone::Normal,
     });
 
     let prompt = match mode {
@@ -570,7 +654,10 @@ pub(crate) fn build_menu(
 
     InteractiveMenu {
         prompt,
+        environment: status.environment.to_string(),
+        process_warning_count: status.process_warnings.len(),
         current_status_label,
+        current_status_tone,
         accounts,
         actions,
     }
@@ -655,14 +742,27 @@ fn render_persistent_menu(
         term.write_line(&style(menu.prompt).bold().to_string())?;
         lines += 1;
     }
+    term.write_line(&render_app_header(&menu.environment))?;
+    lines += 1;
+    if menu.process_warning_count > 0 {
+        term.write_line(
+            &style(format!(
+                "  {} Codex process(es) running — close them before switching for best results",
+                menu.process_warning_count
+            ))
+            .yellow()
+            .to_string(),
+        )?;
+        lines += 1;
+    }
     term.write_line(&render_section_heading("Active Account"))?;
     lines += 1;
     if let Some(current_status_label) = &menu.current_status_label {
-        term.write_line(
-            &style(format!("  {current_status_label}"))
-                .white()
-                .to_string(),
-        )?;
+        term.write_line(&style_menu_label(
+            current_status_label,
+            menu.current_status_tone,
+            false,
+        ))?;
     } else {
         term.write_line(&style("  (not logged in)").white().to_string())?;
     }
@@ -702,6 +802,31 @@ fn render_persistent_menu(
 
 fn render_menu_row(menu: &InteractiveMenu, selection: usize, index: usize) -> String {
     render_menu_row_explicit(menu, index, selection == index)
+}
+
+fn render_app_header(environment: &str) -> String {
+    style(format!(
+        "Codex Account Switcher v{}  ·  {}",
+        env!("CARGO_PKG_VERSION"),
+        environment
+    ))
+    .magenta()
+    .bold()
+    .to_string()
+}
+
+fn style_menu_label(label: &str, tone: MenuLabelTone, selected: bool) -> String {
+    if selected {
+        return style(format!("> {label}")).cyan().bold().to_string();
+    }
+    let body = match tone {
+        MenuLabelTone::LoginRequired => style(label).red().bold().to_string(),
+        MenuLabelTone::Critical => style(label).red().to_string(),
+        MenuLabelTone::Warning => style(label).yellow().to_string(),
+        MenuLabelTone::Active => style(label).green().bold().to_string(),
+        MenuLabelTone::Normal => label.to_owned(),
+    };
+    format!("  {body}")
 }
 
 fn render_section_heading(title: &str) -> String {
@@ -747,11 +872,7 @@ fn rewrite_menu_row(
 
 fn render_menu_row_explicit(menu: &InteractiveMenu, index: usize, selected: bool) -> String {
     let label = menu.label(index);
-    if selected {
-        style(format!("> {label}")).cyan().bold().to_string()
-    } else {
-        format!("  {label}")
-    }
+    style_menu_label(label, menu.tone(index), selected)
 }
 
 fn prompt_for_account_delete(accounts: &[AccountView]) -> Result<Uuid> {
@@ -1160,7 +1281,7 @@ mod tests {
         let disabled_toggle = disabled_menu
             .actions
             .iter()
-            .find(|item| item.label == "Enable auto-start usage windows")
+            .find(|item| item.label == format!("Enable {AUTO_REFRESH_QUOTA_ON_RESET_LABEL}"))
             .expect("enable toggle");
         assert!(matches!(
             disabled_toggle.action,
@@ -1179,7 +1300,7 @@ mod tests {
         let enabled_toggle = enabled_menu
             .actions
             .iter()
-            .find(|item| item.label == "Disable auto-start usage windows")
+            .find(|item| item.label == format!("Disable {AUTO_REFRESH_QUOTA_ON_RESET_LABEL}"))
             .expect("disable toggle");
         assert!(matches!(
             enabled_toggle.action,
@@ -1318,7 +1439,15 @@ mod tests {
         let app = App::new(env, repo);
         let status = app.status().expect("status");
         let list = app.list().expect("list");
-        let menu = build_menu(InteractiveMode::Persistent, &status, &list, None, false, false, false);
+        let menu = build_menu(
+            InteractiveMode::Persistent,
+            &status,
+            &list,
+            None,
+            false,
+            false,
+            false,
+        );
         assert_eq!(menu.accounts.len(), 1);
         assert!(menu.actions.iter().any(|item| item.label == "Show status"));
     }

@@ -268,6 +268,94 @@ fn snapshot_files<'a>(snapshot: &'a SnapshotBlob, file_name: &str) -> Vec<&'a st
         .collect()
 }
 
+const ADD_ACCOUNT_AUTH_BACKUP: &str = "auth.json.switcher-bak";
+const ADD_ACCOUNT_CAP_BACKUP: &str = "cap_sid.switcher-bak";
+
+pub fn add_account_session_active(env: &AppEnv) -> bool {
+    env.codex_root.join(ADD_ACCOUNT_AUTH_BACKUP).exists()
+}
+
+pub fn begin_add_account_session(env: &AppEnv) -> Result<()> {
+    if add_account_session_active(env) {
+        bail!("add account session already in progress");
+    }
+    let auth = env.codex_root.join("auth.json");
+    if !auth.exists() {
+        bail!("not logged in");
+    }
+    fs::create_dir_all(&env.codex_root)
+        .with_context(|| format!("failed to create {}", env.codex_root.display()))?;
+    let cap_sid = env.codex_root.join("cap_sid");
+    let backup_auth = env.codex_root.join(ADD_ACCOUNT_AUTH_BACKUP);
+    let backup_sid = env.codex_root.join(ADD_ACCOUNT_CAP_BACKUP);
+    fs::copy(&auth, &backup_auth).with_context(|| {
+        format!(
+            "failed to back up {} to {}",
+            auth.display(),
+            backup_auth.display()
+        )
+    })?;
+    if cap_sid.exists() {
+        fs::copy(&cap_sid, &backup_sid).with_context(|| {
+            format!(
+                "failed to back up {} to {}",
+                cap_sid.display(),
+                backup_sid.display()
+            )
+        })?;
+        fs::remove_file(&cap_sid)
+            .with_context(|| format!("failed to remove {}", cap_sid.display()))?;
+    }
+    fs::remove_file(&auth).with_context(|| format!("failed to remove {}", auth.display()))?;
+    Ok(())
+}
+
+pub fn ensure_cap_sid_exists(env: &AppEnv) -> Result<()> {
+    let cap_sid = env.codex_root.join("cap_sid");
+    if !cap_sid.exists() {
+        fs::write(&cap_sid, b"")
+            .with_context(|| format!("failed to create empty {}", cap_sid.display()))?;
+    }
+    Ok(())
+}
+
+pub fn restore_add_account_backup(env: &AppEnv) -> Result<()> {
+    let auth = env.codex_root.join("auth.json");
+    let cap_sid = env.codex_root.join("cap_sid");
+    let backup_auth = env.codex_root.join(ADD_ACCOUNT_AUTH_BACKUP);
+    let backup_sid = env.codex_root.join(ADD_ACCOUNT_CAP_BACKUP);
+    if backup_auth.exists() {
+        fs::copy(&backup_auth, &auth).with_context(|| {
+            format!(
+                "failed to restore {} from {}",
+                auth.display(),
+                backup_auth.display()
+            )
+        })?;
+        fs::remove_file(&backup_auth)
+            .with_context(|| format!("failed to remove {}", backup_auth.display()))?;
+    }
+    if backup_sid.exists() {
+        fs::copy(&backup_sid, &cap_sid).with_context(|| {
+            format!(
+                "failed to restore {} from {}",
+                cap_sid.display(),
+                backup_sid.display()
+            )
+        })?;
+        fs::remove_file(&backup_sid)
+            .with_context(|| format!("failed to remove {}", backup_sid.display()))?;
+    }
+    Ok(())
+}
+
+pub fn cancel_add_account_session(env: &AppEnv) -> Result<()> {
+    if !add_account_session_active(env) {
+        return Ok(());
+    }
+    restore_add_account_backup(env)
+}
+
 #[cfg(test)]
 pub fn auth_json_fixture(email: &str, subject: &str, plan: Option<&str>) -> String {
     let payload = serde_json::json!({
@@ -476,5 +564,39 @@ mod tests {
 
         assert!(!snapshot_matches(&left, &right));
         assert!(!snapshot_matches(&right, &left));
+    }
+
+    #[test]
+    fn add_account_session_backs_up_and_restores_live_auth() -> Result<()> {
+        let temp = tempdir()?;
+        let codex_root = temp.path().join(".codex");
+        fs::create_dir_all(&codex_root)?;
+        fs::write(
+            codex_root.join("auth.json"),
+            auth_json_fixture("person@example.com", "sub-1", Some("pro")),
+        )?;
+        fs::write(codex_root.join("cap_sid"), "sid-1")?;
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: codex_root.clone(),
+            app_data_dir: temp.path().join("data"),
+        };
+
+        begin_add_account_session(&env)?;
+        assert!(add_account_session_active(&env));
+        assert!(!codex_root.join("auth.json").exists());
+
+        fs::write(
+            codex_root.join("auth.json"),
+            auth_json_fixture("new@example.com", "sub-2", Some("plus")),
+        )?;
+        ensure_cap_sid_exists(&env)?;
+        restore_add_account_backup(&env)?;
+
+        assert!(!add_account_session_active(&env));
+        let restored = read_live_auth_bundle(&env)?;
+        assert_eq!(restored.identity.email, "person@example.com");
+        Ok(())
     }
 }

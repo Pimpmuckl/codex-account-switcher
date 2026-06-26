@@ -20,7 +20,7 @@ It does not modify other Codex config, history, sessions, or sqlite state.
 
 ## Commands
 
-Run without arguments for interactive mode.
+Run without arguments for interactive mode. On Windows and macOS, a TTY launches the persistent TUI; a non-TTY session launches the native system tray instead.
 
 ```text
 codex-account-switcher
@@ -31,7 +31,11 @@ codex-account-switcher usage [ACCOUNT_ID] [--json]
 codex-account-switcher activate [ACCOUNT_ID] [--force] [--json]
 codex-account-switcher delete [ACCOUNT_ID] [--json]
 codex-account-switcher auto-start-usage-windows [--enable|--disable] [--run] [--json]
+codex-account-switcher auto-switch-on-limit [--enable|--disable] [--run] [--json]
+codex-account-switcher exec ACCOUNT COMMAND [ARGS...]
 ```
+
+`ACCOUNT` for `exec` accepts a saved account UUID or email address.
 
 ## Behavior
 
@@ -42,6 +46,8 @@ codex-account-switcher auto-start-usage-windows [--enable|--disable] [--run] [--
 - `activate` restores a saved snapshot. Reliable swaps require all Codex processes to be closed first; `--force` lets the command attempt activation anyway, but it still fails if the restored files do not stay stable.
 - `delete` removes the saved snapshot from the switcher store only.
 - `auto-start-usage-windows` is opt-in from the CLI, TUI, or tray checkmark. When enabled, the interactive app refreshes saved weekly windows every 5 minutes and starts due windows with a minimal `codex exec` ping when Codex is on `PATH`.
+- `auto-switch-on-limit` is opt-in from the CLI, TUI, or tray. When enabled, the app monitors the active account's quota and automatically switches to another saved account with remaining quota when the current account is exhausted. On macOS and Windows it can quit and relaunch Codex after switching.
+- `exec` runs an arbitrary command under a temporary saved-account snapshot and restores the previous live auth afterward. Useful for scripting or isolated `codex exec` pings without permanently switching accounts.
 
 Saved snapshot data lives in the app-data directory for the current environment:
 
@@ -61,6 +67,24 @@ Account labels come from the `id_token` payload:
 
 ```text
 cargo build --release
+```
+
+Regenerate all icon assets (logo source is procedural — do not hand-edit PNGs):
+
+```text
+python3 scripts/generate_icons.py
+```
+
+This writes:
+
+- `assets/codex-account-switcher-transparent.png` — menu bar template logo (monochrome arcs + dot)
+- `assets/codex-account-switcher-dock.png` — Dock/app icon with warm-black background and teal accent rim
+- `assets/codex-account-switcher.ico` / `.icns` — platform bundles generated from the Dock asset
+
+Package a macOS menu-bar agent app (no Dock icon, tray-first):
+
+```text
+./scripts/build_macos_app.sh
 ```
 
 ## Install
@@ -116,3 +140,9 @@ cargo fmt --check
 - Plan metadata is best effort and may be blank if the token does not expose a recognizable value.
 - Usage enrichment depends on saved `auth.json` tokens still being present and accepted by the Codex/OpenAI usage endpoints.
 - Auto-starting usage windows can ping while Codex processes are running; active Codex sessions keep their auth cached, and the switcher restores the previous live account afterward.
+- Auto-switch on limit requires at least one other saved account with remaining quota and valid auth.
+- `exec` restores live auth even when the child command fails; check the child exit code separately when scripting.
+
+## Optional macOS Menu Bar Wrapper
+
+An alternate Python-based menubar UI lives in `contrib/macos-menubar/`. The Rust binary already includes a native tray on macOS; use the Python wrapper only if you prefer its UI or workflow. See `contrib/macos-menubar/README.md`.

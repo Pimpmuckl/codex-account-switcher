@@ -1,5 +1,7 @@
 # macOS Menu Bar Wrapper
 
+> **Note:** The Rust binary already includes a native macOS menu bar tray. This Python wrapper is optional and maintained for users who prefer its workflow. For new installs, use the Rust app directly (`codex-account-switcher` with no args on a non-TTY session).
+
 A lightweight Python menu bar app that wraps the `codex-account-switcher` CLI, providing a native macOS menu bar experience for account switching.
 
 ## Features
@@ -58,8 +60,9 @@ After setup, look for **⚡** in your macOS menu bar.
 ## Uninstall
 
 ```bash
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.codex-switcher.agent.plist
-rm ~/Library/LaunchAgents/com.codex-switcher.agent.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.codex-switcher.plist
+rm ~/Library/LaunchAgents/com.codex-switcher.plist
+rm -f ~/.local/bin/codex-switcher-launcher.sh
 ```
 
 ## Logs

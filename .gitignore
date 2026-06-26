@@ -1,5 +1,17 @@
 /target
 
+# Python virtual environments
+.venv/
+.venv-system/
+**/__pycache__/
+*.pyc
+
+# macOS resource forks and metadata
+._*
+.DS_Store
+
+# Generated icon build artifacts
+assets/icon.iconset/
 
 # Planning files
 findings.md

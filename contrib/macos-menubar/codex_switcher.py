@@ -17,6 +17,30 @@ CLI_PATHS = [
     os.path.expanduser("~/.cargo/bin/codex-account-switcher"),
 ]
 CLI = next((p for p in CLI_PATHS if os.path.exists(p)), CLI_PATHS[0])
+ICON_PATHS = [
+    os.path.join(os.path.dirname(__file__), "..", "..", "assets", "codex-account-switcher-transparent.png"),
+    os.path.join(os.path.dirname(__file__), "icon.png"),
+]
+
+
+def load_menu_bar_icon():
+    """Load template-friendly menu bar icon from bundled assets."""
+    try:
+        from AppKit import NSImage
+
+        for path in ICON_PATHS:
+            resolved = os.path.abspath(path)
+            if not os.path.exists(resolved):
+                continue
+            image = NSImage.alloc().initByContentsOfFile_(resolved)
+            if image is None:
+                continue
+            image.setSize_((18, 18))
+            image.setTemplate_(True)
+            return image
+    except Exception:
+        pass
+    return None
 
 
 def format_reset_time(reset_at_arr, is_weekly=False):
@@ -27,7 +51,7 @@ def format_reset_time(reset_at_arr, is_weekly=False):
         year, yday, hour, minute, second = reset_at_arr[0], reset_at_arr[1], reset_at_arr[2], reset_at_arr[3], reset_at_arr[4]
         dt = datetime.datetime(year, 1, 1) + datetime.timedelta(days=yday, hours=hour, minutes=minute, seconds=second)
         if is_weekly:
-            return dt.strftime("%d/%m")
+            return dt.strftime("%d/%m/%Y")
         else:
             return dt.strftime("%H:%M")
     except Exception:
@@ -124,7 +148,9 @@ def ask_confirm(title, message):
 
 class CodexSwitcher(rumps.App):
     def __init__(self):
-        super().__init__("⚡", quit_button=None)
+        icon = load_menu_bar_icon()
+        title = "" if icon is not None else "⚡"
+        super().__init__(title, icon=icon, template=True, quit_button=None)
         self._register_login_item()
         self._refresh_menu()
 
@@ -204,9 +230,12 @@ exit 1
         if status and status.get("current_account"):
             current_email = status["current_account"].get("email", "?")
             plan = status["current_account"].get("plan_label", "")
-            self.title = f"⚡ {current_email.split('@')[0]}"
+            if self.icon is None:
+                self.title = f"⚡ {current_email.split('@')[0]}"
+            else:
+                self.title = ""
         else:
-            self.title = "⚡ Codex"
+            self.title = "" if self.icon is not None else "⚡ Codex"
 
         # Helpers for compact labels
         def format_email(email):
@@ -360,7 +389,7 @@ exit 1
         notify("Codex Switcher", "⏳ Switching…", f"→ {email}")
 
         # Kill Codex first for reliable swap
-        subprocess.run(["pkill", "-f", "Codex"], capture_output=True)
+        subprocess.run(["pkill", "-x", "Codex"], capture_output=True)
         time.sleep(0.5)
 
         ok, msg = cli_run("activate", account_id, "--force")
@@ -407,7 +436,7 @@ exit 1
             cap_sid.unlink()
 
         # Restart Codex
-        subprocess.run(["pkill", "-f", "Codex"], capture_output=True)
+        subprocess.run(["pkill", "-x", "Codex"], capture_output=True)
         time.sleep(1)
         subprocess.Popen(["open", "-a", "Codex"])
 
@@ -426,8 +455,6 @@ exit 1
         self.menu.add(rumps.MenuItem(
             "⏳  Waiting for login…"
         ))
-        wait = rumps.MenuItem("⏳  Waiting for login…")
-        wait.set_callback(None)
         self.menu.add(None)
         self.menu.add(rumps.MenuItem(
             "✅  Finish Adding Account",
@@ -460,7 +487,7 @@ exit 1
         ok, msg = cli_run("save")
 
         # Kill Codex, restore original
-        subprocess.run(["pkill", "-f", "Codex"], capture_output=True)
+        subprocess.run(["pkill", "-x", "Codex"], capture_output=True)
         time.sleep(0.5)
 
         if backup_auth.exists():
@@ -488,7 +515,7 @@ exit 1
         auth = codex_dir / "auth.json"
         cap_sid = codex_dir / "cap_sid"
 
-        subprocess.run(["pkill", "-f", "Codex"], capture_output=True)
+        subprocess.run(["pkill", "-x", "Codex"], capture_output=True)
         time.sleep(0.5)
 
         if backup_auth.exists():
@@ -520,5 +547,4 @@ exit 1
 
 
 if __name__ == "__main__":
-    rumps.debug_mode(True)
     CodexSwitcher().run()

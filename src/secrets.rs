@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use crate::file_store::{RecoveryFileKind, list_recovery_files, replace_file_with_recovery};
 use crate::model::SnapshotBlob;
+use crate::permissions::{restrict_store_dir, restrict_store_file};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -268,29 +269,24 @@ fn write_private_file(path: &Path, value: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to write {}", path.display()))?;
         file.write_all(value)
             .with_context(|| format!("failed to write {}", path.display()))?;
+        set_private_file_permissions(path)?;
         Ok(())
     }
 
     #[cfg(not(unix))]
     {
         fs::write(path, value).with_context(|| format!("failed to write {}", path.display()))?;
+        set_private_file_permissions(path)?;
         Ok(())
     }
 }
 
 fn set_private_dir_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    restrict_store_dir(path)
+}
 
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to protect {}", path.display()))?;
-    }
-
-    #[cfg(not(unix))]
-    let _ = path;
-
-    Ok(())
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    restrict_store_file(path)
 }
 
 fn snapshot_payload_is_valid(value: &[u8]) -> bool {

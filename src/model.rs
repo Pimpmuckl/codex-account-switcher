@@ -5,6 +5,10 @@ use uuid::Uuid;
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const METADATA_SCHEMA_VERSION: u32 = 1;
 pub const AUTH_FILES: [&str; 2] = ["auth.json", "cap_sid"];
+/// User-facing label for `settings.auto_start_usage_windows`.
+pub const AUTO_REFRESH_QUOTA_ON_RESET_LABEL: &str = "Auto-refresh quota on reset";
+/// Weekly quota window reset time has passed (new window may be available).
+pub const QUOTA_PAST_RESET_LABEL: &str = "Past reset";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -229,22 +233,25 @@ pub struct AccountUsageView {
 
 impl AccountUsageView {
     pub fn is_out_of_quota(&self, now: OffsetDateTime) -> bool {
-        if let Some(five_hour) = &self.five_hour {
-            if five_hour.remaining_percent == 0 && five_hour.reset_at > now {
-                return true;
-            }
+        if let Some(five_hour) = &self.five_hour
+            && five_hour.remaining_percent == 0
+            && five_hour.reset_at > now
+        {
+            return true;
         }
-        if let Some(weekly) = &self.weekly {
-            if weekly.remaining_percent == 0 && weekly.reset_at > now {
-                return true;
-            }
+        if let Some(weekly) = &self.weekly
+            && weekly.remaining_percent == 0
+            && weekly.reset_at > now
+        {
+            return true;
         }
-        if self.five_hour.is_none() && self.weekly.is_none() {
-            if let Some(credits) = &self.credits {
-                if !credits.unlimited && !credits.has_credits {
-                    return true;
-                }
-            }
+        if self.five_hour.is_none()
+            && self.weekly.is_none()
+            && let Some(credits) = &self.credits
+            && !credits.unlimited
+            && !credits.has_credits
+        {
+            return true;
         }
         false
     }
@@ -264,11 +271,91 @@ pub struct CreditsView {
     pub balance: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageSource {
     LiveAccessToken,
     LiveRefreshToken,
     SavedAccessToken,
     SavedRefreshToken,
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::{AccountUsageView, CreditsView, UsageSource, UsageWindowView};
+    use time::OffsetDateTime;
+
+    fn usage_view(
+        five_hour: Option<UsageWindowView>,
+        weekly: Option<UsageWindowView>,
+        credits: Option<CreditsView>,
+    ) -> AccountUsageView {
+        AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour,
+            weekly,
+            credits,
+        }
+    }
+
+    fn window(remaining_percent: u8, reset_at: OffsetDateTime) -> UsageWindowView {
+        UsageWindowView {
+            used_percent: 100 - remaining_percent,
+            remaining_percent,
+            reset_at,
+        }
+    }
+
+    #[test]
+    fn is_out_of_quota_when_five_hour_window_is_exhausted() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let reset = now + time::Duration::hours(1);
+        let usage = usage_view(Some(window(0, reset)), None, None);
+        assert!(usage.is_out_of_quota(now));
+    }
+
+    #[test]
+    fn is_out_of_quota_when_weekly_window_is_exhausted() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let reset = now + time::Duration::days(1);
+        let usage = usage_view(None, Some(window(0, reset)), None);
+        assert!(usage.is_out_of_quota(now));
+    }
+
+    #[test]
+    fn is_not_out_of_quota_after_reset_time_passes() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
+        let reset = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1);
+        let usage = usage_view(Some(window(0, reset)), None, None);
+        assert!(!usage.is_out_of_quota(now));
+    }
+
+    #[test]
+    fn is_out_of_quota_when_only_credits_remain_and_depleted() {
+        let usage = usage_view(
+            None,
+            None,
+            Some(CreditsView {
+                has_credits: false,
+                unlimited: false,
+                balance: "0".to_owned(),
+            }),
+        );
+        assert!(usage.is_out_of_quota(OffsetDateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn unlimited_credits_do_not_count_as_out_of_quota() {
+        let usage = usage_view(
+            None,
+            None,
+            Some(CreditsView {
+                has_credits: false,
+                unlimited: true,
+                balance: "0".to_owned(),
+            }),
+        );
+        assert!(!usage.is_out_of_quota(OffsetDateTime::UNIX_EPOCH));
+    }
 }
