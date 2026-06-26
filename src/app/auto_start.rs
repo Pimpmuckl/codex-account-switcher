@@ -129,6 +129,47 @@ where
         Ok(LaunchAtStartupStatusOutput { enabled })
     }
 
+    pub fn update_launch_at_startup_path_if_enabled(&self) -> Result<()> {
+        let settings = load_settings(&self.env.app_data_dir)?;
+        if !settings.launch_at_startup {
+            return Ok(());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let launch_agents_dir = self.env.home_dir.join("Library").join("LaunchAgents");
+            let plist_path = launch_agents_dir.join("com.anlvdt.codex-account-switcher.plist");
+            if let Ok(exe) = std::env::current_exe() {
+                let plist_content = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.anlvdt.codex-account-switcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>"#,
+                    exe.display()
+                );
+                let should_write = match std::fs::read_to_string(&plist_path) {
+                    Ok(content) => content != plist_content,
+                    Err(_) => true,
+                };
+                if should_write {
+                    let _ = std::fs::create_dir_all(&launch_agents_dir);
+                    let _ = std::fs::write(&plist_path, plist_content);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn auto_switch_on_limit_once(&self) -> Result<Option<Uuid>> {
         let settings = load_settings(&self.env.app_data_dir)?;
         if !settings.auto_switch_on_limit {
@@ -863,6 +904,48 @@ mod tests {
         assert_eq!(switched, Some(saved_candidate.id));
         let current = crate::codex::read_live_auth_bundle(&env)?;
         assert_eq!(current.identity.email, "candidate@example.com");
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_update_launch_at_startup_path_if_enabled() -> Result<()> {
+        use crate::model::EnvironmentKind;
+        let temp = tempfile::tempdir()?;
+        let env = AppEnv {
+            kind: EnvironmentKind::Macos,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+        std::fs::create_dir_all(&env.app_data_dir)?;
+
+        let repo = SnapshotRepository::new(
+            &env.app_data_dir,
+            crate::secrets::test_support::MemorySecretStore::default(),
+        );
+        let app = App::new(env.clone(), repo);
+
+        // Initially disabled, should not create the plist
+        app.update_launch_at_startup_path_if_enabled()?;
+        let plist_path = env
+            .home_dir
+            .join("Library")
+            .join("LaunchAgents")
+            .join("com.anlvdt.codex-account-switcher.plist");
+        assert!(!plist_path.exists());
+
+        // Enable it
+        app.set_launch_at_startup(true)?;
+        assert!(plist_path.exists());
+
+        // Remove file to test update recreation
+        std::fs::remove_file(&plist_path)?;
+        assert!(!plist_path.exists());
+
+        app.update_launch_at_startup_path_if_enabled()?;
+        assert!(plist_path.exists());
 
         Ok(())
     }

@@ -136,6 +136,7 @@ pub fn run() -> Result<()> {
         MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),
     );
     let app = App::new(env, repository);
+    let _ = app.update_launch_at_startup_path_if_enabled();
     match cli.command {
         None => run_interactive_app(&app),
         Some(Command::Status { json }) => {
