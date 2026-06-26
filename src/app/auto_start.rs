@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::Sender;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -77,32 +77,12 @@ where
 
         #[cfg(target_os = "macos")]
         {
-            let launch_agents_dir = self.env.home_dir.join("Library").join("LaunchAgents");
-            let plist_path = launch_agents_dir.join("com.anlvdt.codex-account-switcher.plist");
             if enabled {
                 if let Ok(exe) = std::env::current_exe() {
-                    let plist_content = format!(
-                        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.anlvdt.codex-account-switcher</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>"#,
-                        exe.display()
-                    );
-                    let _ = std::fs::create_dir_all(&launch_agents_dir);
-                    let _ = std::fs::write(&plist_path, plist_content);
+                    install_macos_launch_at_startup(&self.env.home_dir, &exe)?;
                 }
             } else {
-                let _ = std::fs::remove_file(plist_path);
+                uninstall_macos_launch_at_startup(&self.env.home_dir)?;
             }
         }
 
@@ -136,36 +116,8 @@ where
         }
 
         #[cfg(target_os = "macos")]
-        {
-            let launch_agents_dir = self.env.home_dir.join("Library").join("LaunchAgents");
-            let plist_path = launch_agents_dir.join("com.anlvdt.codex-account-switcher.plist");
-            if let Ok(exe) = std::env::current_exe() {
-                let plist_content = format!(
-                    r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.anlvdt.codex-account-switcher</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>"#,
-                    exe.display()
-                );
-                let should_write = match std::fs::read_to_string(&plist_path) {
-                    Ok(content) => content != plist_content,
-                    Err(_) => true,
-                };
-                if should_write {
-                    let _ = std::fs::create_dir_all(&launch_agents_dir);
-                    let _ = std::fs::write(&plist_path, plist_content);
-                }
-            }
+        if let Ok(exe) = std::env::current_exe() {
+            update_macos_launch_at_startup_if_needed(&self.env.home_dir, &exe)?;
         }
         Ok(())
     }
@@ -455,6 +407,184 @@ fn auto_start_status_output(enabled: bool) -> AutoStartUsageWindowsStatusOutput 
         enabled,
         poll_seconds: AUTO_START_USAGE_WINDOW_POLL_SECONDS,
     }
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_LAUNCH_AGENT_LABEL: &str = "com.anlvdt.codex-account-switcher";
+
+#[cfg(target_os = "macos")]
+const MACOS_LAUNCH_AGENT_WAIT_SECONDS: u32 = 60;
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_plist_path(home_dir: &Path) -> PathBuf {
+    home_dir
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{MACOS_LAUNCH_AGENT_LABEL}.plist"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launcher_script_path(home_dir: &Path) -> PathBuf {
+    home_dir
+        .join(".local")
+        .join("bin")
+        .join("codex-account-switcher-launcher.sh")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_domain() -> Result<String> {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .context("failed to resolve user id for launchctl")?;
+    if !output.status.success() {
+        bail!("id -u failed");
+    }
+    let uid = String::from_utf8(output.stdout)
+        .context("id -u returned invalid utf-8")?
+        .trim()
+        .to_owned();
+    Ok(format!("gui/{uid}"))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launcher_script_content(exe: &Path) -> String {
+    format!(
+        r#"#!/bin/bash
+# Wait for the app binary to become available (e.g. external volume mount).
+TARGET="{}"
+for i in $(seq 1 {MACOS_LAUNCH_AGENT_WAIT_SECONDS}); do
+    if [ -f "$TARGET" ]; then
+        exec "$TARGET"
+    fi
+    sleep 1
+done
+exit 1
+"#,
+        exe.display().to_string().replace('"', "\\\"")
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_plist_content(launcher_path: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{MACOS_LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>"#,
+        launcher_path.display()
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn write_macos_launcher_script(home_dir: &Path, exe: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let launcher_path = macos_launcher_script_path(home_dir);
+    if let Some(parent) = launcher_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = macos_launcher_script_content(exe);
+    fs::write(&launcher_path, content)?;
+    let mut permissions = fs::metadata(&launcher_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&launcher_path, permissions)?;
+    Ok(launcher_path)
+}
+
+#[cfg(target_os = "macos")]
+fn write_macos_launch_agent_plist(home_dir: &Path, launcher_path: &Path) -> Result<PathBuf> {
+    let plist_path = macos_launch_agent_plist_path(home_dir);
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &plist_path,
+        macos_launch_agent_plist_content(launcher_path),
+    )?;
+    Ok(plist_path)
+}
+
+#[cfg(target_os = "macos")]
+fn reload_macos_launch_agent(plist_path: &Path) -> Result<()> {
+    let domain = macos_launch_agent_domain()?;
+    let plist = plist_path
+        .to_str()
+        .context("launch agent plist path is not valid utf-8")?;
+    let _ = Command::new("launchctl")
+        .args(["bootout", &domain, plist])
+        .output();
+    let output = Command::new("launchctl")
+        .args(["bootstrap", &domain, plist])
+        .output()
+        .context("failed to run launchctl bootstrap")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("launchctl bootstrap failed: {stderr}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn unload_macos_launch_agent(plist_path: &Path) -> Result<()> {
+    let domain = macos_launch_agent_domain()?;
+    let plist = plist_path
+        .to_str()
+        .context("launch agent plist path is not valid utf-8")?;
+    let _ = Command::new("launchctl")
+        .args(["bootout", &domain, plist])
+        .output();
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_launch_at_startup(home_dir: &Path, exe: &Path) -> Result<()> {
+    let launcher_path = write_macos_launcher_script(home_dir, exe)?;
+    let plist_path = write_macos_launch_agent_plist(home_dir, &launcher_path)?;
+    reload_macos_launch_agent(&plist_path)
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_macos_launch_at_startup(home_dir: &Path) -> Result<()> {
+    let plist_path = macos_launch_agent_plist_path(home_dir);
+    if plist_path.exists() {
+        unload_macos_launch_agent(&plist_path)?;
+        let _ = fs::remove_file(plist_path);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn update_macos_launch_at_startup_if_needed(home_dir: &Path, exe: &Path) -> Result<()> {
+    let launcher_path = macos_launcher_script_path(home_dir);
+    let plist_path = macos_launch_agent_plist_path(home_dir);
+    let launcher_content = macos_launcher_script_content(exe);
+    let plist_content = macos_launch_agent_plist_content(&launcher_path);
+
+    let launcher_changed = fs::read_to_string(&launcher_path)
+        .map(|content| content != launcher_content)
+        .unwrap_or(true);
+    let plist_changed = fs::read_to_string(&plist_path)
+        .map(|content| content != plist_content)
+        .unwrap_or(true);
+
+    if !launcher_changed && !plist_changed {
+        return Ok(());
+    }
+
+    write_macos_launcher_script(home_dir, exe)?;
+    write_macos_launch_agent_plist(home_dir, &launcher_path)?;
+    reload_macos_launch_agent(&plist_path)
 }
 
 fn usage_window_needs_ping(reset_at: OffsetDateTime, now: OffsetDateTime) -> bool {
@@ -939,13 +1069,23 @@ mod tests {
         // Enable it
         app.set_launch_at_startup(true)?;
         assert!(plist_path.exists());
+        let launcher_path = env
+            .home_dir
+            .join(".local")
+            .join("bin")
+            .join("codex-account-switcher-launcher.sh");
+        assert!(launcher_path.exists());
+        let plist = fs::read_to_string(&plist_path)?;
+        assert!(plist.contains("codex-account-switcher-launcher.sh"));
 
         // Remove file to test update recreation
         std::fs::remove_file(&plist_path)?;
+        std::fs::remove_file(&launcher_path)?;
         assert!(!plist_path.exists());
 
         app.update_launch_at_startup_path_if_enabled()?;
         assert!(plist_path.exists());
+        assert!(launcher_path.exists());
 
         Ok(())
     }
