@@ -49,11 +49,10 @@ Saved snapshot data lives in the app-data directory for the current environment:
 - macOS: `~/Library/Application Support/nextide/codex-account-switcher`
 - Linux / WSL: `${XDG_DATA_HOME:-~/.local/share}/nextide/codex-account-switcher`
 
-Older keyring-backed snapshots are migrated into the local store on first use when they are still readable. Metadata rows created by the broken mock-backed builds still need to be re-saved once.
-
 Account labels come from the `id_token` payload:
 
 - email
+- account identity
 - optional name
 - best-effort plan label
 
@@ -112,7 +111,7 @@ cargo fmt --check
 ## Current Limits
 
 - v1 supports only the existing live-login capture flow. It does not drive Codex login itself.
-- Saved snapshots are keyed by the current environment and current account identity.
+- Saved snapshots are keyed by the current account identity in the current app-data directory.
 - Plan metadata is best effort and may be blank if the token does not expose a recognizable value.
 - Usage enrichment depends on saved `auth.json` tokens still being present and accepted by the Codex/OpenAI usage endpoints.
 - Auto-starting usage windows can ping while Codex processes are running; active Codex sessions keep their auth cached, and the switcher restores the previous live account afterward.

@@ -336,10 +336,7 @@ fn find_active_tray_account<'a>(
 }
 
 fn account_matches_identity(account: &AccountView, identity: &DisplayIdentity) -> bool {
-    match (&account.subject, &identity.subject) {
-        (Some(left), Some(right)) => left == right,
-        _ => account.email.eq_ignore_ascii_case(&identity.email),
-    }
+    account.account_key == identity.account_key
 }
 
 fn tray_row_label<const N: usize>(
@@ -540,7 +537,7 @@ fn fallback_icon() -> Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AccountUsageView, EnvironmentKind, UsageSource, UsageWindowView};
+    use crate::model::{AccountUsageView, UsageSource, UsageWindowView};
     use time::{Date, Month, OffsetDateTime, Time};
 
     #[test]
@@ -551,10 +548,9 @@ mod tests {
         let mut account = AccountView {
             id: Uuid::new_v4(),
             email: "person@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
+            account_key: "sub".to_owned(),
             name: None,
             plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -589,10 +585,9 @@ mod tests {
         let account = AccountView {
             id: Uuid::new_v4(),
             email: "person@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
+            account_key: "sub".to_owned(),
             name: None,
             plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
             is_active: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -632,10 +627,9 @@ mod tests {
         let active = AccountView {
             id: Uuid::new_v4(),
             email: "active@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
+            account_key: "sub".to_owned(),
             name: None,
             plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -663,10 +657,9 @@ mod tests {
         let account = AccountView {
             id: Uuid::new_v4(),
             email: "active@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
+            account_key: "sub".to_owned(),
             name: None,
             plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -676,13 +669,13 @@ mod tests {
         };
         let matching_identity = DisplayIdentity {
             email: "active@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
+            account_key: "sub".to_owned(),
             name: None,
             plan_label: Some("Pro".to_owned()),
         };
         let mismatched_identity = DisplayIdentity {
             email: "other@example.com".to_owned(),
-            subject: Some("other-sub".to_owned()),
+            account_key: "other-sub".to_owned(),
             name: None,
             plan_label: Some("Pro".to_owned()),
         };
@@ -700,10 +693,9 @@ mod tests {
         let mut saved_account = AccountView {
             id: Uuid::new_v4(),
             email: "stale@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
+            account_key: "sub".to_owned(),
             name: None,
             plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -724,7 +716,7 @@ mod tests {
         });
         let account = DisplayIdentity {
             email: "person@example.com".to_owned(),
-            subject: None,
+            account_key: "sub".to_owned(),
             name: None,
             plan_label: Some("ProLite".to_owned()),
         };
@@ -745,7 +737,7 @@ mod tests {
     fn active_account_label_marks_unsaved_current_account() {
         let account = DisplayIdentity {
             email: "person@example.com".to_owned(),
-            subject: None,
+            account_key: "sub".to_owned(),
             name: None,
             plan_label: Some("Plus".to_owned()),
         };
