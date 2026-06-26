@@ -82,7 +82,10 @@ mod tests {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedAccountMetadata {
     pub id: Uuid,
+    #[serde(default, deserialize_with = "optional_string")]
     pub account_key: String,
+    #[serde(default, rename = "subject", skip_serializing)]
+    pub(crate) legacy_subject: Option<String>,
     pub email: String,
     pub name: Option<String>,
     pub plan_label: Option<String>,
@@ -94,6 +97,13 @@ pub struct SavedAccountMetadata {
     pub cached_usage: Option<AccountUsageView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_usage_error: Option<String>,
+}
+
+fn optional_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

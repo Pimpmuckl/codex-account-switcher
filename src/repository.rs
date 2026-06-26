@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::codex;
 use crate::model::{AccountUsageView, DisplayIdentity, SavedAccountMetadata, SnapshotBlob};
 use crate::secrets::SecretStore;
 use crate::usage::usage_error_requires_login;
@@ -30,12 +31,7 @@ where
     }
 
     pub fn list_accounts(&self) -> Result<Vec<SavedAccountMetadata>> {
-        let mut accounts = self
-            .index_store
-            .load_index()?
-            .accounts
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut accounts = self.load_index()?.accounts;
         accounts.sort_by_key(|account| std::cmp::Reverse(account.updated_at));
         Ok(accounts)
     }
@@ -52,7 +48,7 @@ where
         identity: &DisplayIdentity,
         snapshot: &SnapshotBlob,
     ) -> Result<(SavedAccountMetadata, bool)> {
-        let mut index = self.index_store.load_index()?;
+        let mut index = self.load_index()?;
         let now = OffsetDateTime::now_utc();
         let encoded_snapshot = encode_snapshot(snapshot)?;
         let existing_index = index.accounts.iter().position(|account| {
@@ -79,6 +75,7 @@ where
             let metadata = SavedAccountMetadata {
                 id,
                 account_key: identity.account_key.clone(),
+                legacy_subject: None,
                 email: identity.email.clone(),
                 name: identity.name.clone(),
                 plan_label: identity.plan_label.clone(),
@@ -123,7 +120,7 @@ where
         snapshot: &SnapshotBlob,
         usage: Option<AccountUsageView>,
     ) -> Result<SavedAccountMetadata> {
-        let mut index = self.index_store.load_index()?;
+        let mut index = self.load_index()?;
         let position = index
             .accounts
             .iter()
@@ -149,7 +146,7 @@ where
         account_id: Uuid,
         usage_error: String,
     ) -> Result<SavedAccountMetadata> {
-        let mut index = self.index_store.load_index()?;
+        let mut index = self.load_index()?;
         let position = index
             .accounts
             .iter()
@@ -171,7 +168,7 @@ where
     }
 
     pub fn delete_snapshot(&self, account_id: Uuid) -> Result<()> {
-        let mut index = self.index_store.load_index()?;
+        let mut index = self.load_index()?;
         let Some(position) = index
             .accounts
             .iter()
@@ -204,7 +201,7 @@ where
         account_id: Uuid,
         identity: &DisplayIdentity,
     ) -> Result<SavedAccountMetadata> {
-        let mut index = self.index_store.load_index()?;
+        let mut index = self.load_index()?;
         let now = OffsetDateTime::now_utc();
         let Some(account_position) = index
             .accounts
@@ -253,6 +250,39 @@ where
         }
         Ok(updated)
     }
+
+    fn load_index(&self) -> Result<crate::model::MetadataIndex> {
+        let mut index = self.index_store.load_index()?;
+        let mut changed = false;
+        for account in &mut index.accounts {
+            if account.account_key.trim().is_empty()
+                || account.legacy_subject.as_deref().is_some_and(|subject| {
+                    !subject.trim().is_empty() && subject != account.account_key
+                })
+            {
+                if let Some(identity) = self.identity_for_account(account) {
+                    account.account_key = identity.account_key;
+                } else if let Some(subject) = account.legacy_subject.as_deref() {
+                    account.account_key = subject.to_owned();
+                } else if account.account_key.trim().is_empty() {
+                    // ponytail: old subjectless rows stay listable/deletable; snapshot refresh supplies the real key.
+                    account.account_key = format!("legacy:{}", account.id);
+                }
+                account.legacy_subject = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.index_store.save_index(&index)?;
+        }
+        Ok(index)
+    }
+
+    fn identity_for_account(&self, account: &SavedAccountMetadata) -> Option<DisplayIdentity> {
+        let encoded_snapshot = self.secret_store.load(&account.secret_key).ok().flatten()?;
+        let snapshot = decode_snapshot(&encoded_snapshot).ok()?;
+        codex::identity_from_snapshot(&snapshot).ok()
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +300,8 @@ mod tests {
     use std::fs;
 
     use anyhow::{Result, anyhow};
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use tempfile::tempdir;
     use time::Duration;
 
@@ -284,6 +316,42 @@ mod tests {
             account_key: account_key.to_owned(),
             name: Some("Tester".to_owned()),
             plan_label: Some("Pro".to_owned()),
+        }
+    }
+
+    fn snapshot_with_auth(email: &str, subject: &str, account_key: &str) -> SnapshotBlob {
+        let payload = serde_json::json!({
+            "email": email,
+            "sub": subject,
+            "name": "Tester",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_key,
+                "chatgpt_plan_type": "pro"
+            }
+        });
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
+        let auth_json = serde_json::json!({
+            "tokens": {
+                "id_token": format!("{header}.{payload}."),
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "account_id": "acct"
+            },
+            "auth_mode": "chatgpt"
+        });
+        SnapshotBlob {
+            schema_version: 1,
+            files: vec![
+                crate::model::SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: STANDARD.encode(auth_json.to_string()),
+                },
+                crate::model::SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: STANDARD.encode("sid"),
+                },
+            ],
         }
     }
 
@@ -319,6 +387,76 @@ mod tests {
         assert!(!created);
         assert_eq!(first.id, second.id);
         assert_eq!(second.email, "person2@example.com");
+    }
+
+    #[test]
+    fn loads_legacy_subject_metadata_without_account_key() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+        let snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![],
+        };
+        let (subject_row, _) = repo
+            .save_snapshot(
+                &identity("subject@example.com", "account-1"),
+                &snapshot_with_auth("subject@example.com", "sub-1", "account-1"),
+            )
+            .expect("save subject row");
+        let (subjectless_row, _) = repo
+            .save_snapshot(&identity("subjectless@example.com", "sub-2"), &snapshot)
+            .expect("save subjectless row");
+        let (corrupt_row, _) = repo
+            .save_snapshot(&identity("corrupt@example.com", "sub-3"), &snapshot)
+            .expect("save corrupt row");
+        let metadata_path = temp.path().join("metadata.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        for account in raw["accounts"].as_array_mut().expect("accounts") {
+            let account = account.as_object_mut().expect("account");
+            let account_key = account.remove("account_key").expect("account key");
+            account.insert("environment".to_owned(), serde_json::json!("windows"));
+            account.insert(
+                "subject".to_owned(),
+                if account["id"] == subject_row.id.to_string() {
+                    account_key
+                } else if account["id"] == corrupt_row.id.to_string() {
+                    serde_json::json!("sub-3")
+                } else {
+                    serde_json::Value::Null
+                },
+            );
+        }
+        repo.secret_store
+            .save(&corrupt_row.secret_key, b"not-a-snapshot")
+            .expect("corrupt saved snapshot");
+        fs::write(
+            &metadata_path,
+            serde_json::to_string_pretty(&raw).expect("serialize legacy metadata"),
+        )
+        .expect("write legacy metadata");
+
+        let loaded = repo.list_accounts().expect("list legacy metadata");
+        let subject_account = loaded
+            .iter()
+            .find(|account| account.id == subject_row.id)
+            .expect("subject account");
+        let subjectless_account = loaded
+            .iter()
+            .find(|account| account.id == subjectless_row.id)
+            .expect("subjectless account");
+        let corrupt_account = loaded
+            .iter()
+            .find(|account| account.id == corrupt_row.id)
+            .expect("corrupt account");
+
+        assert_eq!(subject_account.account_key, "account-1");
+        assert_eq!(
+            subjectless_account.account_key,
+            format!("legacy:{}", subjectless_row.id)
+        );
+        assert_eq!(corrupt_account.account_key, "sub-3");
     }
 
     #[derive(Clone, Default)]
