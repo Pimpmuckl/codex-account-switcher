@@ -279,6 +279,29 @@ where
     crate::app::spawn_auto_start_usage_windows_worker(app.env().clone());
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            crate::tray::hide_console_window();
+            match crate::tray::run(app)? {
+                crate::tray::TrayExit::ShowTui => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new("osascript")
+                                .arg("-e")
+                                .arg(format!(
+                                    "tell application \"Terminal\" to do script \"'{}'\"",
+                                    exe.display()
+                                ))
+                                .spawn();
+                        }
+                    }
+                    return Ok(());
+                }
+                crate::tray::TrayExit::Quit => return Ok(()),
+            }
+        }
+
         loop {
             match app.interactive(InteractiveMode::Persistent, false)? {
                 InteractiveExit::Quit => return Ok(()),

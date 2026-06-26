@@ -10,8 +10,44 @@ import subprocess
 import json
 import os
 import time
+import datetime
 
-CLI = os.path.expanduser("~/.cargo/bin/codex-account-switcher")
+CLI_PATHS = [
+    os.path.expanduser("~/.codex-account-switcher/bin/codex-account-switcher"),
+    os.path.expanduser("~/.cargo/bin/codex-account-switcher"),
+]
+CLI = next((p for p in CLI_PATHS if os.path.exists(p)), CLI_PATHS[0])
+
+
+def format_reset_time(reset_at_arr, is_weekly=False):
+    """Parse 0-indexed day-of-year array to a readable time string."""
+    if not reset_at_arr or len(reset_at_arr) < 5:
+        return ""
+    try:
+        year, yday, hour, minute, second = reset_at_arr[0], reset_at_arr[1], reset_at_arr[2], reset_at_arr[3], reset_at_arr[4]
+        dt = datetime.datetime(year, 1, 1) + datetime.timedelta(days=yday, hours=hour, minutes=minute, seconds=second)
+        if is_weekly:
+            return dt.strftime("%d/%m")
+        else:
+            return dt.strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+
+def notify(title, subtitle, message):
+    """Safe notification — falls back to osascript if rumps fails."""
+    try:
+        rumps.notification(title, subtitle, message)
+    except Exception:
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{message}" with title "{title}" subtitle "{subtitle}"'],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -89,7 +125,72 @@ def ask_confirm(title, message):
 class CodexSwitcher(rumps.App):
     def __init__(self):
         super().__init__("⚡", quit_button=None)
+        self._register_login_item()
         self._refresh_menu()
+
+    def _register_login_item(self):
+        try:
+            from pathlib import Path
+            py_path = os.path.abspath(__file__)
+            script_dir = os.path.dirname(py_path)
+            cmd_path = os.path.join(script_dir, "run.command")
+            venv_path = os.path.join(script_dir, ".venv/bin/python")
+
+            if not os.path.exists(cmd_path):
+                return
+            
+            # Create local launcher script to wait for mount
+            local_bin = Path.home() / ".local" / "bin"
+            local_bin.mkdir(parents=True, exist_ok=True)
+            launcher_path = local_bin / "codex-switcher-launcher.sh"
+            
+            launcher_content = f"""#!/bin/bash
+# Wait for external volume to mount (max 30 seconds)
+PY_PATH="{py_path}"
+VENV_PATH="{venv_path}"
+for i in {{1..30}}; do
+    if [ -f "$PY_PATH" ]; then
+        pkill -f codex_switcher.py 2>/dev/null
+        sleep 0.5
+        exec "$VENV_PATH" "$PY_PATH"
+    fi
+    sleep 1
+done
+exit 1
+"""
+            if not launcher_path.exists() or launcher_path.read_text() != launcher_content:
+                launcher_path.write_text(launcher_content)
+                launcher_path.chmod(0o755)
+
+            plist_dir = Path.home() / "Library" / "LaunchAgents"
+            plist_dir.mkdir(parents=True, exist_ok=True)
+            plist_path = plist_dir / "com.codex-switcher.plist"
+            plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.codex-switcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{launcher_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"""
+            if not plist_path.exists() or plist_path.read_text() != plist_content:
+                plist_path.write_text(plist_content)
+                # Load agent immediately
+                uid_out = subprocess.run(["id", "-u"], capture_output=True, text=True)
+                uid = uid_out.stdout.strip()
+                if uid:
+                    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(plist_path)], capture_output=True)
+                    subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)], capture_output=True)
+        except Exception:
+            pass
+
 
     # ── Menu ─────────────────────────────────────────────────
 
@@ -103,25 +204,91 @@ class CodexSwitcher(rumps.App):
         if status and status.get("current_account"):
             current_email = status["current_account"].get("email", "?")
             plan = status["current_account"].get("plan_label", "")
-            plan_str = f"  ({plan})" if plan else ""
             self.title = f"⚡ {current_email.split('@')[0]}"
         else:
             self.title = "⚡ Codex"
 
-        header = rumps.MenuItem("Codex Account Switcher")
-        header.set_callback(None)
-        self.menu.add(header)
-        self.menu.add(None)
+        # Helpers for compact labels
+        def format_email(email):
+            if not email:
+                return ""
+            if email.endswith("@gmail.com"):
+                return email[:-10]
+            return email
+
+        def get_clean_usage_str(acc):
+            usage = acc.get("usage")
+            if not usage:
+                err = acc.get("usage_error", "")
+                if err and "login required" in err.lower():
+                    return " • login required"
+                return ""
+            parts = []
+            five_hour = usage.get("five_hour")
+            if five_hour:
+                fh_rem = five_hour.get("remaining_percent", "?")
+                fh_str = ""
+                if fh_rem != "?":
+                    if fh_rem < 100:
+                        fh_str = f"5h {fh_rem}%"
+                        if fh_rem <= 20:
+                            fh_reset = format_reset_time(five_hour.get("reset_at"), is_weekly=False)
+                            if fh_reset:
+                                fh_str += f"@{fh_reset}"
+                else:
+                    fh_str = "5h ?"
+                if fh_str:
+                    parts.append(fh_str)
+
+            weekly = usage.get("weekly")
+            if weekly:
+                w_rem = weekly.get("remaining_percent", "?")
+                w_str = ""
+                if w_rem != "?":
+                    if w_rem < 100:
+                        w_str = f"W {w_rem}%"
+                        if w_rem <= 20:
+                            w_reset = format_reset_time(weekly.get("reset_at"), is_weekly=True)
+                            if w_reset:
+                                w_str += f"@{w_reset}"
+                else:
+                    w_str = "W ?"
+                if w_str:
+                    parts.append(w_str)
+
+            if parts:
+                return " • " + " • ".join(parts)
+            return ""
 
         # Active account display
+        accounts = account_list.get("accounts", []) if account_list else []
+        active_usage_str = ""
+        current_saved_id = status.get("current_account_saved_id") if status else None
+
+        # Extract active account's usage and exclude it from the inactive switcher list
+        other_accounts = []
+        for acc in accounts:
+            if acc["email"] == current_email or acc.get("is_active", False) or (current_saved_id and acc["id"] == current_saved_id):
+                active_usage_str = get_clean_usage_str(acc)
+            else:
+                other_accounts.append(acc)
+
         if current_email:
-            active_label = f"✅  {current_email}{plan_str}"
-            current_saved_id = status.get("current_account_saved_id")
+            display_email = format_email(current_email)
+            plan_str = f" ({plan})" if plan else ""
+            active_label = f"✅  {display_email}{plan_str}"
             if not current_saved_id:
-                active_label += "  [not saved]"
+                active_label += " (not saved)"
             active_item = rumps.MenuItem(active_label)
             active_item.set_callback(None)
             self.menu.add(active_item)
+            
+            # Sub-label for active usage if exists
+            if active_usage_str:
+                sub_label = "      " + active_usage_str.replace(" • ", "", 1).strip()
+                sub_item = rumps.MenuItem(sub_label)
+                sub_item.set_callback(None)
+                self.menu.add(sub_item)
         else:
             ni = rumps.MenuItem("  ⚠️  Not logged in")
             ni.set_callback(None)
@@ -129,42 +296,33 @@ class CodexSwitcher(rumps.App):
 
         self.menu.add(None)
 
-        # Saved accounts
-        accounts = account_list.get("accounts", []) if account_list else []
+        # Saved accounts header
         saved_header = rumps.MenuItem("Switch to:")
         saved_header.set_callback(None)
         self.menu.add(saved_header)
 
-        if accounts:
-            for acc in accounts:
+        if other_accounts:
+            for acc in other_accounts:
                 aid = acc["id"]
                 email = acc["email"]
-                is_active = acc.get("is_active", False)
-                plan = acc.get("plan_label", "")
-                plan_s = f" ({plan})" if plan else ""
-
-                # Usage info
-                usage_str = ""
-                usage = acc.get("usage")
-                if usage and usage.get("weekly"):
-                    w = usage["weekly"]
-                    remaining = w.get("remaining_percent", "?")
-                    usage_str = f"  [{remaining}% left]"
-
-                err = acc.get("usage_error", "")
-                if err and "login required" in err.lower():
-                    usage_str = "  [login required]"
-
-                if is_active:
-                    label = f"  ● {email}{plan_s}{usage_str}"
-                    item = rumps.MenuItem(label)
-                    item.set_callback(None)
-                else:
-                    label = f"  ○ {email}{plan_s}{usage_str}"
-                    item = rumps.MenuItem(
-                        label, callback=self._mk(self._switch, aid, email)
-                    )
+                plan_lbl = acc.get("plan_label", "")
+                
+                display_email = format_email(email)
+                plan_str = f" ({plan_lbl})" if plan_lbl else ""
+                
+                label = f"  ○  {display_email}{plan_str}"
+                item = rumps.MenuItem(
+                    label, callback=self._mk(self._switch, aid, email)
+                )
                 self.menu.add(item)
+                
+                # Sub-label for inactive usage if exists
+                usage_str = get_clean_usage_str(acc)
+                if usage_str:
+                    sub_label = "      " + usage_str.replace(" • ", "", 1).strip()
+                    sub_item = rumps.MenuItem(sub_label)
+                    sub_item.set_callback(None)
+                    self.menu.add(sub_item)
         else:
             empty = rumps.MenuItem("  (no saved accounts)")
             empty.set_callback(None)
@@ -199,7 +357,7 @@ class CodexSwitcher(rumps.App):
     # ── Actions ──────────────────────────────────────────────
 
     def _switch(self, account_id, email):
-        rumps.notification("Codex Switcher", "⏳ Switching…", f"→ {email}")
+        notify("Codex Switcher", "⏳ Switching…", f"→ {email}")
 
         # Kill Codex first for reliable swap
         subprocess.run(["pkill", "-f", "Codex"], capture_output=True)
@@ -209,18 +367,18 @@ class CodexSwitcher(rumps.App):
         if ok:
             # Relaunch Codex
             subprocess.Popen(["open", "-a", "Codex"])
-            rumps.notification("Codex Switcher", "✅ Switched", f"Now: {email}")
+            notify("Codex Switcher", "✅ Switched", f"Now: {email}")
         else:
-            rumps.notification("Codex Switcher", "❌ Error", msg[:100])
+            notify("Codex Switcher", "❌ Error", msg[:100])
 
         self._refresh_menu()
 
     def _on_save(self, _):
         ok, msg = cli_run("save")
         if ok:
-            rumps.notification("Codex Switcher", "💾 Saved", msg)
+            notify("Codex Switcher", "💾 Saved", msg)
         else:
-            rumps.notification("Codex Switcher", "❌ Error", msg[:100])
+            notify("Codex Switcher", "❌ Error", msg[:100])
         self._refresh_menu()
 
     def _on_add(self, _):
@@ -235,7 +393,7 @@ class CodexSwitcher(rumps.App):
         backup_sid = codex_dir / "cap_sid.switcher-bak"
 
         if not auth.exists():
-            rumps.notification("Codex Switcher", "Error", "Not logged in")
+            notify("Codex Switcher", "Error", "Not logged in")
             return
 
         # Backup
@@ -253,7 +411,7 @@ class CodexSwitcher(rumps.App):
         time.sleep(1)
         subprocess.Popen(["open", "-a", "Codex"])
 
-        rumps.notification(
+        notify(
             "Codex Switcher",
             "🔑 Login with new account",
             "Login in Codex, then click ⚡ → Finish Adding Account",
@@ -290,7 +448,7 @@ class CodexSwitcher(rumps.App):
         auth = codex_dir / "auth.json"
 
         if not auth.exists():
-            rumps.notification("Codex Switcher", "Error", "Not logged in yet")
+            notify("Codex Switcher", "Error", "Not logged in yet")
             return
 
         # Ensure cap_sid exists
@@ -316,9 +474,9 @@ class CodexSwitcher(rumps.App):
         subprocess.Popen(["open", "-a", "Codex"])
 
         if ok:
-            rumps.notification("Codex Switcher", "✅ Account Added", msg)
+            notify("Codex Switcher", "✅ Account Added", msg)
         else:
-            rumps.notification("Codex Switcher", "❌ Error", msg[:100])
+            notify("Codex Switcher", "❌ Error", msg[:100])
 
         self._refresh_menu()
 
@@ -341,7 +499,7 @@ class CodexSwitcher(rumps.App):
             backup_sid.unlink()
 
         subprocess.Popen(["open", "-a", "Codex"])
-        rumps.notification("Codex Switcher", "", "Cancelled. Original restored.")
+        notify("Codex Switcher", "", "Cancelled. Original restored.")
         self._refresh_menu()
 
     def _delete(self, account_id, email):
@@ -349,9 +507,9 @@ class CodexSwitcher(rumps.App):
             return
         ok, msg = cli_run("delete", account_id)
         if ok:
-            rumps.notification("Codex Switcher", "🗑 Deleted", email)
+            notify("Codex Switcher", "🗑 Deleted", email)
         else:
-            rumps.notification("Codex Switcher", "❌ Error", msg[:100])
+            notify("Codex Switcher", "❌ Error", msg[:100])
         self._refresh_menu()
 
     def _on_refresh(self, _):
@@ -362,4 +520,5 @@ class CodexSwitcher(rumps.App):
 
 
 if __name__ == "__main__":
+    rumps.debug_mode(True)
     CodexSwitcher().run()

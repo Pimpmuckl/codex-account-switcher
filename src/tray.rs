@@ -325,6 +325,33 @@ where
                 }
             }
             Some(TrayCommand::ShowTui) => {
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        #[cfg(target_os = "macos")]
+                        {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new("osascript")
+                                    .arg("-e")
+                                    .arg(format!(
+                                        "tell application \"Terminal\" to do script \"'{}'\"",
+                                        exe.display()
+                                    ))
+                                    .spawn();
+                            }
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new("cmd")
+                                    .args(["/c", "start", "cmd", "/k", &format!("\"{}\"", exe.display())])
+                                    .spawn();
+                            }
+                        }
+                        return;
+                    }
+                }
                 self.exit = TrayExit::ShowTui;
                 event_loop.exit();
             }
