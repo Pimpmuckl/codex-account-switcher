@@ -17,7 +17,7 @@ use crate::env::AppEnv;
 use crate::model::{
     AUTH_FILES, AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
     AutoStartUsageWindowsStatusOutput, AutoSwitchOnLimitStatusOutput, DisplayIdentity,
-    SnapshotBlob,
+    LaunchAtStartupStatusOutput, SnapshotBlob,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
@@ -64,6 +64,72 @@ where
         settings.auto_switch_on_limit = enabled;
         save_settings(&self.env.app_data_dir, &settings)?;
         Ok(AutoSwitchOnLimitStatusOutput { enabled })
+    }
+
+    pub fn launch_at_startup_status(&self) -> Result<LaunchAtStartupStatusOutput> {
+        let settings = load_settings(&self.env.app_data_dir)?;
+        Ok(LaunchAtStartupStatusOutput {
+            enabled: settings.launch_at_startup,
+        })
+    }
+
+    pub fn set_launch_at_startup(&self, enabled: bool) -> Result<LaunchAtStartupStatusOutput> {
+        let mut settings = load_settings(&self.env.app_data_dir)?;
+        settings.launch_at_startup = enabled;
+        save_settings(&self.env.app_data_dir, &settings)?;
+
+        #[cfg(target_os = "macos")]
+        {
+            let launch_agents_dir = self.env.home_dir.join("Library").join("LaunchAgents");
+            let plist_path = launch_agents_dir.join("com.anlvdt.codex-account-switcher.plist");
+            if enabled {
+                if let Ok(exe) = std::env::current_exe() {
+                    let plist_content = format!(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.anlvdt.codex-account-switcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>"#,
+                        exe.display()
+                    );
+                    let _ = std::fs::create_dir_all(&launch_agents_dir);
+                    let _ = std::fs::write(&plist_path, plist_content);
+                }
+            } else {
+                let _ = std::fs::remove_file(plist_path);
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if enabled {
+                if let Ok(exe) = std::env::current_exe() {
+                    let cmd = format!(
+                        "Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'CodexAccountSwitcher' -Value '\"{}\"'",
+                        exe.display()
+                    );
+                    let _ = std::process::Command::new("powershell")
+                        .args(["-Command", &cmd])
+                        .output();
+                }
+            } else {
+                let cmd = "Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'CodexAccountSwitcher' -ErrorAction SilentlyContinue";
+                let _ = std::process::Command::new("powershell")
+                    .args(["-Command", cmd])
+                    .output();
+            }
+        }
+
+        Ok(LaunchAtStartupStatusOutput { enabled })
     }
 
     pub fn auto_switch_on_limit_once(&self) -> Result<Option<Uuid>> {

@@ -12,6 +12,8 @@ pub struct AppSettings {
     pub auto_start_usage_windows: bool,
     #[serde(default)]
     pub auto_switch_on_limit: bool,
+    #[serde(default)]
+    pub launch_at_startup: bool,
 }
 
 pub fn load_settings(app_data_dir: &Path) -> Result<AppSettings> {
@@ -53,6 +55,7 @@ mod tests {
 
         assert!(!settings.auto_start_usage_windows);
         assert!(!settings.auto_switch_on_limit);
+        assert!(!settings.launch_at_startup);
     }
 
     #[test]
@@ -63,6 +66,7 @@ mod tests {
             &AppSettings {
                 auto_start_usage_windows: true,
                 auto_switch_on_limit: true,
+                launch_at_startup: true,
             },
         )
         .expect("save settings");
@@ -71,6 +75,7 @@ mod tests {
 
         assert!(settings.auto_start_usage_windows);
         assert!(settings.auto_switch_on_limit);
+        assert!(settings.launch_at_startup);
     }
 
     #[test]
@@ -83,5 +88,6 @@ mod tests {
 
         assert!(!settings.auto_start_usage_windows);
         assert!(!settings.auto_switch_on_limit);
+        assert!(!settings.launch_at_startup);
     }
 }

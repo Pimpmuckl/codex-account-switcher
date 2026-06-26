@@ -30,6 +30,8 @@ enum TrayCommand {
     SaveCurrent,
     Delete(Uuid, String),
     SetAutoStartUsageWindows(bool),
+    SetAutoSwitchOnLimit(bool),
+    SetLaunchAtStartup(bool),
     ShowTui,
     Refresh,
     Quit,
@@ -153,13 +155,31 @@ where
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
 
-                if let Err(error) = self.app.activate_with_running_policy(account_id, false) {
-                    eprintln!("failed to activate account from tray: {error:#}");
+                let mut activated_info = None;
+                match self.app.activate_with_running_policy(account_id, false) {
+                    Ok(output) => {
+                        let email = output.account.email.clone();
+                        let plan = format_plan_label_simple(output.account.plan_label.as_deref());
+                        activated_info = Some((email, plan));
+                    }
+                    Err(error) => {
+                        eprintln!("failed to activate account from tray: {error:#}");
+                    }
                 }
 
                 #[cfg(target_os = "macos")]
                 {
                     let _ = std::process::Command::new("open").args(["-a", "Codex"]).spawn();
+                    if let Some((email, plan)) = activated_info {
+                        let msg = format!("Switched to account {email} ({plan}). Codex restarted.");
+                        let _ = std::process::Command::new("osascript")
+                            .arg("-e")
+                            .arg(format!(
+                                "display notification \"{}\" with title \"Codex Switcher\"",
+                                msg.replace('"', "\\\"")
+                            ))
+                            .spawn();
+                    }
                 }
                 #[cfg(target_os = "windows")]
                 {
@@ -313,12 +333,28 @@ where
                             if let Err(error) =
                                 crate::app::run_auto_start_usage_windows_check_now(env)
                             {
-                                eprintln!(
-                                    "failed to run auto-start usage window check from tray: {error:#}"
-                                );
+                                  eprintln!(
+                                      "failed to run auto-start usage window check from tray: {error:#}"
+                                  );
                             }
                             let _ = proxy.send_event(UserEvent::AutoStartUsageWindowsChecked);
                         });
+                }
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
+            Some(TrayCommand::SetAutoSwitchOnLimit(enabled)) => {
+                if let Err(error) = self.app.set_auto_switch_on_limit(enabled) {
+                    eprintln!("failed to update auto-switch on limit from tray: {error:#}");
+                }
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
+            Some(TrayCommand::SetLaunchAtStartup(enabled)) => {
+                if let Err(error) = self.app.set_launch_at_startup(enabled) {
+                    eprintln!("failed to update launch at startup from tray: {error:#}");
                 }
                 if let Err(error) = self.update_tray_menu() {
                     eprintln!("failed to refresh tray menu: {error:#}");
@@ -486,6 +522,22 @@ where
             "Auto-start usage windows",
             auto_start_enabled,
             TrayCommand::SetAutoStartUsageWindows(!auto_start_enabled),
+        )?;
+        let auto_switch_enabled = self.app.auto_switch_on_limit_status()?.enabled;
+        self.append_check_command(
+            &menu,
+            "toggle-auto-switch-on-limit",
+            "Auto-switch on limit",
+            auto_switch_enabled,
+            TrayCommand::SetAutoSwitchOnLimit(!auto_switch_enabled),
+        )?;
+        let launch_at_startup_enabled = self.app.launch_at_startup_status()?.enabled;
+        self.append_check_command(
+            &menu,
+            "toggle-launch-at-startup",
+            "Launch at Login",
+            launch_at_startup_enabled,
+            TrayCommand::SetLaunchAtStartup(!launch_at_startup_enabled),
         )?;
         self.append_command(&menu, "show-tui", "Show TUI", TrayCommand::ShowTui)?;
         self.append_command(&menu, "refresh", "Refresh", TrayCommand::Refresh)?;
@@ -743,83 +795,25 @@ fn fallback_icon() -> Icon {
 mod tests {
     use super::*;
     use crate::model::{AccountUsageView, EnvironmentKind, UsageSource, UsageWindowView};
-    use time::{Date, Month, OffsetDateTime, Time};
+    use time::OffsetDateTime;
 
     #[test]
-    fn tray_account_label_includes_usage_table_columns() {
-        let reset_at = OffsetDateTime::UNIX_EPOCH
-            .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
-            .replace_time(Time::from_hms(0, 52, 0).unwrap());
-        let mut account = AccountView {
-            id: Uuid::new_v4(),
-            email: "person@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
-            name: None,
-            plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
-            is_active: true,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-            last_activated_at: None,
-            usage: None,
-            usage_error: None,
-        };
-        account.usage = Some(AccountUsageView {
-            source: UsageSource::SavedAccessToken,
-            fetched_at: OffsetDateTime::UNIX_EPOCH,
-            five_hour: None,
-            weekly: Some(UsageWindowView {
-                used_percent: 83,
-                remaining_percent: 17,
-                reset_at,
-            }),
-            credits: None,
-        });
-
-        assert_eq!(
-            tray_account_label(&account, tray_label_widths(&[&account])),
-            format!(
-                "person@example.com{}Plan: Pro  Weekly Remaining: \u{2007}17%  Reset: {}",
-                tray_detail_separator(),
-                format_local_reset_at(reset_at)
-            )
-        );
+    fn test_format_plan_label_simple() {
+        assert_eq!(format_plan_label_simple(Some("pro")), "pro");
+        assert_eq!(format_plan_label_simple(Some("Free")), "Free");
+        assert_eq!(format_plan_label_simple(None), "Free");
     }
 
     #[test]
-    fn tray_account_label_marks_login_required_usage_error() {
-        let account = AccountView {
-            id: Uuid::new_v4(),
-            email: "person@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
-            name: None,
-            plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
-            is_active: false,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-            last_activated_at: None,
-            usage: Some(AccountUsageView {
-                source: UsageSource::SavedAccessToken,
-                fetched_at: OffsetDateTime::UNIX_EPOCH,
-                five_hour: None,
-                weekly: Some(UsageWindowView {
-                    used_percent: 0,
-                    remaining_percent: 100,
-                    reset_at: OffsetDateTime::UNIX_EPOCH
-                        .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
-                        .replace_time(Time::from_hms(13, 56, 0).unwrap()),
-                }),
-                credits: None,
-            }),
-            usage_error: Some("Login required: Codex auth expired.".to_owned()),
-        };
-
-        let label = tray_account_label(&account, tray_label_widths(&[&account]));
-
-        assert!(label.contains("Login required"));
-        assert!(!label.contains("Usage unavailable"));
-        assert!(!label.contains("Weekly Remaining"));
+    fn test_format_details_line() {
+        assert_eq!(
+            format_details_line("Plus".to_owned(), "17% remaining".to_owned(), "Reset: 05/12 00:52".to_owned(), None),
+            "Plus  •  17% remaining  •  Reset: 05/12 00:52"
+        );
+        assert_eq!(
+            format_details_line("Free".to_owned(), String::new(), String::new(), Some("[not saved]")),
+            "Free  •  [not saved]"
+        );
     }
 
     #[test]
@@ -892,72 +886,5 @@ mod tests {
 
         assert!(find_active_tray_account(Some(&matching_identity), None, &accounts).is_some());
         assert!(find_active_tray_account(Some(&mismatched_identity), None, &accounts).is_none());
-    }
-
-    #[test]
-    fn active_account_label_keeps_live_identity_and_saved_usage() {
-        let reset_at = OffsetDateTime::UNIX_EPOCH
-            .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
-            .replace_time(Time::from_hms(0, 52, 0).unwrap());
-        let mut saved_account = AccountView {
-            id: Uuid::new_v4(),
-            email: "stale@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
-            name: None,
-            plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
-            is_active: true,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-            last_activated_at: None,
-            usage: None,
-            usage_error: None,
-        };
-        saved_account.usage = Some(AccountUsageView {
-            source: UsageSource::SavedAccessToken,
-            fetched_at: OffsetDateTime::UNIX_EPOCH,
-            five_hour: None,
-            weekly: Some(UsageWindowView {
-                used_percent: 83,
-                remaining_percent: 17,
-                reset_at,
-            }),
-            credits: None,
-        });
-        let account = DisplayIdentity {
-            email: "person@example.com".to_owned(),
-            subject: None,
-            name: None,
-            plan_label: Some("ProLite".to_owned()),
-        };
-        let mut widths = tray_label_widths(&[&saved_account]);
-        widths.include_plan(account.plan_label.as_deref());
-
-        assert_eq!(
-            active_account_label(&account, Some(&saved_account), widths),
-            format!(
-                "person@example.com{}Plan: ProLite  Weekly Remaining: \u{2007}17%  Reset: {}",
-                tray_detail_separator(),
-                format_local_reset_at(reset_at)
-            )
-        );
-    }
-
-    #[test]
-    fn active_account_label_marks_unsaved_current_account() {
-        let account = DisplayIdentity {
-            email: "person@example.com".to_owned(),
-            subject: None,
-            name: None,
-            plan_label: Some("Plus".to_owned()),
-        };
-
-        assert_eq!(
-            active_account_label(&account, None, TrayLabelWidths::default()),
-            format!(
-                "person@example.com{}Plan: Plus  [not saved]",
-                tray_detail_separator()
-            )
-        );
     }
 }

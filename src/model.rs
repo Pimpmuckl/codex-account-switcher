@@ -166,6 +166,11 @@ pub struct AutoSwitchOnLimitStatusOutput {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct LaunchAtStartupStatusOutput {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct AutoStartUsageWindowsRunOutput {
     pub enabled: bool,
     pub checked_accounts: usize,
