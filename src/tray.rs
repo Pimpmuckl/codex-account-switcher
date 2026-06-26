@@ -19,6 +19,7 @@ use crate::codex;
 use crate::model::{
     AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountView, DisplayIdentity, QUOTA_PAST_RESET_LABEL,
 };
+use crate::repository::SnapshotRepository;
 use crate::secrets::SecretStore;
 use crate::usage::usage_error_requires_login;
 
@@ -36,6 +37,7 @@ enum TrayCommand {
     StartAddAccount,
     FinishAddAccount,
     CancelAddAccount,
+    PickBestQuota,
     Delete(Uuid, String),
     SetAutoStartUsageWindows(bool),
     SetAutoSwitchOnLimit(bool),
@@ -130,7 +132,10 @@ where
                             builder = builder.with_icon_as_template(true);
                         }
                         match builder.build() {
-                            Ok(tray_icon) => self.tray_icon = Some(tray_icon),
+                            Ok(tray_icon) => {
+                                self.tray_icon = Some(tray_icon);
+                                self.spawn_startup_usage_refresh();
+                            }
                             Err(error) => eprintln!("failed to create tray icon: {error:#}"),
                         }
                     }
@@ -339,6 +344,29 @@ where
                     eprintln!("failed to refresh tray menu: {error:#}");
                 }
             }
+            Some(TrayCommand::PickBestQuota) => {
+                let was_running = !self.app.activation_preflight_warnings().is_empty();
+                if was_running {
+                    quit_codex_app();
+                }
+                let msg = match self.app.pick_best_account(true, true) {
+                    Ok(output) => {
+                        if output.switched {
+                            format!("Switched to best quota account {}.", output.account.email)
+                        } else {
+                            format!("Already on best quota account {}.", output.account.email)
+                        }
+                    }
+                    Err(error) => format!("Pick best quota failed: {error:#}"),
+                };
+                if was_running && msg.starts_with("Switched to best") {
+                    launch_codex_app();
+                }
+                tray_notify("Codex Switcher", &msg);
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
             Some(TrayCommand::Delete(account_id, email)) => {
                 let confirmed = {
                     #[cfg(target_os = "macos")]
@@ -438,9 +466,7 @@ where
                             if let Err(error) =
                                 crate::app::run_auto_start_usage_windows_check_now(env)
                             {
-                                eprintln!(
-                                    "failed to run auto-switch check from tray: {error:#}"
-                                );
+                                eprintln!("failed to run auto-switch check from tray: {error:#}");
                             }
                             let _ = proxy.send_event(UserEvent::AutoStartUsageWindowsChecked);
                         });
@@ -633,6 +659,12 @@ where
                 "  Add New Account…",
                 TrayCommand::StartAddAccount,
             )?;
+            self.append_command(
+                &menu,
+                "pick-best-quota",
+                "  Switch to Best Quota",
+                TrayCommand::PickBestQuota,
+            )?;
         } else {
             menu.append(&MenuItem::new("  not logged in", false, None))?;
         }
@@ -778,6 +810,24 @@ where
         ))?;
         self.commands.insert(id.to_owned(), command);
         Ok(())
+    }
+
+    fn spawn_startup_usage_refresh(&self) {
+        let proxy = self.event_proxy.clone();
+        let env = self.app.env().clone();
+        let _ = thread::Builder::new()
+            .name("tray-startup-usage-refresh".to_owned())
+            .spawn(move || {
+                let repository = SnapshotRepository::new(
+                    &env.app_data_dir,
+                    crate::secrets::MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),
+                );
+                let app = App::new(env, repository);
+                if let Err(error) = app.refresh_saved_usage_cache() {
+                    eprintln!("failed to refresh usage cache on tray startup: {error:#}");
+                }
+                let _ = proxy.send_event(UserEvent::AutoStartUsageWindowsChecked);
+            });
     }
 }
 
@@ -1118,6 +1168,7 @@ mod tests {
             last_activated_at: None,
             usage: None,
             usage_error: None,
+            label: None,
         };
         let inactive = AccountView {
             id: Uuid::new_v4(),
@@ -1149,6 +1200,7 @@ mod tests {
             last_activated_at: None,
             usage: None,
             usage_error: None,
+            label: None,
         };
         let matching_identity = DisplayIdentity {
             email: "active@example.com".to_owned(),

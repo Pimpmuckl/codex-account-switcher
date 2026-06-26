@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use std::time::Duration;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::codex;
 use crate::env::AppEnv;
 use crate::model::{
-    ActivateOutput, DeleteOutput, DisplayIdentity, ListOutput, RunningCodexProcess, SaveAction,
-    SaveOutput, SnapshotBlob, StatusOutput, UsageOutput, UsageSource,
+    ActivateOutput, DeleteOutput, DisplayIdentity, ExportBundle, ImportOutput, ListOutput,
+    PickBestOutput, PickBestScoreView, RenameOutput, RunningCodexProcess, SaveAction, SaveOutput,
+    SnapshotBlob, StatusOutput, UsageOutput, UsageSource,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::SecretStore;
@@ -126,6 +128,13 @@ where
             .repository
             .sync_activated_account(&self.env.kind, account_id, &snapshot_identity)
             .context("activated live auth but failed to update local metadata")?;
+        let _ = crate::activity::log_account_activation(
+            &self.env.app_data_dir,
+            account_id,
+            &metadata.email,
+            metadata.label.as_deref(),
+            None,
+        );
         Ok(ActivateOutput {
             account: account_view(metadata, Some(account_id), None, None),
             warnings,
@@ -294,10 +303,126 @@ where
             return Ok(account.clone());
         }
         let query_lower = query.to_ascii_lowercase();
-        let matched = accounts
-            .into_iter()
-            .find(|a| a.email.to_ascii_lowercase() == query_lower);
+        let matched = accounts.into_iter().find(|account| {
+            account.email.to_ascii_lowercase() == query_lower
+                || account
+                    .label
+                    .as_ref()
+                    .is_some_and(|label| label.to_ascii_lowercase() == query_lower)
+        });
         matched.ok_or_else(|| anyhow::anyhow!("no saved account found matching '{}'", query))
+    }
+
+    pub fn pick_best_account(&self, refresh: bool, activate: bool) -> Result<PickBestOutput> {
+        if refresh {
+            self.refresh_saved_usage_cache()?;
+        }
+        let accounts = self.repository.list_accounts(&self.env.kind)?;
+        let status = self.status()?;
+        let active_id = status.current_account_saved_id;
+        let now = OffsetDateTime::now_utc();
+        let scores = accounts
+            .iter()
+            .map(|account| {
+                crate::quota_scoring::score_saved_account(
+                    account.id,
+                    &account.email,
+                    account.label.as_deref(),
+                    account.cached_usage.as_ref(),
+                    account.cached_usage_error.as_deref(),
+                    now,
+                )
+            })
+            .collect::<Vec<_>>();
+        let score_views = scores
+            .iter()
+            .map(|entry| PickBestScoreView {
+                account_id: entry.account_id,
+                email: entry.email.clone(),
+                label: entry.label.clone(),
+                score: entry.eligible.then_some(entry.score),
+                eligible: entry.eligible,
+                weekly_used_percent: entry.weekly_used_percent,
+                five_hour_used_percent: entry.five_hour_used_percent,
+                detail: entry.detail.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Some(best_id) = crate::quota_scoring::pick_best_account_id(&scores) else {
+            anyhow::bail!("no eligible saved account with usable quota");
+        };
+        if active_id == Some(best_id) || !activate {
+            let metadata = self
+                .repository
+                .get_account(&self.env.kind, best_id)?
+                .context("best account metadata missing")?;
+            return Ok(PickBestOutput {
+                switched: false,
+                account: account_view(metadata, active_id, None, None),
+                scores: score_views,
+            });
+        }
+        let output = self.activate_with_running_policy(best_id, true)?;
+        let best_score = scores
+            .iter()
+            .find(|entry| entry.account_id == best_id)
+            .map(|entry| entry.score)
+            .unwrap_or(0.0);
+        let _ = crate::activity::log_pick_best(
+            &self.env.app_data_dir,
+            best_id,
+            &output.account.email,
+            output.account.label.as_deref(),
+            best_score,
+        );
+        Ok(PickBestOutput {
+            switched: true,
+            account: output.account,
+            scores: score_views,
+        })
+    }
+
+    pub fn login_and_save(&self) -> Result<SaveOutput> {
+        let status = std::process::Command::new("codex")
+            .arg("login")
+            .status()
+            .context("failed to run `codex login`; make sure `codex` is on PATH")?;
+        if !status.success() {
+            anyhow::bail!("`codex login` failed with {status}");
+        }
+        self.save_current()
+    }
+
+    pub fn export_accounts(&self, account_ids: Option<Vec<Uuid>>) -> Result<ExportBundle> {
+        crate::import_export::export_accounts(
+            &self.repository,
+            &self.env.kind,
+            account_ids.as_deref(),
+        )
+    }
+
+    pub fn import_auth_path(
+        &self,
+        auth_path: &std::path::Path,
+        label: Option<String>,
+    ) -> Result<ImportOutput> {
+        crate::import_export::import_auth_file(&self.repository, &self.env.kind, auth_path, label)
+    }
+
+    pub fn import_bundle(&self, bundle: &ExportBundle) -> Result<Vec<ImportOutput>> {
+        crate::import_export::import_export_bundle(&self.repository, &self.env.kind, bundle)
+    }
+
+    pub fn rename_account(&self, account_id: Uuid, label: Option<String>) -> Result<RenameOutput> {
+        let metadata = self
+            .repository
+            .set_account_label(&self.env.kind, account_id, label)?;
+        let active_id = self
+            .status()?
+            .current_account_saved_id
+            .filter(|id| *id == account_id);
+        Ok(RenameOutput {
+            account: account_view(metadata, active_id, None, None),
+        })
     }
 
     pub fn exec_with_temporary_account(

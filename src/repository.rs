@@ -101,6 +101,7 @@ where
                 last_activated_at: None,
                 cached_usage: None,
                 cached_usage_error: None,
+                label: None,
             };
             index.accounts.push(metadata.clone());
             (metadata, true)
@@ -216,6 +217,28 @@ where
             return Err(error);
         }
         Ok(())
+    }
+
+    pub fn set_account_label(
+        &self,
+        environment: &EnvironmentKind,
+        account_id: Uuid,
+        label: Option<String>,
+    ) -> Result<SavedAccountMetadata> {
+        let mut index = self.index_store.load_index()?;
+        let normalized_label = label
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let account = index
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id && &account.environment == environment)
+            .ok_or_else(|| anyhow!("saved account {account_id} not found"))?;
+        account.label = normalized_label;
+        account.updated_at = OffsetDateTime::now_utc();
+        let metadata = account.clone();
+        self.index_store.save_index(&index)?;
+        Ok(metadata)
     }
 
     pub fn sync_activated_account(

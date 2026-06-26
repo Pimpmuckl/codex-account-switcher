@@ -15,5 +15,9 @@ mod time_display;
 pub mod tray;
 pub mod usage;
 
+pub mod activity;
+pub mod import_export;
+pub mod quota_scoring;
+
 #[cfg(test)]
 mod usage_http;

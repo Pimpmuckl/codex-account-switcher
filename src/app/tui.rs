@@ -499,8 +499,7 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
             }
             if let Some(weekly) = &usage.weekly {
                 if weekly.reset_at <= now {
-                    remaining =
-                        remaining.max(format!("Weekly: {QUOTA_PAST_RESET_LABEL}").len());
+                    remaining = remaining.max(format!("Weekly: {QUOTA_PAST_RESET_LABEL}").len());
                 } else {
                     remaining = remaining
                         .max(format!("Weekly Remaining: {}%", weekly.remaining_percent).len());
@@ -1116,6 +1115,7 @@ mod tests {
                 last_activated_at: is_active.then_some(OffsetDateTime::UNIX_EPOCH),
                 usage: None,
                 usage_error: None,
+                label: None,
             }],
         }
     }

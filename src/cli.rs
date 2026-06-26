@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
@@ -5,10 +7,11 @@ use uuid::Uuid;
 
 use crate::app::{App, InteractiveExit, InteractiveMode};
 use crate::env;
+use crate::import_export::{read_export_bundle, write_export_bundle};
 use crate::model::{
     AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountUsageView, AccountView,
-    AutoStartUsageWindowsRunOutput, AutoStartUsageWindowsStatusOutput, QUOTA_PAST_RESET_LABEL,
-    RunningCodexProcess, UsageOutput,
+    AutoStartUsageWindowsRunOutput, AutoStartUsageWindowsStatusOutput, ImportOutput,
+    PickBestOutput, QUOTA_PAST_RESET_LABEL, RunningCodexProcess, UsageOutput,
 };
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
@@ -38,6 +41,42 @@ enum Command {
         json: bool,
     },
     Save {
+        #[arg(long)]
+        json: bool,
+    },
+    Login {
+        #[arg(long)]
+        json: bool,
+    },
+    Current {
+        #[arg(long)]
+        json: bool,
+    },
+    PickBest {
+        #[arg(long)]
+        skip_refresh: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Export {
+        #[arg(long)]
+        output: PathBuf,
+        account_id: Vec<Uuid>,
+        #[arg(long)]
+        json: bool,
+    },
+    Import {
+        path: PathBuf,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Rename {
+        account: String,
+        label: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -132,6 +171,104 @@ pub fn run() -> Result<()> {
                 print_json(&output)?;
             } else {
                 println!("Saved {} ({})", output.account.email, output.account.id);
+            }
+            Ok(())
+        }
+        Some(Command::Login { json }) => {
+            let output = app.login_and_save()?;
+            if json {
+                print_json(&output)?;
+            } else {
+                println!(
+                    "Logged in and saved {} ({})",
+                    output.account.email, output.account.id
+                );
+            }
+            Ok(())
+        }
+        Some(Command::Current { json }) => {
+            let status = app.status()?;
+            if json {
+                print_json(&status)?;
+            } else {
+                match status.current_account {
+                    Some(account) => {
+                        println!("Current account: {}", account.email);
+                        if let Some(id) = status.current_account_saved_id {
+                            println!("Saved account ID: {id}");
+                        } else {
+                            println!("Saved account: not saved in switcher");
+                        }
+                    }
+                    None => println!("Current account: not logged in"),
+                }
+            }
+            Ok(())
+        }
+        Some(Command::PickBest {
+            skip_refresh,
+            dry_run,
+            json,
+        }) => {
+            let output = app.pick_best_account(!skip_refresh, !dry_run)?;
+            if json {
+                print_json(&output)?;
+            } else {
+                print_pick_best_output(&output);
+            }
+            Ok(())
+        }
+        Some(Command::Export {
+            output,
+            account_id,
+            json,
+        }) => {
+            let ids = if account_id.is_empty() {
+                None
+            } else {
+                Some(account_id)
+            };
+            let bundle = app.export_accounts(ids)?;
+            if json {
+                print_json(&bundle)?;
+            } else {
+                write_export_bundle(&output, &bundle)?;
+                println!(
+                    "Exported {} account(s) to {}",
+                    bundle.accounts.len(),
+                    output.display()
+                );
+            }
+            Ok(())
+        }
+        Some(Command::Import { path, label, json }) => {
+            let outputs = match read_export_bundle(&path) {
+                Ok(bundle) => app.import_bundle(&bundle)?,
+                Err(_) => vec![app.import_auth_path(&path, label)?],
+            };
+            if json {
+                print_json(&outputs)?;
+            } else {
+                for output in outputs {
+                    print_import_output(&output);
+                }
+            }
+            Ok(())
+        }
+        Some(Command::Rename {
+            account,
+            label,
+            json,
+        }) => {
+            let metadata = app.find_account_by_id_or_email(&account)?;
+            let output = app.rename_account(metadata.id, label)?;
+            if json {
+                print_json(&output)?;
+            } else {
+                match &output.account.label {
+                    Some(name) => println!("Renamed {} to label \"{name}\"", output.account.email),
+                    None => println!("Cleared label for {}", output.account.email),
+                }
             }
             Ok(())
         }
@@ -346,10 +483,16 @@ fn print_process_summary(title: &str, processes: &[RunningCodexProcess]) {
 }
 
 fn render_account_summary(account: &AccountView) -> String {
+    let label = account
+        .label
+        .as_deref()
+        .map(|name| format!(" [{name}]"))
+        .unwrap_or_default();
     let mut line = format!(
-        "{} {}{}",
+        "{} {}{}{}",
         account.id,
         account.email,
+        label,
         if account.is_active { " [active]" } else { "" }
     );
     if account
@@ -420,6 +563,55 @@ fn print_auto_start_usage_windows_run(output: &AutoStartUsageWindowsRunOutput) {
     }
     for skipped in &output.skipped {
         println!("Skipped: {skipped}");
+    }
+}
+
+fn print_pick_best_output(output: &PickBestOutput) {
+    println!(
+        "{} {} ({})",
+        if output.switched {
+            "Switched to best quota account:"
+        } else {
+            "Best quota account already active:"
+        },
+        output.account.email,
+        output.account.id
+    );
+    for entry in &output.scores {
+        let score = entry
+            .score
+            .map(|value| format!("{value:+.1}"))
+            .unwrap_or_else(|| "n/a".to_owned());
+        let marker = if entry.account_id == output.account.id {
+            " ←"
+        } else {
+            ""
+        };
+        let label = entry
+            .label
+            .as_deref()
+            .map(|name| format!(" [{name}]"))
+            .unwrap_or_default();
+        println!(
+            "  {}{label}: score {score}{marker}{}",
+            entry.email,
+            if entry.eligible { "" } else { " (ineligible)" },
+        );
+    }
+}
+
+fn print_import_output(output: &ImportOutput) {
+    let action = if output.created {
+        "Imported"
+    } else {
+        "Updated"
+    };
+    match &output.label {
+        Some(label) => println!(
+            "{action} {} as \"{label}\" ({})",
+            output.email, output.account_id
+        ),
+        None => println!("{action} {} ({})", output.email, output.account_id),
     }
 }
 

@@ -11,6 +11,7 @@ pub struct MockHttpServer {
     pub base_url: String,
     responses: Arc<Mutex<Vec<(u16, String)>>>,
     expected: Arc<AtomicUsize>,
+    #[allow(dead_code)]
     served: Arc<AtomicUsize>,
     handle: Option<JoinHandle<()>>,
 }

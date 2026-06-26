@@ -109,6 +109,8 @@ pub struct SavedAccountMetadata {
     pub cached_usage: Option<AccountUsageView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_usage_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -133,6 +135,8 @@ pub struct AccountView {
     pub last_activated_at: Option<OffsetDateTime>,
     pub usage: Option<AccountUsageView>,
     pub usage_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -188,6 +192,58 @@ pub struct AutoStartUsageWindowAccountResult {
     pub email: String,
     pub status: String,
     pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PickBestOutput {
+    pub switched: bool,
+    pub account: AccountView,
+    pub scores: Vec<PickBestScoreView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PickBestScoreView {
+    pub account_id: Uuid,
+    pub email: String,
+    pub label: Option<String>,
+    pub score: Option<f64>,
+    pub eligible: bool,
+    pub weekly_used_percent: Option<u8>,
+    pub five_hour_used_percent: Option<u8>,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExportBundle {
+    pub schema_version: u32,
+    pub environment: EnvironmentKind,
+    pub exported_at: OffsetDateTime,
+    pub accounts: Vec<ExportBundleAccount>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExportBundleAccount {
+    pub id: Uuid,
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub subject: Option<String>,
+    pub name: Option<String>,
+    pub plan_label: Option<String>,
+    pub snapshot: SnapshotBlob,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ImportOutput {
+    pub account_id: Uuid,
+    pub email: String,
+    pub label: Option<String>,
+    pub created: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RenameOutput {
+    pub account: AccountView,
 }
 
 #[derive(Clone, Debug, Serialize)]

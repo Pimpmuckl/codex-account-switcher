@@ -64,6 +64,7 @@ fn account_view(
         last_activated_at: account.last_activated_at,
         usage,
         usage_error,
+        label: account.label,
     }
 }
 

@@ -151,6 +151,10 @@ fn ensure_snapshot_complete(snapshot: &SnapshotBlob) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_import_snapshot(snapshot: &SnapshotBlob) -> Result<()> {
+    ensure_snapshot_complete(snapshot)
+}
+
 fn stage_and_restore(
     codex_root: &Path,
     backup_dir: &Path,
