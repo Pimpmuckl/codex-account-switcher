@@ -66,6 +66,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    AutoSwitchOnLimit {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long)]
+        run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Exec {
+        account: String,
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -210,6 +225,50 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::AutoSwitchOnLimit {
+            enable,
+            disable,
+            run,
+            json,
+        }) => {
+            let status = if enable {
+                app.set_auto_switch_on_limit(true)?
+            } else if disable {
+                app.set_auto_switch_on_limit(false)?
+            } else {
+                app.auto_switch_on_limit_status()?
+            };
+            if run && !disable {
+                let output = app.auto_switch_on_limit_once()?;
+                if json {
+                    print_json(&output)?;
+                } else if let Some(target_id) = output {
+                    println!("Auto-switched to account ID {}.", target_id);
+                } else {
+                    println!("No switch performed.");
+                }
+            } else if json {
+                print_json(&status)?;
+            } else {
+                println!(
+                    "Auto-switch on limit: {}",
+                    if status.enabled { "enabled" } else { "disabled" }
+                );
+            }
+            Ok(())
+        }
+        Some(Command::Exec { account, command }) => {
+            let target_account = app.find_account_by_id_or_email(&account)?;
+            let status = app.exec_with_temporary_account(target_account.id, &command)?;
+            if !status.success() {
+                if let Some(code) = status.code() {
+                    std::process::exit(code);
+                } else {
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -218,8 +277,31 @@ where
     S: crate::secrets::SecretStore,
 {
     crate::app::spawn_auto_start_usage_windows_worker(app.env().clone());
-    #[cfg(windows)]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            crate::tray::hide_console_window();
+            match crate::tray::run(app)? {
+                crate::tray::TrayExit::ShowTui => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new("osascript")
+                                .arg("-e")
+                                .arg(format!(
+                                    "tell application \"Terminal\" to do script \"'{}'\"",
+                                    exe.display()
+                                ))
+                                .spawn();
+                        }
+                    }
+                    return Ok(());
+                }
+                crate::tray::TrayExit::Quit => return Ok(()),
+            }
+        }
+
         loop {
             match app.interactive(InteractiveMode::Persistent, false)? {
                 InteractiveExit::Quit => return Ok(()),
@@ -233,7 +315,7 @@ where
             }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         match app.interactive(InteractiveMode::Persistent, false)? {
             InteractiveExit::Quit => Ok(()),

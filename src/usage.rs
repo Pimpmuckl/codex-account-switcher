@@ -91,7 +91,10 @@ pub fn usage_error_requires_login(error: &str) -> bool {
         || (error.contains("token refresh failed")
             && (error.contains("invalid_grant")
                 || error.contains("refresh token")
+                || error.contains("refresh_token")
                 || error.contains("log out")
+                || error.contains("log in")
+                || error.contains("session has ended")
                 || error.contains("sign in")))
 }
 

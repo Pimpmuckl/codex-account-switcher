@@ -25,12 +25,14 @@ time = { version = "0.3.47", features = ["formatting", "local-offset", "parsing"
 ureq = { version = "3.1.2", features = ["json"] }
 uuid = { version = "1.23.0", features = ["serde", "v4"] }
 
-[target.'cfg(target_os = "windows")'.dependencies]
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }
-keyring = { version = "3.6.3", features = ["windows-native"] }
 tray-icon = { version = "0.22.1", default-features = false }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 winit = { version = "0.30.13", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1.31"

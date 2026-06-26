@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use anyhow::{Context, Result};
-use time::OffsetDateTime;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use time::{OffsetDateTime, UtcOffset};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use uuid::Uuid;
 use winit::application::ApplicationHandler;
@@ -15,8 +15,7 @@ use winit::window::WindowId;
 use crate::app::App;
 use crate::model::{AccountView, DisplayIdentity};
 use crate::secrets::SecretStore;
-use crate::time_display::format_local_reset_at;
-use crate::usage::{usage_error_label, usage_error_requires_login};
+use crate::usage::usage_error_requires_login;
 
 #[derive(Debug)]
 enum UserEvent {
@@ -24,20 +23,21 @@ enum UserEvent {
     AutoStartUsageWindowsChecked,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum TrayCommand {
     Activate(Uuid),
+    Login(Uuid),
+    SaveCurrent,
+    Delete(Uuid, String),
     SetAutoStartUsageWindows(bool),
+    SetAutoSwitchOnLimit(bool),
+    SetLaunchAtStartup(bool),
     ShowTui,
+    Refresh,
     Quit,
 }
 
-#[derive(Clone, Copy, Default)]
-struct TrayLabelWidths {
-    plan: usize,
-    remaining: usize,
-    reset: usize,
-}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrayExit {
@@ -106,17 +106,28 @@ where
         if self.tray_icon.is_some() {
             return;
         }
-        match self.rebuild_menu() {
-            Ok(menu) => match TrayIconBuilder::new()
-                .with_tooltip("Codex account switcher")
-                .with_icon(load_codex_icon())
-                .with_menu(Box::new(menu))
-                .build()
-            {
-                Ok(tray_icon) => self.tray_icon = Some(tray_icon),
-                Err(error) => eprintln!("failed to create tray icon: {error:#}"),
-            },
-            Err(error) => eprintln!("failed to build tray menu: {error:#}"),
+        match self.app.status().and_then(|s| self.app.list().map(|l| (s, l))) {
+            Ok((status, list)) => {
+                let tooltip = self.get_tooltip_text(&status, &list);
+                match self.rebuild_menu_with_status_and_list(&status, &list) {
+                    Ok(menu) => {
+                        let mut builder = TrayIconBuilder::new()
+                            .with_tooltip(tooltip)
+                            .with_icon(load_codex_icon())
+                            .with_menu(Box::new(menu));
+                        #[cfg(target_os = "macos")]
+                        {
+                            builder = builder.with_icon_as_template(true);
+                        }
+                        match builder.build() {
+                            Ok(tray_icon) => self.tray_icon = Some(tray_icon),
+                            Err(error) => eprintln!("failed to create tray icon: {error:#}"),
+                        }
+                    }
+                    Err(error) => eprintln!("failed to build tray menu: {error:#}"),
+                }
+            }
+            Err(error) => eprintln!("failed to query app status and list: {error:#}"),
         }
     }
 
@@ -135,14 +146,185 @@ where
             }
             return;
         };
-        let command = self.commands.get(event.id.as_ref()).copied();
+        let command = self.commands.get(event.id.as_ref()).cloned();
         match command {
             Some(TrayCommand::Activate(account_id)) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("osascript").args(["-e", "quit app \"Codex\""]).output();
+                    let _ = std::process::Command::new("pkill").args(["-x", "Codex"]).output();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = std::process::Command::new("taskkill").args(["/f", "/im", "Codex.exe"]).output();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+
+                let mut activated_info = None;
+                match self.app.activate_with_running_policy(account_id, false) {
+                    Ok(output) => {
+                        let email = output.account.email.clone();
+                        let plan = format_plan_label_simple(output.account.plan_label.as_deref());
+                        activated_info = Some((email, plan));
+                    }
+                    Err(error) => {
+                        eprintln!("failed to activate account from tray: {error:#}");
+                    }
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("open").args(["-a", "Codex"]).spawn();
+                    if let Some((email, plan)) = activated_info {
+                        let msg = format!("Switched to account {email} ({plan}). Codex restarted.");
+                        let _ = std::process::Command::new("osascript")
+                            .arg("-e")
+                            .arg(format!(
+                                "display notification \"{}\" with title \"Codex Switcher\"",
+                                msg.replace('"', "\\\"")
+                            ))
+                            .spawn();
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = std::process::Command::new("cmd").args(["/c", "start", "", "Codex"]).spawn();
+                }
+
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
+            Some(TrayCommand::Login(account_id)) => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("osascript").args(["-e", "quit app \"Codex\""]).output();
+                    let _ = std::process::Command::new("pkill").args(["-x", "Codex"]).output();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = std::process::Command::new("taskkill").args(["/f", "/im", "Codex.exe"]).output();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+
                 if let Err(error) = self.app.activate_with_running_policy(account_id, false) {
                     eprintln!("failed to activate account from tray: {error:#}");
                 }
+
+                #[cfg(target_os = "macos")]
+                {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new("osascript")
+                            .arg("-e")
+                            .arg(format!(
+                                "tell application \"Terminal\" to do script \"codex login && '{}' save\"",
+                                exe.display()
+                            ))
+                            .spawn();
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/c", "start", "cmd", "/k", &format!("codex login && \"{}\" save", exe.display())])
+                            .spawn();
+                    }
+                }
                 if let Err(error) = self.update_tray_menu() {
                     eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
+            Some(TrayCommand::SaveCurrent) => {
+                let msg = match self.app.save_current() {
+                    Ok(output) => {
+                        format!(
+                            "Saved account {} successfully.",
+                            output.account.email
+                        )
+                    }
+                    Err(error) => {
+                        format!("Failed to save account: {error:#}")
+                    }
+                };
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("osascript")
+                        .arg("-e")
+                        .arg(format!(
+                            "display notification \"{}\" with title \"Codex Switcher\"",
+                            msg.replace('"', "\\\"")
+                        ))
+                        .spawn();
+                }
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
+            Some(TrayCommand::Delete(account_id, email)) => {
+                let confirmed = {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let script = format!(
+                            "tell application \"System Events\" to display dialog \"Are you sure you want to delete {}?\" buttons {{\"Cancel\", \"Delete\"}} default button \"Cancel\" with icon caution",
+                            email.replace('"', "\\\"")
+                        );
+                        let output = std::process::Command::new("osascript")
+                            .args(["-e", &script])
+                            .output();
+                        if let Ok(out) = output {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            stdout.contains("button returned:Delete")
+                        } else {
+                            false
+                        }
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        let script = format!(
+                            "Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('Are you sure you want to delete {}?', 'Confirm Delete', 'YesNo') -eq 'Yes'",
+                            email
+                        );
+                        let output = std::process::Command::new("powershell")
+                            .args(["-Command", &script])
+                            .output();
+                        if let Ok(out) = output {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            stdout.trim().eq_ignore_ascii_case("True")
+                        } else {
+                            false
+                        }
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                    {
+                        true
+                    }
+                };
+
+                if confirmed {
+                    match self.app.delete(account_id) {
+                        Ok(_) => {
+                            let msg = format!("Deleted account {} successfully.", email);
+                            #[cfg(target_os = "macos")]
+                            {
+                                let _ = std::process::Command::new("osascript")
+                                    .arg("-e")
+                                    .arg(format!(
+                                        "display notification \"{}\" with title \"Codex Switcher\"",
+                                        msg.replace('"', "\\\"")
+                                    ))
+                                    .spawn();
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("failed to delete account: {error:#}");
+                        }
+                    }
+                    if let Err(error) = self.update_tray_menu() {
+                        eprintln!("failed to refresh tray menu: {error:#}");
+                    }
                 }
             }
             Some(TrayCommand::SetAutoStartUsageWindows(enabled)) => {
@@ -157,9 +339,9 @@ where
                             if let Err(error) =
                                 crate::app::run_auto_start_usage_windows_check_now(env)
                             {
-                                eprintln!(
-                                    "failed to run auto-start usage window check from tray: {error:#}"
-                                );
+                                  eprintln!(
+                                      "failed to run auto-start usage window check from tray: {error:#}"
+                                  );
                             }
                             let _ = proxy.send_event(UserEvent::AutoStartUsageWindowsChecked);
                         });
@@ -168,9 +350,57 @@ where
                     eprintln!("failed to refresh tray menu: {error:#}");
                 }
             }
+            Some(TrayCommand::SetAutoSwitchOnLimit(enabled)) => {
+                if let Err(error) = self.app.set_auto_switch_on_limit(enabled) {
+                    eprintln!("failed to update auto-switch on limit from tray: {error:#}");
+                }
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
+            Some(TrayCommand::SetLaunchAtStartup(enabled)) => {
+                if let Err(error) = self.app.set_launch_at_startup(enabled) {
+                    eprintln!("failed to update launch at startup from tray: {error:#}");
+                }
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
             Some(TrayCommand::ShowTui) => {
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                {
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        #[cfg(target_os = "macos")]
+                        {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new("osascript")
+                                    .arg("-e")
+                                    .arg(format!(
+                                        "tell application \"Terminal\" to do script \"'{}'\"",
+                                        exe.display()
+                                    ))
+                                    .spawn();
+                            }
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new("cmd")
+                                    .args(["/c", "start", "cmd", "/k", &format!("\"{}\"", exe.display())])
+                                    .spawn();
+                            }
+                        }
+                        return;
+                    }
+                }
                 self.exit = TrayExit::ShowTui;
                 event_loop.exit();
+            }
+            Some(TrayCommand::Refresh) => {
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
             }
             Some(TrayCommand::Quit) => {
                 self.exit = TrayExit::Quit;
@@ -186,16 +416,49 @@ where
     S: SecretStore,
 {
     fn update_tray_menu(&mut self) -> Result<()> {
-        let menu = self.rebuild_menu()?;
+        let status = self.app.status()?;
+        let list = self.app.list()?;
+        let tooltip = self.get_tooltip_text(&status, &list);
+        let menu = self.rebuild_menu_with_status_and_list(&status, &list)?;
         if let Some(tray_icon) = &self.tray_icon {
+            let _ = tray_icon.set_tooltip(Some(&tooltip));
             tray_icon.set_menu(Some(Box::new(menu)));
         }
         Ok(())
     }
 
-    fn rebuild_menu(&mut self) -> Result<Menu> {
-        let status = self.app.status()?;
-        let list = self.app.list()?;
+    fn get_tooltip_text(
+        &self,
+        status: &crate::model::StatusOutput,
+        list: &crate::model::ListOutput,
+    ) -> String {
+        match &status.current_account {
+            Some(account) => {
+                let plan = format_plan_label_simple(account.plan_label.as_deref());
+                let active_account = find_active_tray_account(
+                    Some(account),
+                    status.current_account_saved_id,
+                    &list.accounts,
+                );
+                let usage_info = active_account.map(|act| {
+                    let (remaining, _) = account_usage_labels_simple(act);
+                    if remaining.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" - {remaining}")
+                    }
+                }).unwrap_or_default();
+                format!("Codex: {}{} ({})", account.email, usage_info, plan)
+            }
+            None => "Codex: Not logged in".to_owned(),
+        }
+    }
+
+    fn rebuild_menu_with_status_and_list(
+        &mut self,
+        status: &crate::model::StatusOutput,
+        list: &crate::model::ListOutput,
+    ) -> Result<Menu> {
         let menu = Menu::new();
         self.commands.clear();
 
@@ -206,39 +469,88 @@ where
         );
         let active_account_id = active_account.map(|account| account.id);
         let saved_accounts = tray_saved_accounts(&list.accounts, active_account_id);
-        let label_accounts = active_account
-            .into_iter()
-            .chain(saved_accounts.iter().copied())
-            .collect::<Vec<_>>();
-        let mut widths = tray_label_widths(&label_accounts);
-        if let Some(current) = &status.current_account {
-            widths.include_plan(current.plan_label.as_deref());
-        }
 
-        menu.append(&MenuItem::new("Active Account", false, None))?;
-        let active_label = status
-            .current_account
-            .as_ref()
-            .map(|account| active_account_label(account, active_account, widths))
-            .unwrap_or_else(|| "not logged in".to_owned());
-        menu.append(&MenuItem::new(format!("  {active_label}"), false, None))?;
+        menu.append(&MenuItem::new("ACTIVE ACCOUNT", false, None))?;
+        if let Some(current) = &status.current_account {
+            // Line 1: Full Email
+            menu.append(&MenuItem::new(format!("  {}", current.email), false, None))?;
+            
+            // Line 2: Details
+            let plan = format_plan_label_simple(current.plan_label.as_deref());
+            let (remaining, reset) = active_account.map(account_usage_labels_simple).unwrap_or_default();
+            
+            let needs_login = active_account.and_then(|a| a.usage_error.as_deref()).is_some_and(usage_error_requires_login);
+            if needs_login {
+                if let Some(act_acc) = active_account {
+                    let login_id = "login_active".to_owned();
+                    let item = MenuItem::with_id(
+                        MenuId::new(&login_id),
+                        format!("    {plan}  •  Click to Login"),
+                        true,
+                        None,
+                    );
+                    menu.append(&item)?;
+                    self.commands.insert(login_id, TrayCommand::Login(act_acc.id));
+                } else {
+                    let details = format_details_line(plan, remaining, reset, active_account.is_none().then_some("[not saved]"));
+                    menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
+                }
+            } else {
+                let details = format_details_line(plan, remaining, reset, active_account.is_none().then_some("[not saved]"));
+                menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
+            }
+
+            self.append_command(&menu, "save-current", "  Save Current Account", TrayCommand::SaveCurrent)?;
+        } else {
+            menu.append(&MenuItem::new("  not logged in", false, None))?;
+        }
         menu.append(&PredefinedMenuItem::separator())?;
 
-        menu.append(&MenuItem::new("Saved Accounts", false, None))?;
+        menu.append(&MenuItem::new("SAVED ACCOUNTS", false, None))?;
         if saved_accounts.is_empty() {
-            menu.append(&MenuItem::new("No saved accounts", false, None))?;
+            menu.append(&MenuItem::new("  No saved accounts", false, None))?;
         } else {
-            for account in saved_accounts {
+            for account in &saved_accounts {
                 let id = format!("activate:{}", account.id);
+                // Line 1: Full Email (clickable)
                 let item = MenuItem::with_id(
                     MenuId::new(&id),
-                    format!("  {}", tray_account_label(account, widths)),
+                    format!("  {}", account.email),
                     true,
                     None,
                 );
                 menu.append(&item)?;
                 self.commands.insert(id, TrayCommand::Activate(account.id));
+                
+                // Line 2: Details (non-clickable unless needs login)
+                let plan = format_plan_label_simple(account.plan_label.as_deref());
+                let (remaining, reset) = account_usage_labels_simple(account);
+                
+                let needs_login = account.usage_error.as_deref().is_some_and(usage_error_requires_login);
+                if needs_login {
+                    let login_id = format!("login:{}", account.id);
+                    let item = MenuItem::with_id(
+                        MenuId::new(&login_id),
+                        format!("    {plan}  •  Click to Login"),
+                        true,
+                        None,
+                    );
+                    menu.append(&item)?;
+                    self.commands.insert(login_id, TrayCommand::Login(account.id));
+                } else {
+                    let details = format_details_line(plan, remaining, reset, None);
+                    menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
+                }
             }
+            
+            menu.append(&PredefinedMenuItem::separator())?;
+            let delete_submenu = Submenu::new("  Delete Account", true);
+            for account in &saved_accounts {
+                let delete_id = format!("delete:{}", account.id);
+                delete_submenu.append(&MenuItem::with_id(MenuId::new(&delete_id), &account.email, true, None))?;
+                self.commands.insert(delete_id, TrayCommand::Delete(account.id, account.email.clone()));
+            }
+            menu.append(&delete_submenu)?;
         }
 
         menu.append(&PredefinedMenuItem::separator())?;
@@ -250,7 +562,24 @@ where
             auto_start_enabled,
             TrayCommand::SetAutoStartUsageWindows(!auto_start_enabled),
         )?;
+        let auto_switch_enabled = self.app.auto_switch_on_limit_status()?.enabled;
+        self.append_check_command(
+            &menu,
+            "toggle-auto-switch-on-limit",
+            "Auto-switch on limit",
+            auto_switch_enabled,
+            TrayCommand::SetAutoSwitchOnLimit(!auto_switch_enabled),
+        )?;
+        let launch_at_startup_enabled = self.app.launch_at_startup_status()?.enabled;
+        self.append_check_command(
+            &menu,
+            "toggle-launch-at-startup",
+            "Launch at Login",
+            launch_at_startup_enabled,
+            TrayCommand::SetLaunchAtStartup(!launch_at_startup_enabled),
+        )?;
         self.append_command(&menu, "show-tui", "Show TUI", TrayCommand::ShowTui)?;
+        self.append_command(&menu, "refresh", "Refresh", TrayCommand::Refresh)?;
         self.append_command(&menu, "quit", "Quit", TrayCommand::Quit)?;
         Ok(menu)
     }
@@ -287,28 +616,6 @@ where
     }
 }
 
-fn active_account_label(
-    account: &DisplayIdentity,
-    saved_account: Option<&AccountView>,
-    widths: TrayLabelWidths,
-) -> String {
-    let plan = format_plan_label(account.plan_label.as_deref(), widths);
-    let (remaining, reset) = saved_account.map(account_usage_labels).unwrap_or_default();
-    let remaining = format!("{:<width$}", remaining, width = widths.remaining);
-    let reset = format!("{:<width$}", reset, width = widths.reset);
-    let saved_marker = saved_account.is_none().then_some("[not saved]");
-    tray_row_label(&account.email, [plan, remaining, reset], saved_marker)
-}
-
-fn tray_account_label(account: &AccountView, widths: TrayLabelWidths) -> String {
-    let plan = format_plan_label(account.plan_label.as_deref(), widths);
-    let (remaining, reset) = account_usage_labels(account);
-    let remaining = format!("{:<width$}", remaining, width = widths.remaining);
-    let reset = format!("{:<width$}", reset, width = widths.reset);
-
-    tray_row_label(&account.email, [plan, remaining, reset], None)
-}
-
 fn tray_saved_accounts(
     accounts: &[AccountView],
     active_account_id: Option<Uuid>,
@@ -342,97 +649,76 @@ fn account_matches_identity(account: &AccountView, identity: &DisplayIdentity) -
     }
 }
 
-fn tray_row_label<const N: usize>(
-    email: &str,
-    details: [String; N],
-    marker: Option<&str>,
-) -> String {
-    let details = details
-        .into_iter()
-        .chain(marker.map(str::to_owned))
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("  ");
-    if details.is_empty() {
-        email.to_owned()
-    } else {
-        format!(
-            "{}{separator}{details}",
-            email,
-            separator = tray_detail_separator()
-        )
-    }
+fn format_plan_label_simple(plan: Option<&str>) -> String {
+    plan.map(|p| {
+        match p.to_ascii_lowercase().as_str() {
+            "free" => "Free".to_owned(),
+            "plus" => "Plus".to_owned(),
+            "k12" => "K12".to_owned(),
+            other => other.to_owned(),
+        }
+    })
+    .unwrap_or_else(|| "Free".to_owned())
 }
 
-fn tray_detail_separator() -> &'static str {
-    if cfg!(windows) { "\t" } else { "  " }
-}
-
-fn format_plan_label(plan: Option<&str>, widths: TrayLabelWidths) -> String {
-    format!(
-        "{:<width$}",
-        plan.map(|plan| format!("Plan: {plan}")).unwrap_or_default(),
-        width = widths.plan
-    )
-}
-
-fn tray_label_widths(accounts: &[&AccountView]) -> TrayLabelWidths {
-    let mut widths = TrayLabelWidths::default();
-    for account in accounts {
-        widths.include_plan(account.plan_label.as_deref());
-        let (remaining, reset) = account_usage_labels(account);
-        widths.remaining = widths.remaining.max(visible_width(&remaining));
-        widths.reset = widths.reset.max(visible_width(&reset));
-    }
-    widths
-}
-
-impl TrayLabelWidths {
-    fn include_plan(&mut self, plan: Option<&str>) {
-        self.plan = self.plan.max(
-            plan.map(|plan| visible_width(&format!("Plan: {plan}")))
-                .unwrap_or_default(),
-        );
-    }
-}
-
-fn account_usage_labels(account: &AccountView) -> (String, String) {
+fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
     if account
         .usage_error
         .as_deref()
         .is_some_and(usage_error_requires_login)
     {
         (
-            usage_error_label(account.usage_error.as_deref().unwrap_or_default()).to_owned(),
+            "Login required".to_owned(),
             String::new(),
         )
     } else if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
         if weekly.reset_at <= OffsetDateTime::now_utc() {
-            ("Weekly Remaining: passed".to_owned(), String::new())
+            ("Quota passed".to_owned(), String::new())
         } else {
             (
                 format!(
-                    "Weekly Remaining: {}%",
-                    format_remaining_percent(weekly.remaining_percent)
+                    "{}% remaining",
+                    format_remaining_percent(weekly.remaining_percent).trim()
                 ),
-                format!("Reset: {}", format_local_reset_at(weekly.reset_at)),
+                format!("Reset: {}", format_short_reset_at(weekly.reset_at)),
             )
         }
     } else if let Some(error) = &account.usage_error {
-        (usage_error_label(error).to_owned(), String::new())
+        if error.to_lowercase().contains("login required") {
+            ("Login required".to_owned(), String::new())
+        } else {
+            ("Error".to_owned(), String::new())
+        }
     } else {
         (String::new(), String::new())
     }
 }
 
-fn format_remaining_percent(percent: u8) -> String {
-    format!("{percent:>3}").replace(' ', "\u{2007}")
+fn format_details_line(plan: String, remaining: String, reset: String, marker: Option<&str>) -> String {
+    let mut parts = vec![plan];
+    if !remaining.is_empty() {
+        parts.push(remaining);
+    }
+    if !reset.is_empty() {
+        parts.push(reset);
+    }
+    if let Some(m) = marker {
+        parts.push(m.to_owned());
+    }
+    parts.join("  •  ")
 }
 
-fn visible_width(text: &str) -> usize {
-    text.chars().count()
+fn format_short_reset_at(reset_at: OffsetDateTime) -> String {
+    let local = UtcOffset::local_offset_at(reset_at)
+        .map(|offset| reset_at.to_offset(offset))
+        .unwrap_or(reset_at);
+    format!("{:02}/{:02} {:02}:{:02}", local.month() as u8, local.day(), local.hour(), local.minute())
+}
+
+fn format_remaining_percent(percent: u8) -> String {
+    format!("{percent:>3}").replace(' ', "\u{2007}")
 }
 
 fn load_codex_icon() -> Icon {
@@ -446,13 +732,16 @@ fn load_codex_icon() -> Icon {
 }
 
 pub(crate) fn hide_console_window() {
+    #[cfg(target_os = "windows")]
     release_console();
 }
 
 pub(crate) fn show_console_window() {
+    #[cfg(target_os = "windows")]
     allocate_console();
 }
 
+#[cfg(target_os = "windows")]
 fn release_console() {
     use windows_sys::Win32::System::Console::FreeConsole;
 
@@ -461,6 +750,7 @@ fn release_console() {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn allocate_console() {
     use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
@@ -487,14 +777,17 @@ fn candidate_icon_paths() -> Vec<PathBuf> {
         paths.push(dir.join("icon.ico"));
         paths.push(dir.join("icon.png"));
     }
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        let windows_apps = PathBuf::from(program_files).join("WindowsApps");
-        if let Ok(entries) = std::fs::read_dir(windows_apps) {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.starts_with("OpenAI.Codex_") {
-                    paths.push(entry.path().join("app").join("resources").join("icon.ico"));
-                    paths.push(entry.path().join("app").join("assets").join("icon.png"));
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            let windows_apps = PathBuf::from(program_files).join("WindowsApps");
+            if let Ok(entries) = std::fs::read_dir(windows_apps) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if file_name.starts_with("OpenAI.Codex_") {
+                        paths.push(entry.path().join("app").join("resources").join("icon.ico"));
+                        paths.push(entry.path().join("app").join("assets").join("icon.png"));
+                    }
                 }
             }
         }
@@ -540,84 +833,26 @@ fn fallback_icon() -> Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AccountUsageView, EnvironmentKind, UsageSource, UsageWindowView};
-    use time::{Date, Month, OffsetDateTime, Time};
+    use crate::model::EnvironmentKind;
+    use time::OffsetDateTime;
 
     #[test]
-    fn tray_account_label_includes_usage_table_columns() {
-        let reset_at = OffsetDateTime::UNIX_EPOCH
-            .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
-            .replace_time(Time::from_hms(0, 52, 0).unwrap());
-        let mut account = AccountView {
-            id: Uuid::new_v4(),
-            email: "person@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
-            name: None,
-            plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
-            is_active: true,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-            last_activated_at: None,
-            usage: None,
-            usage_error: None,
-        };
-        account.usage = Some(AccountUsageView {
-            source: UsageSource::SavedAccessToken,
-            fetched_at: OffsetDateTime::UNIX_EPOCH,
-            five_hour: None,
-            weekly: Some(UsageWindowView {
-                used_percent: 83,
-                remaining_percent: 17,
-                reset_at,
-            }),
-            credits: None,
-        });
-
-        assert_eq!(
-            tray_account_label(&account, tray_label_widths(&[&account])),
-            format!(
-                "person@example.com{}Plan: Pro  Weekly Remaining: \u{2007}17%  Reset: {}",
-                tray_detail_separator(),
-                format_local_reset_at(reset_at)
-            )
-        );
+    fn test_format_plan_label_simple() {
+        assert_eq!(format_plan_label_simple(Some("pro")), "pro");
+        assert_eq!(format_plan_label_simple(Some("Free")), "Free");
+        assert_eq!(format_plan_label_simple(None), "Free");
     }
 
     #[test]
-    fn tray_account_label_marks_login_required_usage_error() {
-        let account = AccountView {
-            id: Uuid::new_v4(),
-            email: "person@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
-            name: None,
-            plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
-            is_active: false,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-            last_activated_at: None,
-            usage: Some(AccountUsageView {
-                source: UsageSource::SavedAccessToken,
-                fetched_at: OffsetDateTime::UNIX_EPOCH,
-                five_hour: None,
-                weekly: Some(UsageWindowView {
-                    used_percent: 0,
-                    remaining_percent: 100,
-                    reset_at: OffsetDateTime::UNIX_EPOCH
-                        .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
-                        .replace_time(Time::from_hms(13, 56, 0).unwrap()),
-                }),
-                credits: None,
-            }),
-            usage_error: Some("Login required: Codex auth expired.".to_owned()),
-        };
-
-        let label = tray_account_label(&account, tray_label_widths(&[&account]));
-
-        assert!(label.contains("Login required"));
-        assert!(!label.contains("Usage unavailable"));
-        assert!(!label.contains("Weekly Remaining"));
+    fn test_format_details_line() {
+        assert_eq!(
+            format_details_line("Plus".to_owned(), "17% remaining".to_owned(), "Reset: 05/12 00:52".to_owned(), None),
+            "Plus  •  17% remaining  •  Reset: 05/12 00:52"
+        );
+        assert_eq!(
+            format_details_line("Free".to_owned(), String::new(), String::new(), Some("[not saved]")),
+            "Free  •  [not saved]"
+        );
     }
 
     #[test]
@@ -690,72 +925,5 @@ mod tests {
 
         assert!(find_active_tray_account(Some(&matching_identity), None, &accounts).is_some());
         assert!(find_active_tray_account(Some(&mismatched_identity), None, &accounts).is_none());
-    }
-
-    #[test]
-    fn active_account_label_keeps_live_identity_and_saved_usage() {
-        let reset_at = OffsetDateTime::UNIX_EPOCH
-            .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
-            .replace_time(Time::from_hms(0, 52, 0).unwrap());
-        let mut saved_account = AccountView {
-            id: Uuid::new_v4(),
-            email: "stale@example.com".to_owned(),
-            subject: Some("sub".to_owned()),
-            name: None,
-            plan_label: Some("Pro".to_owned()),
-            environment: EnvironmentKind::Windows,
-            is_active: true,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-            last_activated_at: None,
-            usage: None,
-            usage_error: None,
-        };
-        saved_account.usage = Some(AccountUsageView {
-            source: UsageSource::SavedAccessToken,
-            fetched_at: OffsetDateTime::UNIX_EPOCH,
-            five_hour: None,
-            weekly: Some(UsageWindowView {
-                used_percent: 83,
-                remaining_percent: 17,
-                reset_at,
-            }),
-            credits: None,
-        });
-        let account = DisplayIdentity {
-            email: "person@example.com".to_owned(),
-            subject: None,
-            name: None,
-            plan_label: Some("ProLite".to_owned()),
-        };
-        let mut widths = tray_label_widths(&[&saved_account]);
-        widths.include_plan(account.plan_label.as_deref());
-
-        assert_eq!(
-            active_account_label(&account, Some(&saved_account), widths),
-            format!(
-                "person@example.com{}Plan: ProLite  Weekly Remaining: \u{2007}17%  Reset: {}",
-                tray_detail_separator(),
-                format_local_reset_at(reset_at)
-            )
-        );
-    }
-
-    #[test]
-    fn active_account_label_marks_unsaved_current_account() {
-        let account = DisplayIdentity {
-            email: "person@example.com".to_owned(),
-            subject: None,
-            name: None,
-            plan_label: Some("Plus".to_owned()),
-        };
-
-        assert_eq!(
-            active_account_label(&account, None, TrayLabelWidths::default()),
-            format!(
-                "person@example.com{}Plan: Plus  [not saved]",
-                tray_detail_separator()
-            )
-        );
     }
 }

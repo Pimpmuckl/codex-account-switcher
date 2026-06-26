@@ -40,6 +40,10 @@ where
             });
             let auto_start_usage_windows_enabled = matches!(mode, InteractiveMode::Persistent)
                 && self.auto_start_usage_windows_status()?.enabled;
+            let auto_switch_on_limit_enabled = matches!(mode, InteractiveMode::Persistent)
+                && self.auto_switch_on_limit_status()?.enabled;
+            let launch_at_startup_enabled = matches!(mode, InteractiveMode::Persistent)
+                && self.launch_at_startup_status()?.enabled;
 
             let menu = build_menu(
                 mode,
@@ -47,6 +51,8 @@ where
                 &list,
                 current_saved,
                 auto_start_usage_windows_enabled,
+                auto_switch_on_limit_enabled,
+                launch_at_startup_enabled,
             );
             let selection = match mode {
                 InteractiveMode::Persistent => {
@@ -223,7 +229,53 @@ where
                         }
                     }
                 }
-                #[cfg(windows)]
+                InteractiveAction::SetAutoSwitchOnLimit(enabled) => {
+                    match self.set_auto_switch_on_limit(enabled) {
+                        Ok(output) => feedback.push(format!(
+                            "Auto-switch on limit {}.",
+                            if output.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        )),
+                        Err(error) => {
+                            feedback =
+                                error_feedback("Updating auto-switch on limit failed.", error);
+                            continue;
+                        }
+                    }
+                    if enabled {
+                        match self.auto_switch_on_limit_once() {
+                            Ok(Some(target_id)) => {
+                                feedback.push(format!("Auto-switched to account ID {}.", target_id));
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                feedback =
+                                    error_feedback("Initial auto-switch check failed.", error);
+                            }
+                        }
+                    }
+                }
+                InteractiveAction::SetLaunchAtStartup(enabled) => {
+                    match self.set_launch_at_startup(enabled) {
+                        Ok(output) => feedback.push(format!(
+                            "Launch at startup {}.",
+                            if output.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        )),
+                        Err(error) => {
+                            feedback =
+                                error_feedback("Updating launch at startup failed.", error);
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 InteractiveAction::SendToTray => return Ok(InteractiveExit::SendToTray),
                 InteractiveAction::Quit => break,
             }
@@ -240,7 +292,9 @@ pub(crate) enum InteractiveAction {
     DeletePrompt,
     ShowStatus,
     SetAutoStartUsageWindows(bool),
-    #[cfg(windows)]
+    SetAutoSwitchOnLimit(bool),
+    SetLaunchAtStartup(bool),
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     SendToTray,
     Quit,
 }
@@ -399,6 +453,8 @@ pub(crate) fn build_menu(
     list: &ListOutput,
     current_saved: Option<Uuid>,
     auto_start_usage_windows_enabled: bool,
+    auto_switch_on_limit_enabled: bool,
+    launch_at_startup_enabled: bool,
 ) -> InteractiveMenu {
     let active_account = current_saved
         .and_then(|saved_id| list.accounts.iter().find(|account| account.id == saved_id));
@@ -473,12 +529,32 @@ pub(crate) fn build_menu(
             action: InteractiveAction::SetAutoStartUsageWindows(!auto_start_usage_windows_enabled),
         });
         actions.push(InteractiveItem {
+            label: if auto_switch_on_limit_enabled {
+                "Disable auto-switch on limit".to_owned()
+            } else {
+                "Enable auto-switch on limit".to_owned()
+            },
+            action: InteractiveAction::SetAutoSwitchOnLimit(!auto_switch_on_limit_enabled),
+        });
+        actions.push(InteractiveItem {
+            label: if launch_at_startup_enabled {
+                "Disable launch at startup".to_owned()
+            } else {
+                "Enable launch at startup".to_owned()
+            },
+            action: InteractiveAction::SetLaunchAtStartup(!launch_at_startup_enabled),
+        });
+        actions.push(InteractiveItem {
             label: "Show status".to_owned(),
             action: InteractiveAction::ShowStatus,
         });
-        #[cfg(windows)]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         actions.push(InteractiveItem {
-            label: "Send to Tray".to_owned(),
+            label: if cfg!(target_os = "macos") {
+                "Send to Menu Bar".to_owned()
+            } else {
+                "Send to Tray".to_owned()
+            },
             action: InteractiveAction::SendToTray,
         });
     }
@@ -1021,6 +1097,8 @@ mod tests {
             &sample_list(id, true),
             Some(id),
             false,
+            false,
+            false,
         );
         assert_eq!(menu.prompt, "");
         assert_eq!(menu.accounts.len(), 0);
@@ -1036,6 +1114,8 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, true),
             Some(id),
+            false,
+            false,
             false,
         );
         assert_eq!(menu.prompt, "Which saved account do you want to delete?");
@@ -1053,6 +1133,8 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, false),
             Some(id),
+            false,
+            false,
             false,
         );
         assert_eq!(menu.accounts.len(), 1);
@@ -1072,6 +1154,8 @@ mod tests {
             &sample_list(id, false),
             Some(id),
             false,
+            false,
+            false,
         );
         let disabled_toggle = disabled_menu
             .actions
@@ -1089,6 +1173,8 @@ mod tests {
             &sample_list(id, false),
             Some(id),
             true,
+            false,
+            false,
         );
         let enabled_toggle = enabled_menu
             .actions
@@ -1125,6 +1211,8 @@ mod tests {
             &sample_list(id, false),
             Some(id),
             false,
+            false,
+            false,
         );
         assert_eq!(jump_section(&menu, 0), 1);
         assert_eq!(jump_section(&menu, 1), 0);
@@ -1138,6 +1226,8 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, true),
             Some(id),
+            false,
+            false,
             false,
         );
         assert_eq!(menu.accounts.len(), 0);
@@ -1176,6 +1266,8 @@ mod tests {
             &status,
             &sample_list(id, false),
             None,
+            false,
+            false,
             false,
         );
         assert_eq!(
@@ -1226,7 +1318,7 @@ mod tests {
         let app = App::new(env, repo);
         let status = app.status().expect("status");
         let list = app.list().expect("list");
-        let menu = build_menu(InteractiveMode::Persistent, &status, &list, None, false);
+        let menu = build_menu(InteractiveMode::Persistent, &status, &list, None, false, false, false);
         assert_eq!(menu.accounts.len(), 1);
         assert!(menu.actions.iter().any(|item| item.label == "Show status"));
     }
