@@ -41,18 +41,15 @@ pub struct SnapshotFile {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisplayIdentity {
+    pub account_key: String,
     pub email: String,
-    pub subject: Option<String>,
     pub name: Option<String>,
     pub plan_label: Option<String>,
 }
 
 impl DisplayIdentity {
     pub fn matches(&self, other: &Self) -> bool {
-        match (&self.subject, &other.subject) {
-            (Some(left), Some(right)) => left == right,
-            _ => self.email.eq_ignore_ascii_case(&other.email),
-        }
+        self.account_key == other.account_key
     }
 }
 
@@ -60,31 +57,24 @@ impl DisplayIdentity {
 mod tests {
     use super::DisplayIdentity;
 
-    fn identity(email: &str, subject: Option<&str>) -> DisplayIdentity {
+    fn identity(email: &str, account_key: &str) -> DisplayIdentity {
         DisplayIdentity {
+            account_key: account_key.to_owned(),
             email: email.to_owned(),
-            subject: subject.map(str::to_owned),
             name: None,
             plan_label: None,
         }
     }
 
     #[test]
-    fn matches_falls_back_to_email_when_either_subject_is_missing() {
+    fn matches_uses_account_key_only() {
         assert!(
-            identity("person@example.com", Some("sub-1"))
-                .matches(&identity("PERSON@example.com", None))
+            identity("person@example.com", "account-1")
+                .matches(&identity("other@example.com", "account-1"))
         );
         assert!(
-            identity("person@example.com", None)
-                .matches(&identity("PERSON@example.com", Some("sub-1")))
-        );
-        assert!(
-            identity("person@example.com", None).matches(&identity("PERSON@example.com", None))
-        );
-        assert!(
-            !identity("person@example.com", Some("sub-1"))
-                .matches(&identity("other@example.com", None))
+            !identity("person@example.com", "account-1")
+                .matches(&identity("person@example.com", "account-2"))
         );
     }
 }
@@ -92,9 +82,11 @@ mod tests {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedAccountMetadata {
     pub id: Uuid,
-    pub environment: EnvironmentKind,
+    #[serde(default, deserialize_with = "optional_string")]
+    pub account_key: String,
+    #[serde(default, rename = "subject", skip_serializing)]
+    pub(crate) legacy_subject: Option<String>,
     pub email: String,
-    pub subject: Option<String>,
     pub name: Option<String>,
     pub plan_label: Option<String>,
     pub secret_key: String,
@@ -105,6 +97,13 @@ pub struct SavedAccountMetadata {
     pub cached_usage: Option<AccountUsageView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_usage_error: Option<String>,
+}
+
+fn optional_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -118,11 +117,10 @@ pub struct MetadataIndex {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountView {
     pub id: Uuid,
+    pub account_key: String,
     pub email: String,
-    pub subject: Option<String>,
     pub name: Option<String>,
     pub plan_label: Option<String>,
-    pub environment: EnvironmentKind,
     pub is_active: bool,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,

@@ -889,7 +889,7 @@ mod tests {
             codex_root: "C:\\Users\\tester\\.codex".to_owned(),
             current_account: current_saved_id.map(|_| DisplayIdentity {
                 email: email.to_owned(),
-                subject: Some("sub-1".to_owned()),
+                account_key: "sub-1".to_owned(),
                 name: Some("Tester".to_owned()),
                 plan_label: Some("Pro".to_owned()),
             }),
@@ -909,10 +909,9 @@ mod tests {
             accounts: vec![AccountView {
                 id,
                 email: "person@example.com".to_owned(),
-                subject: Some("sub-1".to_owned()),
+                account_key: "sub-1".to_owned(),
                 name: Some("Tester".to_owned()),
                 plan_label: Some("Pro".to_owned()),
-                environment: EnvironmentKind::Windows,
                 is_active,
                 created_at: OffsetDateTime::UNIX_EPOCH,
                 updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -1163,7 +1162,7 @@ mod tests {
             codex_root: "C:\\Users\\tester\\.codex".to_owned(),
             current_account: Some(DisplayIdentity {
                 email: "other@example.com".to_owned(),
-                subject: Some("sub-2".to_owned()),
+                account_key: "sub-2".to_owned(),
                 name: Some("Other".to_owned()),
                 plan_label: Some("Plus".to_owned()),
             }),
@@ -1210,10 +1209,9 @@ mod tests {
         std::fs::write(env.codex_root.join("cap_sid"), "sid-current").expect("cap");
         let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
         repo.save_snapshot(
-            &env.kind,
             &DisplayIdentity {
                 email: "saved@example.com".to_owned(),
-                subject: Some("sub-1".to_owned()),
+                account_key: "sub-1".to_owned(),
                 name: None,
                 plan_label: Some("Pro".to_owned()),
             },

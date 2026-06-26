@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -23,14 +23,13 @@ pub(super) fn encode_snapshot(snapshot: &SnapshotBlob) -> Result<Vec<u8>> {
 }
 
 pub(super) fn decode_snapshot(encoded: &[u8]) -> Result<SnapshotBlob> {
-    if let Some(compressed) = encoded.strip_prefix(SNAPSHOT_ENCODING_V1_MAGIC) {
-        let mut decoder = GzDecoder::new(compressed);
-        let mut serialized = Vec::new();
-        decoder
-            .read_to_end(&mut serialized)
-            .context("failed to decompress stored snapshot")?;
-        return serde_json::from_slice(&serialized).context("failed to parse stored snapshot");
-    }
-
-    serde_json::from_slice(encoded).context("failed to parse stored snapshot")
+    let Some(compressed) = encoded.strip_prefix(SNAPSHOT_ENCODING_V1_MAGIC) else {
+        bail!("unsupported stored snapshot encoding; re-save that account");
+    };
+    let mut decoder = GzDecoder::new(compressed);
+    let mut serialized = Vec::new();
+    decoder
+        .read_to_end(&mut serialized)
+        .context("failed to decompress stored snapshot")?;
+    serde_json::from_slice(&serialized).context("failed to parse stored snapshot")
 }

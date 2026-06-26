@@ -1130,12 +1130,14 @@ fn snapshot_files<'a>(snapshot: &'a SnapshotBlob, file_name: &str) -> Vec<&'a st
 }
 
 #[cfg(test)]
-pub fn auth_json_fixture(email: &str, subject: &str, plan: Option<&str>) -> String {
+pub fn auth_json_fixture(email: &str, account_key: &str, plan: Option<&str>) -> String {
     let payload = serde_json::json!({
         "email": email,
-        "sub": subject,
+        "sub": account_key,
         "name": "Tester",
         "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_key,
+            "user_id": account_key,
             "chatgpt_plan_type": plan
         }
     });
@@ -1186,10 +1188,10 @@ mod tests {
         }
     }
 
-    fn identity(email: &str, subject: &str) -> DisplayIdentity {
+    fn identity(email: &str, account_key: &str) -> DisplayIdentity {
         DisplayIdentity {
             email: email.to_owned(),
-            subject: Some(subject.to_owned()),
+            account_key: account_key.to_owned(),
             name: Some("Tester".to_owned()),
             plan_label: Some("Pro".to_owned()),
         }
@@ -1427,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_verification_uses_case_insensitive_email_when_subject_missing() -> Result<()> {
+    fn restore_verification_uses_account_key_when_email_case_changes() -> Result<()> {
         let temp = tempdir()?;
         let codex_root = temp.path().join(".codex");
         fs::create_dir_all(&codex_root)?;
@@ -1445,7 +1447,7 @@ mod tests {
         let bundle = read_live_auth_bundle(&env)?;
         let expected = DisplayIdentity {
             email: "person@example.com".to_owned(),
-            subject: None,
+            account_key: bundle.identity.account_key.clone(),
             name: bundle.identity.name.clone(),
             plan_label: bundle.identity.plan_label.clone(),
         };
@@ -2393,7 +2395,7 @@ mod tests {
         };
         let expected = DisplayIdentity {
             email: "after@example.com".to_owned(),
-            subject: Some("sub-2".to_owned()),
+            account_key: "sub-2".to_owned(),
             name: Some("Tester".to_owned()),
             plan_label: Some("Plus".to_owned()),
         };
@@ -2438,7 +2440,7 @@ mod tests {
         };
         let expected = DisplayIdentity {
             email: "after@example.com".to_owned(),
-            subject: Some("sub-2".to_owned()),
+            account_key: "sub-2".to_owned(),
             name: Some("Tester".to_owned()),
             plan_label: Some("Plus".to_owned()),
         };

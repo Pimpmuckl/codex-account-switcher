@@ -50,7 +50,7 @@ pub fn fetch_usage(target: UsageTarget) -> Result<(UsageOutput, SnapshotBlob)> {
         target.snapshot
     };
 
-    let fetched_identity = merge_identity(&target.identity, response.identity()?);
+    let fetched_identity = response.merged_identity(&target.identity);
     Ok((
         UsageOutput {
             environment: target.environment,
@@ -164,16 +164,14 @@ struct ErrorResponse {
 }
 
 impl UsageResponse {
-    fn identity(&self) -> Result<Option<DisplayIdentity>> {
-        let Some(email) = &self.email else {
-            return Ok(None);
-        };
-        Ok(Some(DisplayIdentity {
-            email: email.clone(),
-            subject: None,
-            name: None,
-            plan_label: normalize_plan_label(self.plan_type.as_deref()),
-        }))
+    fn merged_identity(&self, base: &DisplayIdentity) -> DisplayIdentity {
+        DisplayIdentity {
+            account_key: base.account_key.clone(),
+            email: self.email.clone().unwrap_or_else(|| base.email.clone()),
+            name: base.name.clone(),
+            plan_label: normalize_plan_label(self.plan_type.as_deref())
+                .or_else(|| base.plan_label.clone()),
+        }
     }
 
     fn into_view(self, source: UsageSource) -> Result<AccountUsageView> {
@@ -374,18 +372,6 @@ fn normalize_plan_label(raw: Option<&str>) -> Option<String> {
         "pro" => Some("Pro".to_owned()),
         "free" => Some("Free".to_owned()),
         other => Some(other.to_owned()),
-    }
-}
-
-fn merge_identity(base: &DisplayIdentity, fetched: Option<DisplayIdentity>) -> DisplayIdentity {
-    let Some(fetched) = fetched else {
-        return base.clone();
-    };
-    DisplayIdentity {
-        email: fetched.email,
-        subject: base.subject.clone(),
-        name: base.name.clone(),
-        plan_label: fetched.plan_label.or_else(|| base.plan_label.clone()),
     }
 }
 

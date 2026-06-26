@@ -29,14 +29,23 @@ pub fn parse_identity_from_id_token(id_token: &str) -> Result<DisplayIdentity> {
         .context("failed to decode JWT payload")?;
     let claims: Value =
         serde_json::from_slice(&payload_bytes).context("failed to parse JWT payload")?;
-    let email = claims
-        .get("email")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("JWT payload did not contain email"))?
-        .to_owned();
-    let subject = claims.get("sub").and_then(Value::as_str).map(str::to_owned);
+    let email = string_claim(&claims, "email")
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(Value::as_object)
+                .and_then(|profile| object_string_claim(profile, "email"))
+        })
+        .ok_or_else(|| anyhow!("JWT payload did not contain email"))?;
+    let auth_claims = claims
+        .get("https://api.openai.com/auth")
+        .and_then(Value::as_object);
+    let account_key = auth_claims
+        .and_then(|auth| object_string_claim(auth, "chatgpt_account_id"))
+        .or_else(|| auth_claims.and_then(|auth| object_string_claim(auth, "chatgpt_user_id")))
+        .or_else(|| auth_claims.and_then(|auth| object_string_claim(auth, "user_id")))
+        .or_else(|| string_claim(&claims, "sub"))
+        .ok_or_else(|| anyhow!("JWT payload did not contain a supported ChatGPT account id"))?;
     let name = claims
         .get("name")
         .and_then(Value::as_str)
@@ -50,11 +59,29 @@ pub fn parse_identity_from_id_token(id_token: &str) -> Result<DisplayIdentity> {
         .and_then(Value::as_str)
         .and_then(normalize_plan_label);
     Ok(DisplayIdentity {
+        account_key,
         email,
-        subject,
         name,
         plan_label,
     })
+}
+
+fn string_claim(claims: &Value, key: &str) -> Option<String> {
+    claims
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn object_string_claim(claims: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    claims
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn normalize_plan_label(raw: &str) -> Option<String> {
@@ -102,11 +129,27 @@ mod tests {
     #[test]
     fn parses_email_and_plan() {
         let token = token(
-            r#"{"email":"person@example.com","sub":"abc","name":"Jane","https://api.openai.com/auth":{"chatgpt_plan_type":"pro_lite"}}"#,
+            r#"{"email":"person@example.com","sub":"abc","name":"Jane","https://api.openai.com/auth":{"chatgpt_account_id":"account-123","chatgpt_plan_type":"pro_lite"}}"#,
         );
         let identity = parse_identity_from_id_token(&token).expect("identity");
         assert_eq!(identity.email, "person@example.com");
-        assert_eq!(identity.subject.as_deref(), Some("abc"));
+        assert_eq!(identity.account_key, "account-123");
         assert_eq!(identity.plan_label.as_deref(), Some("Pro Lite"));
+    }
+
+    #[test]
+    fn falls_back_to_subject_when_chatgpt_account_claim_is_missing() {
+        let token = token(r#"{"email":"person@example.com","sub":"sub-123"}"#);
+        let identity = parse_identity_from_id_token(&token).expect("identity");
+
+        assert_eq!(identity.account_key, "sub-123");
+    }
+
+    #[test]
+    fn rejects_tokens_without_account_key() {
+        let token = token(r#"{"email":"person@example.com"}"#);
+        let error = parse_identity_from_id_token(&token).expect_err("identity should fail");
+
+        assert!(format!("{error:#}").contains("supported ChatGPT account id"));
     }
 }

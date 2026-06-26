@@ -53,11 +53,10 @@ fn account_view(
     };
     AccountView {
         id: account.id,
+        account_key: account.account_key,
         email: account.email,
-        subject: account.subject,
         name: account.name,
         plan_label: account.plan_label,
-        environment: account.environment,
         is_active: active_id.is_some_and(|id| id == account.id),
         created_at: account.created_at,
         updated_at: account.updated_at,
@@ -78,8 +77,8 @@ fn match_saved_account<'a>(
 
 fn account_view_matches_identity(account: &AccountView, identity: &DisplayIdentity) -> bool {
     DisplayIdentity {
+        account_key: account.account_key.clone(),
         email: account.email.clone(),
-        subject: account.subject.clone(),
         name: account.name.clone(),
         plan_label: account.plan_label.clone(),
     }
@@ -88,17 +87,10 @@ fn account_view_matches_identity(account: &AccountView, identity: &DisplayIdenti
 
 fn saved_identity(account: &SavedAccountMetadata) -> DisplayIdentity {
     DisplayIdentity {
+        account_key: account.account_key.clone(),
         email: account.email.clone(),
-        subject: account.subject.clone(),
         name: account.name.clone(),
         plan_label: account.plan_label.clone(),
-    }
-}
-
-fn subject_bound_identity_matches(expected: &DisplayIdentity, snapshot: &DisplayIdentity) -> bool {
-    match (&expected.subject, &snapshot.subject) {
-        (Some(left), Some(right)) => left == right,
-        _ => false,
     }
 }
 

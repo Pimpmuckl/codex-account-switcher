@@ -11,7 +11,7 @@ use crate::model::{
 };
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
-use crate::secrets::MigratingSecretStore;
+use crate::secrets::LocalSecretStore;
 use crate::usage::{usage_error_label, usage_error_requires_login};
 
 #[derive(Parser)]
@@ -73,7 +73,7 @@ pub fn run() -> Result<()> {
     let env = env::detect()?;
     let repository = SnapshotRepository::new(
         &env.app_data_dir,
-        MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),
+        LocalSecretStore::new(&env.app_data_dir.join("snapshots")),
     );
     let app = App::new(env, repository);
     match cli.command {

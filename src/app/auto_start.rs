@@ -19,7 +19,7 @@ use crate::model::{
     AutoStartUsageWindowsStatusOutput, DisplayIdentity, SnapshotBlob,
 };
 use crate::repository::SnapshotRepository;
-use crate::secrets::{MigratingSecretStore, SecretStore};
+use crate::secrets::{LocalSecretStore, SecretStore};
 use crate::settings::{load_settings, save_settings};
 
 use super::App;
@@ -68,7 +68,7 @@ where
             .get_or_init(|| Mutex::new(()))
             .lock()
             .map_err(|_| anyhow!("auto-start usage-window run lock poisoned"))?;
-        let accounts = self.repository.list_accounts(&self.env.kind)?;
+        let accounts = self.repository.list_accounts()?;
         output.checked_accounts = accounts.len();
         let now = OffsetDateTime::now_utc();
         let mut due_accounts = Vec::new();
@@ -114,11 +114,10 @@ where
         account_id: Uuid,
         email: &str,
     ) -> Result<AutoStartUsageWindowAccountResult> {
-        let (_, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
+        let (_, snapshot) = self.repository.load_snapshot(account_id)?;
         let identity = codex::identity_from_snapshot(&snapshot)?;
         let ping_result = run_codex_usage_ping(&self.env, &snapshot, &identity)?;
-        let (current_metadata, current_snapshot) =
-            self.repository.load_snapshot(&self.env.kind, account_id)?;
+        let (current_metadata, current_snapshot) = self.repository.load_snapshot(account_id)?;
         if current_snapshot != snapshot {
             return Err(anyhow!(
                 "saved snapshot changed while ping was running; skipped write-back"
@@ -126,7 +125,6 @@ where
         }
         let refreshed_identity = codex::identity_from_snapshot(&ping_result.snapshot)?;
         self.repository.replace_snapshot(
-            &self.env.kind,
             account_id,
             &refreshed_identity,
             &ping_result.snapshot,
@@ -198,7 +196,7 @@ pub(crate) fn run_auto_start_usage_windows_check_now(env: AppEnv) -> Result<()> 
 fn run_auto_start_usage_windows_for_env(env: AppEnv) -> Result<()> {
     let repository = SnapshotRepository::new(
         &env.app_data_dir,
-        MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),
+        LocalSecretStore::new(&env.app_data_dir.join("snapshots")),
     );
     let app = App::new(env, repository);
     let _ = app.auto_start_usage_windows_once(true)?;

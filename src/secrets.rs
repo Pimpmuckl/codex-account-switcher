@@ -17,11 +17,6 @@ pub trait SecretStore {
     fn delete(&self, key: &str) -> Result<()>;
 }
 
-trait LegacySnapshotStore {
-    fn load_legacy(&self, key: &str) -> Result<Option<Vec<u8>>>;
-    fn delete_legacy(&self, key: &str) -> Result<()>;
-}
-
 #[derive(Clone, Debug)]
 pub struct LocalSecretStore {
     root_dir: PathBuf,
@@ -159,72 +154,6 @@ impl SecretStore for LocalSecretStore {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct MigratingSecretStore<L> {
-    local: LocalSecretStore,
-    legacy: L,
-}
-
-impl<L> MigratingSecretStore<L> {
-    #[cfg(test)]
-    pub fn with_legacy(root_dir: &Path, legacy: L) -> Self {
-        Self {
-            local: LocalSecretStore::new(root_dir),
-            legacy,
-        }
-    }
-}
-
-impl MigratingSecretStore<DefaultLegacyStore> {
-    pub fn new(root_dir: &Path) -> Self {
-        Self {
-            local: LocalSecretStore::new(root_dir),
-            legacy: DefaultLegacyStore::default(),
-        }
-    }
-}
-
-impl<L> SecretStore for MigratingSecretStore<L>
-where
-    L: LegacySnapshotStore,
-{
-    fn save(&self, key: &str, value: &[u8]) -> Result<()> {
-        self.local.save(key, value)?;
-        let _ = self.legacy.delete_legacy(key);
-        Ok(())
-    }
-
-    fn load(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let local_result = self.local.load(key);
-        match local_result {
-            Ok(Some(value)) => return Ok(Some(value)),
-            Ok(None) => {}
-            Err(local_error) => {
-                if let Some(legacy_value) = self.legacy.load_legacy(key)? {
-                    if self.local.save(key, &legacy_value).is_ok() {
-                        let _ = self.legacy.delete_legacy(key);
-                    }
-                    return Ok(Some(legacy_value));
-                }
-                return Err(local_error);
-            }
-        }
-
-        let Some(legacy_value) = self.legacy.load_legacy(key)? else {
-            return Ok(None);
-        };
-        if self.local.save(key, &legacy_value).is_ok() {
-            let _ = self.legacy.delete_legacy(key);
-        }
-        Ok(Some(legacy_value))
-    }
-
-    fn delete(&self, key: &str) -> Result<()> {
-        self.legacy.delete_legacy(key)?;
-        self.local.delete(key)
-    }
-}
-
 fn ensure_store_dir(root_dir: &Path) -> Result<()> {
     if root_dir.exists() {
         set_private_dir_permissions(root_dir)?;
@@ -294,77 +223,21 @@ fn set_private_dir_permissions(path: &Path) -> Result<()> {
 }
 
 fn snapshot_payload_is_valid(value: &[u8]) -> bool {
-    if let Some(compressed) = value.strip_prefix(SNAPSHOT_ENCODING_V1_MAGIC) {
-        let mut decoder = GzDecoder::new(compressed);
-        let mut decoded = Vec::new();
-        if std::io::Read::read_to_end(&mut decoder, &mut decoded).is_err() {
-            return false;
-        }
-        return serde_json::from_slice::<SnapshotBlob>(&decoded).is_ok();
+    let Some(compressed) = value.strip_prefix(SNAPSHOT_ENCODING_V1_MAGIC) else {
+        return false;
+    };
+    let mut decoder = GzDecoder::new(compressed);
+    let mut decoded = Vec::new();
+    if std::io::Read::read_to_end(&mut decoder, &mut decoded).is_err() {
+        return false;
     }
-
-    serde_json::from_slice::<SnapshotBlob>(value).is_ok()
+    serde_json::from_slice::<SnapshotBlob>(&decoded).is_ok()
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-type DefaultLegacyStore = KeyringLegacyStore;
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-type DefaultLegacyStore = NoopLegacyStore;
-
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-#[derive(Clone, Debug)]
-pub struct KeyringLegacyStore {
-    service_name: &'static str,
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-impl Default for KeyringLegacyStore {
-    fn default() -> Self {
-        Self {
-            service_name: "codex-account-switcher",
-        }
-    }
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-impl LegacySnapshotStore for KeyringLegacyStore {
-    fn load_legacy(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let entry = keyring::Entry::new(self.service_name, key)?;
-        match entry.get_password() {
-            Ok(value) => Ok(Some(value.into_bytes())),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error).context("failed to load legacy snapshot from keychain"),
-        }
-    }
-
-    fn delete_legacy(&self, key: &str) -> Result<()> {
-        let entry = keyring::Entry::new(self.service_name, key)?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(error).context("failed to delete legacy snapshot from keychain"),
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-#[derive(Clone, Debug, Default)]
-pub struct NoopLegacyStore;
-
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-impl LegacySnapshotStore for NoopLegacyStore {
-    fn load_legacy(&self, _key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
-
-    fn delete_legacy(&self, _key: &str) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -403,70 +276,21 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::io::Write;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use anyhow::Result;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use tempfile::tempdir;
 
-    use super::{LegacySnapshotStore, LocalSecretStore, MigratingSecretStore, SecretStore};
+    use super::{LocalSecretStore, SNAPSHOT_ENCODING_V1_MAGIC, SecretStore};
     use crate::model::{SnapshotBlob, SnapshotFile};
 
-    #[derive(Clone, Default)]
-    struct FakeLegacyStore {
-        inner: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    }
-
-    impl FakeLegacyStore {
-        fn insert(&self, key: &str, value: &[u8]) {
-            self.inner
-                .lock()
-                .expect("lock")
-                .insert(key.to_owned(), value.to_vec());
-        }
-    }
-
-    impl LegacySnapshotStore for FakeLegacyStore {
-        fn load_legacy(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.inner.lock().expect("lock").get(key).cloned())
-        }
-
-        fn delete_legacy(&self, key: &str) -> Result<()> {
-            self.inner.lock().expect("lock").remove(key);
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct FailingDeleteLegacyStore {
-        inner: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    }
-
-    impl FailingDeleteLegacyStore {
-        fn insert(&self, key: &str, value: &[u8]) {
-            self.inner
-                .lock()
-                .expect("lock")
-                .insert(key.to_owned(), value.to_vec());
-        }
-    }
-
-    impl LegacySnapshotStore for FailingDeleteLegacyStore {
-        fn load_legacy(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(self.inner.lock().expect("lock").get(key).cloned())
-        }
-
-        fn delete_legacy(&self, _key: &str) -> Result<()> {
-            Err(anyhow::anyhow!("legacy delete failed"))
-        }
-    }
-
     fn valid_snapshot_bytes() -> Vec<u8> {
-        serde_json::to_vec(&SnapshotBlob {
+        encoded_snapshot(SnapshotBlob {
             schema_version: 1,
             files: vec![
                 SnapshotFile {
@@ -479,11 +303,10 @@ mod tests {
                 },
             ],
         })
-        .expect("snapshot")
     }
 
     fn updated_snapshot_bytes() -> Vec<u8> {
-        serde_json::to_vec(&SnapshotBlob {
+        encoded_snapshot(SnapshotBlob {
             schema_version: 1,
             files: vec![
                 SnapshotFile {
@@ -496,7 +319,15 @@ mod tests {
                 },
             ],
         })
-        .expect("snapshot")
+    }
+
+    fn encoded_snapshot(snapshot: SnapshotBlob) -> Vec<u8> {
+        let serialized = serde_json::to_vec(&snapshot).expect("snapshot");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&serialized).expect("compress snapshot");
+        let mut encoded = SNAPSHOT_ENCODING_V1_MAGIC.to_vec();
+        encoded.extend(encoder.finish().expect("finish compression"));
+        encoded
     }
 
     #[test]
@@ -700,77 +531,6 @@ mod tests {
         assert!(format!("{error:#}").contains("failed to delete snapshot"));
 
         assert!(!temp.path().join("c25hcHNob3Q6dGVzdA.snapshot").exists());
-    }
-
-    #[test]
-    fn migrating_store_moves_legacy_payload_into_local_storage() {
-        let temp = tempdir().expect("tempdir");
-        let legacy = FakeLegacyStore::default();
-        let payload = valid_snapshot_bytes();
-        legacy.insert("snapshot:test", &payload);
-        let store = MigratingSecretStore::with_legacy(temp.path(), legacy.clone());
-
-        let loaded = store.load("snapshot:test").expect("load").expect("payload");
-        assert_eq!(loaded, payload);
-        assert!(
-            temp.path().join("c25hcHNob3Q6dGVzdA.snapshot").exists(),
-            "payload should be migrated into local storage"
-        );
-        assert!(
-            legacy
-                .load_legacy("snapshot:test")
-                .expect("legacy load")
-                .is_none(),
-            "legacy payload should be cleaned up after migration"
-        );
-    }
-
-    #[test]
-    fn migrating_store_save_cleans_up_legacy_copy() {
-        let temp = tempdir().expect("tempdir");
-        let legacy = FakeLegacyStore::default();
-        let payload = valid_snapshot_bytes();
-        legacy.insert("snapshot:test", &payload);
-        let store = MigratingSecretStore::with_legacy(temp.path(), legacy.clone());
-
-        store.save("snapshot:test", &payload).expect("save");
-        assert!(
-            legacy
-                .load_legacy("snapshot:test")
-                .expect("legacy load")
-                .is_none(),
-            "save should clear the stale legacy copy"
-        );
-    }
-
-    #[test]
-    fn migrating_store_falls_back_to_legacy_when_local_load_errors() {
-        let temp = tempdir().expect("tempdir");
-        fs::create_dir(temp.path().join("c25hcHNob3Q6dGVzdA.snapshot"))
-            .expect("create unreadable canonical directory");
-        let legacy = FakeLegacyStore::default();
-        let payload = valid_snapshot_bytes();
-        legacy.insert("snapshot:test", &payload);
-        let store = MigratingSecretStore::with_legacy(temp.path(), legacy);
-
-        let loaded = store.load("snapshot:test").expect("load").expect("payload");
-        assert_eq!(loaded, payload);
-    }
-
-    #[test]
-    fn migrating_store_delete_surfaces_legacy_cleanup_failures() {
-        let temp = tempdir().expect("tempdir");
-        let legacy = FailingDeleteLegacyStore::default();
-        let payload = valid_snapshot_bytes();
-        legacy.insert("snapshot:test", &payload);
-        let store = MigratingSecretStore::with_legacy(temp.path(), legacy);
-        store.save("snapshot:test", &payload).expect("save");
-
-        let error = store
-            .delete("snapshot:test")
-            .expect_err("delete should fail");
-        assert!(format!("{error:#}").contains("legacy delete failed"));
-        assert!(temp.path().join("c25hcHNob3Q6dGVzdA.snapshot").exists());
     }
 
     #[cfg(unix)]
