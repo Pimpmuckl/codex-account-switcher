@@ -6,9 +6,10 @@ use uuid::Uuid;
 use crate::codex;
 use crate::env::AppEnv;
 use crate::model::{
-    ActivateOutput, DeleteOutput, DisplayIdentity, ExportBundle, ImportOutput, ListOutput,
-    PickBestOutput, PickBestScoreView, RenameOutput, RunningCodexProcess, SaveAction, SaveOutput,
-    SnapshotBlob, StatusOutput, UsageOutput, UsageSource,
+    ActivateOutput, BatchRefreshFailure, BatchRefreshOutput, DeleteOutput, DisplayIdentity,
+    ExportBundle, ImportOutput, ListOutput, PickBestOutput, PickBestScoreView, RenameOutput,
+    RunningCodexProcess, SaveAction, SaveOutput, SnapshotBlob, StatusOutput, UsageOutput,
+    UsageSource,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::SecretStore;
@@ -184,11 +185,29 @@ where
     }
 
     pub fn refresh_saved_usage_cache(&self) -> Result<()> {
-        let accounts = self.repository.list_accounts(&self.env.kind)?;
-        for account in accounts {
-            let _ = self.usage(Some(account.id));
-        }
+        let _ = self.refresh_all_usage()?;
         Ok(())
+    }
+
+    pub fn refresh_all_usage(&self) -> Result<BatchRefreshOutput> {
+        let accounts = self.repository.list_accounts(&self.env.kind)?;
+        let mut refreshed = Vec::new();
+        let mut failed = Vec::new();
+        for account in accounts {
+            match self.usage(Some(account.id)) {
+                Ok(_) => refreshed.push(account.id),
+                Err(error) => failed.push(BatchRefreshFailure {
+                    account_id: account.id,
+                    email: account.email.clone(),
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
+        Ok(BatchRefreshOutput {
+            total: refreshed.len() + failed.len(),
+            refreshed,
+            failed,
+        })
     }
 
     pub fn usage(&self, account_id: Option<Uuid>) -> Result<UsageOutput> {

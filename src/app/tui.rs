@@ -1,12 +1,13 @@
 use anyhow::{Context, Error, Result};
 use console::{Key, Term, style};
-use dialoguer::{Select, theme::ColorfulTheme};
+use dialoguer::{Input, Select, theme::ColorfulTheme};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::model::{
-    AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountView, AutoStartUsageWindowsRunOutput, ListOutput,
-    QUOTA_PAST_RESET_LABEL, RunningCodexProcess, SaveAction, StatusOutput,
+    AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountView, AutoStartUsageWindowsRunOutput,
+    BatchRefreshOutput, ListOutput, PickBestOutput, QUOTA_PAST_RESET_LABEL, RunningCodexProcess,
+    SaveAction, StatusOutput,
 };
 use crate::process::format_process_table;
 use crate::secrets::SecretStore;
@@ -198,6 +199,60 @@ where
                         output.deleted_account_id
                     ));
                 }
+                InteractiveAction::RefreshAllUsage => match self.refresh_all_usage() {
+                    Ok(output) => feedback.extend(batch_refresh_feedback(&output)),
+                    Err(error) => {
+                        feedback = error_feedback("Refreshing saved account usage failed.", error);
+                        continue;
+                    }
+                },
+                InteractiveAction::PickBestQuota => {
+                    let warnings = self.activation_preflight_warnings();
+                    let showed_preflight = !warnings.is_empty();
+                    if showed_preflight && !confirm_pick_best(&warnings)? {
+                        continue;
+                    }
+                    match self.pick_best_account(true, true) {
+                        Ok(output) => {
+                            feedback.extend(pick_best_feedback(&output));
+                            if showed_preflight && output.switched {
+                                feedback.push(
+                                    "Codex was still running during the switch. Close those processes fully if the account does not change in Codex."
+                                        .to_owned(),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            feedback =
+                                error_feedback("Switching to best quota account failed.", error);
+                            continue;
+                        }
+                    }
+                }
+                InteractiveAction::RenamePrompt => {
+                    let account_id = prompt_for_account_rename(&list.accounts)?;
+                    let account = list
+                        .accounts
+                        .iter()
+                        .find(|account| account.id == account_id)
+                        .context("selected account no longer exists")?;
+                    let label = prompt_for_account_label(account)?;
+                    match self.rename_account(account_id, label) {
+                        Ok(output) => match &output.account.label {
+                            Some(name) => feedback.push(format!(
+                                "Renamed {} to label \"{name}\"",
+                                output.account.email
+                            )),
+                            None => {
+                                feedback.push(format!("Cleared label for {}", output.account.email))
+                            }
+                        },
+                        Err(error) => {
+                            feedback = error_feedback("Renaming the saved account failed.", error);
+                            continue;
+                        }
+                    }
+                }
                 InteractiveAction::ShowStatus => {
                     feedback = interactive_status_lines(&status);
                 }
@@ -290,6 +345,9 @@ pub(crate) enum InteractiveAction {
     Activate(Uuid),
     Delete(Uuid),
     DeletePrompt,
+    RefreshAllUsage,
+    PickBestQuota,
+    RenamePrompt,
     ShowStatus,
     SetAutoStartUsageWindows(bool),
     SetAutoSwitchOnLimit(bool),
@@ -414,7 +472,12 @@ fn account_menu_tone(account: &AccountView) -> MenuLabelTone {
 }
 
 fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> String {
-    let email = format!("{:<width$}", account.email, width = widths.email);
+    let display_email = if let Some(label) = &account.label {
+        format!("{} [{label}]", account.email)
+    } else {
+        account.email.clone()
+    };
+    let email = format!("{:<width$}", display_email, width = widths.email);
     let plan = format!(
         "{:<width$}",
         account
@@ -470,7 +533,12 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
 fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
     let mut widths = AccountLabelWidths::default();
     for account in accounts {
-        widths.email = widths.email.max(account.email.len());
+        let display_email = if let Some(label) = &account.label {
+            format!("{} [{label}]", account.email)
+        } else {
+            account.email.clone()
+        };
+        widths.email = widths.email.max(display_email.len());
         widths.plan = widths.plan.max(
             account
                 .plan_label
@@ -591,6 +659,21 @@ pub(crate) fn build_menu(
             });
         }
         if !list.accounts.is_empty() {
+            actions.push(InteractiveItem {
+                label: "Refresh usage for all saved accounts".to_owned(),
+                action: InteractiveAction::RefreshAllUsage,
+                tone: MenuLabelTone::Normal,
+            });
+            actions.push(InteractiveItem {
+                label: "Switch to best quota account".to_owned(),
+                action: InteractiveAction::PickBestQuota,
+                tone: MenuLabelTone::Normal,
+            });
+            actions.push(InteractiveItem {
+                label: "Rename saved account label".to_owned(),
+                action: InteractiveAction::RenamePrompt,
+                tone: MenuLabelTone::Normal,
+            });
             actions.push(InteractiveItem {
                 label: "Delete saved account".to_owned(),
                 action: InteractiveAction::DeletePrompt,
@@ -875,17 +958,63 @@ fn render_menu_row_explicit(menu: &InteractiveMenu, index: usize, selected: bool
 }
 
 fn prompt_for_account_delete(accounts: &[AccountView]) -> Result<Uuid> {
+    prompt_for_account_selection(accounts, "Which saved account do you want to delete?")
+}
+
+fn prompt_for_account_rename(accounts: &[AccountView]) -> Result<Uuid> {
+    prompt_for_account_selection(accounts, "Which saved account do you want to rename?")
+}
+
+fn prompt_for_account_selection(accounts: &[AccountView], prompt: &str) -> Result<Uuid> {
     let widths = account_label_widths(&accounts.iter().collect::<Vec<_>>());
     let labels = accounts
         .iter()
         .map(|account| render_account_label(account, widths))
         .collect::<Vec<_>>();
     let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Which saved account do you want to delete?")
+        .with_prompt(prompt)
         .items(&labels)
         .default(0)
         .interact()?;
     Ok(accounts[selection].id)
+}
+
+fn prompt_for_account_label(account: &AccountView) -> Result<Option<String>> {
+    let default = account.label.clone().unwrap_or_default();
+    let input = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Label for {} (leave blank to clear)",
+            account.email
+        ))
+        .default(default)
+        .allow_empty(true)
+        .interact_text()?;
+    let trimmed = input.trim().to_owned();
+    Ok(if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    })
+}
+
+fn confirm_pick_best(warnings: &[RunningCodexProcess]) -> Result<bool> {
+    if warnings.is_empty() {
+        return Ok(true);
+    }
+    let body = vec![
+        "Codex appears to be running.".to_owned(),
+        "Close every listed process first for a reliable swap, or force the best-quota switch anyway."
+            .to_owned(),
+    ];
+    let details = process_summary_lines("Codex processes", warnings);
+    confirm_with_menu(
+        "Continue with best-quota switch?",
+        &body,
+        &details,
+        "Yes, force switch",
+        "No, cancel",
+        false,
+    )
 }
 
 fn confirm_delete(account: &AccountView) -> Result<bool> {
@@ -967,6 +1096,57 @@ fn auto_start_usage_window_feedback(output: &AutoStartUsageWindowsRunOutput) -> 
     }
     for skipped in &output.skipped {
         lines.push(format!("Skipped: {skipped}"));
+    }
+    lines
+}
+
+fn batch_refresh_feedback(output: &BatchRefreshOutput) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Refreshed usage for {}/{} saved accounts.",
+        output.refreshed.len(),
+        output.total
+    )];
+    for failure in &output.failed {
+        lines.push(format!(
+            "Failed {} ({}): {}",
+            failure.email, failure.account_id, failure.error
+        ));
+    }
+    lines
+}
+
+fn pick_best_feedback(output: &PickBestOutput) -> Vec<String> {
+    let mut lines = vec![if output.switched {
+        format!(
+            "Switched to best quota account {} ({}).",
+            output.account.email, output.account.id
+        )
+    } else {
+        format!(
+            "Already on best quota account {} ({}).",
+            output.account.email, output.account.id
+        )
+    }];
+    for entry in &output.scores {
+        let score = entry
+            .score
+            .map(|value| format!("{value:+.1}"))
+            .unwrap_or_else(|| "n/a".to_owned());
+        let marker = if entry.account_id == output.account.id {
+            " <-"
+        } else {
+            ""
+        };
+        let label = entry
+            .label
+            .as_deref()
+            .map(|name| format!(" [{name}]"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "  {}{label}: score {score}{marker}{}",
+            entry.email,
+            if entry.eligible { "" } else { " (ineligible)" },
+        ));
     }
     lines
 }

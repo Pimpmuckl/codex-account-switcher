@@ -195,6 +195,20 @@ pub struct AutoStartUsageWindowAccountResult {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct BatchRefreshOutput {
+    pub total: usize,
+    pub refreshed: Vec<Uuid>,
+    pub failed: Vec<BatchRefreshFailure>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BatchRefreshFailure {
+    pub account_id: Uuid,
+    pub email: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct PickBestOutput {
     pub switched: bool,
     pub account: AccountView,

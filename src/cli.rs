@@ -7,11 +7,11 @@ use uuid::Uuid;
 
 use crate::app::{App, InteractiveExit, InteractiveMode};
 use crate::env;
-use crate::import_export::{read_export_bundle, write_export_bundle};
+use crate::import_export::{read_export_file, write_export_file};
 use crate::model::{
     AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountUsageView, AccountView,
-    AutoStartUsageWindowsRunOutput, AutoStartUsageWindowsStatusOutput, ImportOutput,
-    PickBestOutput, QUOTA_PAST_RESET_LABEL, RunningCodexProcess, UsageOutput,
+    AutoStartUsageWindowsRunOutput, AutoStartUsageWindowsStatusOutput, BatchRefreshOutput,
+    ImportOutput, PickBestOutput, QUOTA_PAST_RESET_LABEL, RunningCodexProcess, UsageOutput,
 };
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
@@ -82,6 +82,10 @@ enum Command {
     },
     Usage {
         account_id: Option<Uuid>,
+        #[arg(long)]
+        json: bool,
+    },
+    RefreshUsage {
         #[arg(long)]
         json: bool,
     },
@@ -232,7 +236,7 @@ pub fn run() -> Result<()> {
             if json {
                 print_json(&bundle)?;
             } else {
-                write_export_bundle(&output, &bundle)?;
+                write_export_file(&output, &bundle)?;
                 println!(
                     "Exported {} account(s) to {}",
                     bundle.accounts.len(),
@@ -242,9 +246,15 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Import { path, label, json }) => {
-            let outputs = match read_export_bundle(&path) {
+            let outputs = match read_export_file(&path) {
                 Ok(bundle) => app.import_bundle(&bundle)?,
-                Err(_) => vec![app.import_auth_path(&path, label)?],
+                Err(bundle_error) => match app.import_auth_path(&path, label) {
+                    Ok(output) => vec![output],
+                    Err(auth_error) => {
+                        return Err(bundle_error
+                            .context(format!("failed to import as auth.json ({auth_error:#})")));
+                    }
+                },
             };
             if json {
                 print_json(&outputs)?;
@@ -278,6 +288,15 @@ pub fn run() -> Result<()> {
                 print_json(&output)?;
             } else {
                 print_usage_output(&output);
+            }
+            Ok(())
+        }
+        Some(Command::RefreshUsage { json }) => {
+            let output = app.refresh_all_usage()?;
+            if json {
+                print_json(&output)?;
+            } else {
+                print_batch_refresh_output(&output);
             }
             Ok(())
         }
@@ -612,6 +631,20 @@ fn print_import_output(output: &ImportOutput) {
             output.email, output.account_id
         ),
         None => println!("{action} {} ({})", output.email, output.account_id),
+    }
+}
+
+fn print_batch_refresh_output(output: &BatchRefreshOutput) {
+    println!(
+        "Refreshed usage for {}/{} saved accounts.",
+        output.refreshed.len(),
+        output.total
+    );
+    for failure in &output.failed {
+        println!(
+            "Failed {} ({}): {}",
+            failure.email, failure.account_id, failure.error
+        );
     }
 }
 
