@@ -106,22 +106,28 @@ where
         if self.tray_icon.is_some() {
             return;
         }
-        match self.rebuild_menu() {
-            Ok(menu) => {
-                let mut builder = TrayIconBuilder::new()
-                    .with_tooltip("Codex account switcher")
-                    .with_icon(load_codex_icon())
-                    .with_menu(Box::new(menu));
-                #[cfg(target_os = "macos")]
-                {
-                    builder = builder.with_icon_as_template(true);
-                }
-                match builder.build() {
-                    Ok(tray_icon) => self.tray_icon = Some(tray_icon),
-                    Err(error) => eprintln!("failed to create tray icon: {error:#}"),
+        match self.app.status().and_then(|s| self.app.list().map(|l| (s, l))) {
+            Ok((status, list)) => {
+                let tooltip = self.get_tooltip_text(&status, &list);
+                match self.rebuild_menu_with_status_and_list(&status, &list) {
+                    Ok(menu) => {
+                        let mut builder = TrayIconBuilder::new()
+                            .with_tooltip(tooltip)
+                            .with_icon(load_codex_icon())
+                            .with_menu(Box::new(menu));
+                        #[cfg(target_os = "macos")]
+                        {
+                            builder = builder.with_icon_as_template(true);
+                        }
+                        match builder.build() {
+                            Ok(tray_icon) => self.tray_icon = Some(tray_icon),
+                            Err(error) => eprintln!("failed to create tray icon: {error:#}"),
+                        }
+                    }
+                    Err(error) => eprintln!("failed to build tray menu: {error:#}"),
                 }
             }
-            Err(error) => eprintln!("failed to build tray menu: {error:#}"),
+            Err(error) => eprintln!("failed to query app status and list: {error:#}"),
         }
     }
 
@@ -410,16 +416,49 @@ where
     S: SecretStore,
 {
     fn update_tray_menu(&mut self) -> Result<()> {
-        let menu = self.rebuild_menu()?;
+        let status = self.app.status()?;
+        let list = self.app.list()?;
+        let tooltip = self.get_tooltip_text(&status, &list);
+        let menu = self.rebuild_menu_with_status_and_list(&status, &list)?;
         if let Some(tray_icon) = &self.tray_icon {
+            let _ = tray_icon.set_tooltip(Some(&tooltip));
             tray_icon.set_menu(Some(Box::new(menu)));
         }
         Ok(())
     }
 
-    fn rebuild_menu(&mut self) -> Result<Menu> {
-        let status = self.app.status()?;
-        let list = self.app.list()?;
+    fn get_tooltip_text(
+        &self,
+        status: &crate::model::StatusOutput,
+        list: &crate::model::ListOutput,
+    ) -> String {
+        match &status.current_account {
+            Some(account) => {
+                let plan = format_plan_label_simple(account.plan_label.as_deref());
+                let active_account = find_active_tray_account(
+                    Some(account),
+                    status.current_account_saved_id,
+                    &list.accounts,
+                );
+                let usage_info = active_account.map(|act| {
+                    let (remaining, _) = account_usage_labels_simple(act);
+                    if remaining.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" - {remaining}")
+                    }
+                }).unwrap_or_default();
+                format!("Codex: {}{} ({})", account.email, usage_info, plan)
+            }
+            None => "Codex: Not logged in".to_owned(),
+        }
+    }
+
+    fn rebuild_menu_with_status_and_list(
+        &mut self,
+        status: &crate::model::StatusOutput,
+        list: &crate::model::ListOutput,
+    ) -> Result<Menu> {
         let menu = Menu::new();
         self.commands.clear();
 
@@ -794,7 +833,7 @@ fn fallback_icon() -> Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AccountUsageView, EnvironmentKind, UsageSource, UsageWindowView};
+    use crate::model::EnvironmentKind;
     use time::OffsetDateTime;
 
     #[test]

@@ -184,7 +184,46 @@ where
             b_rem.cmp(&a_rem)
         });
         let target_id = candidates[0].id;
+        let warnings = self.activation_preflight_warnings();
+        let was_running = !warnings.is_empty();
+
+        if was_running {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("osascript").args(["-e", "quit app \"Codex\""]).output();
+                let _ = std::process::Command::new("pkill").args(["-x", "Codex"]).output();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("taskkill").args(["/f", "/im", "Codex.exe"]).output();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+
         self.activate_with_running_policy(target_id, true)?;
+
+        if was_running {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").args(["-a", "Codex"]).spawn();
+                let email = candidates[0].email.clone();
+                let plan = candidates[0].plan_label.as_deref().unwrap_or("Free");
+                let msg = format!("Auto-switched to account {email} ({plan}) due to quota limit. Codex restarted.");
+                let _ = std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg(format!(
+                        "display notification \"{}\" with title \"Codex Switcher\"",
+                        msg.replace('"', "\\\"")
+                    ))
+                    .spawn();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("cmd").args(["/c", "start", "", "Codex"]).spawn();
+            }
+        }
+
         Ok(Some(target_id))
     }
 
