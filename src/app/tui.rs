@@ -26,7 +26,11 @@ where
     ) -> Result<InteractiveExit> {
         let mut default_selection = 0usize;
         if matches!(mode, InteractiveMode::Persistent) {
-            self.refresh_saved_usage_cache()?;
+            if self.auto_start_usage_windows_status()?.enabled {
+                let _ = self.auto_start_usage_windows_once(true)?;
+            } else {
+                self.refresh_saved_usage_cache()?;
+            }
         }
         let mut feedback = Vec::new();
         loop {

@@ -15,12 +15,16 @@ use uuid::Uuid;
 use crate::codex;
 use crate::env::AppEnv;
 use crate::model::{
-    AUTH_FILES, AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
-    AutoStartUsageWindowsStatusOutput, DisplayIdentity, SnapshotBlob,
+    AUTH_FILES, AccountUsageView, AutoStartUsageWindowAccountResult,
+    AutoStartUsageWindowsRunOutput, AutoStartUsageWindowsStatusOutput, DisplayIdentity,
+    SavedAccountMetadata, SnapshotBlob, UsageOutput, UsageSource, UsageWindowView,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{LocalSecretStore, SecretStore};
 use crate::settings::{load_settings, save_settings};
+use crate::usage::{
+    fetch_usage, usage_error_message, usage_error_requires_login, usage_target_from_snapshot,
+};
 
 use super::App;
 
@@ -73,20 +77,40 @@ where
         let now = OffsetDateTime::now_utc();
         let mut due_accounts = Vec::new();
         for account in &accounts {
-            match self.usage(Some(account.id)) {
-                Ok(usage) => {
-                    if usage
-                        .usage
-                        .weekly
-                        .as_ref()
-                        .is_some_and(|weekly| usage_window_needs_ping(weekly.reset_at, now))
-                    {
+            let cached_weekly = cached_weekly_window(account);
+            let cached_due = cached_weekly.is_some_and(|weekly| weekly.reset_at <= now);
+            let previous_reset_at = cached_weekly.map(|weekly| weekly.reset_at);
+            match self.fetch_usage_for_auto_start_check(account.id) {
+                Ok((usage, refreshed_snapshot)) => {
+                    let needs_ping = auto_start_check_needs_ping(
+                        cached_due,
+                        usage.usage.weekly.as_ref(),
+                        previous_reset_at,
+                        now,
+                    );
+                    if let Err(error) = self.repository.replace_snapshot(
+                        account.id,
+                        &usage.account,
+                        &refreshed_snapshot,
+                        auto_start_check_usage_cache(account, &usage.usage, needs_ping),
+                    ) {
+                        output
+                            .skipped
+                            .push(format!("{}: usage unavailable: {error:#}", account.email));
+                        continue;
+                    }
+                    if needs_ping {
                         due_accounts.push((account.id, account.email.clone()));
                     }
                 }
-                Err(error) => output
-                    .skipped
-                    .push(format!("{}: usage unavailable: {error:#}", account.email)),
+                Err(error) => {
+                    let _ = self
+                        .repository
+                        .record_usage_error(account.id, usage_error_message(&error));
+                    output
+                        .skipped
+                        .push(format!("{}: usage unavailable: {error:#}", account.email));
+                }
             }
         }
         if due_accounts.is_empty() {
@@ -143,6 +167,20 @@ where
             status: status.to_owned(),
             detail: ping_result.cleanup_warning,
         })
+    }
+
+    fn fetch_usage_for_auto_start_check(
+        &self,
+        account_id: Uuid,
+    ) -> Result<(UsageOutput, SnapshotBlob)> {
+        let (snapshot, _, _) = self.load_activation_target(account_id)?;
+        let target = usage_target_from_snapshot(
+            self.env.kind.clone(),
+            snapshot,
+            UsageSource::SavedAccessToken,
+            true,
+        )?;
+        fetch_usage(target)
     }
 }
 
@@ -210,8 +248,50 @@ fn auto_start_status_output(enabled: bool) -> AutoStartUsageWindowsStatusOutput 
     }
 }
 
-fn usage_window_needs_ping(reset_at: OffsetDateTime, now: OffsetDateTime) -> bool {
-    reset_at <= now
+fn cached_weekly_window(account: &SavedAccountMetadata) -> Option<&UsageWindowView> {
+    if account
+        .cached_usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        return None;
+    }
+    account.cached_usage.as_ref()?.weekly.as_ref()
+}
+
+fn auto_start_check_usage_cache(
+    account: &SavedAccountMetadata,
+    usage: &AccountUsageView,
+    needs_ping: bool,
+) -> Option<AccountUsageView> {
+    if needs_ping {
+        account.cached_usage.clone()
+    } else {
+        Some(usage.clone())
+    }
+}
+
+fn auto_start_check_needs_ping(
+    cached_due: bool,
+    weekly: Option<&UsageWindowView>,
+    previous_reset_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> bool {
+    let refreshed_active =
+        weekly.is_some_and(|weekly| weekly.reset_at > now && weekly.remaining_percent < 100);
+    !refreshed_active
+        && (cached_due
+            || weekly.is_some_and(|weekly| usage_window_needs_ping(weekly, previous_reset_at, now)))
+}
+
+fn usage_window_needs_ping(
+    weekly: &UsageWindowView,
+    previous_reset_at: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) -> bool {
+    weekly.reset_at <= now
+        || weekly.remaining_percent == 100
+            && previous_reset_at.is_some_and(|previous| previous < weekly.reset_at)
 }
 
 struct CodexUsagePingResult {
@@ -449,13 +529,139 @@ mod tests {
 
     use super::*;
 
+    fn weekly_window(reset_at: OffsetDateTime, remaining_percent: u8) -> UsageWindowView {
+        UsageWindowView {
+            used_percent: 100u8.saturating_sub(remaining_percent),
+            remaining_percent,
+            reset_at,
+        }
+    }
+
+    fn weekly_usage(reset_at: OffsetDateTime) -> AccountUsageView {
+        AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: None,
+            weekly: Some(weekly_window(reset_at, 100)),
+            credits: None,
+        }
+    }
+
+    fn saved_account(
+        cached_usage: Option<AccountUsageView>,
+        cached_usage_error: Option<String>,
+    ) -> SavedAccountMetadata {
+        SavedAccountMetadata {
+            id: Uuid::new_v4(),
+            account_key: "sub-1".to_owned(),
+            legacy_subject: None,
+            email: "person@example.com".to_owned(),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            secret_key: "secret".to_owned(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            cached_usage,
+            cached_usage_error,
+        }
+    }
+
     #[test]
     fn usage_window_needs_ping_when_reset_is_due_or_past() {
         let now = OffsetDateTime::now_utc();
 
-        assert!(usage_window_needs_ping(now, now));
-        assert!(usage_window_needs_ping(now - Duration::minutes(1), now));
-        assert!(!usage_window_needs_ping(now + Duration::minutes(1), now));
+        assert!(usage_window_needs_ping(&weekly_window(now, 50), None, now));
+        assert!(usage_window_needs_ping(
+            &weekly_window(now - Duration::minutes(1), 50),
+            None,
+            now
+        ));
+        assert!(!usage_window_needs_ping(
+            &weekly_window(now + Duration::minutes(1), 50),
+            None,
+            now
+        ));
+    }
+
+    #[test]
+    fn usage_window_needs_ping_when_full_window_moves_forward() {
+        let now = OffsetDateTime::now_utc();
+        let previous_reset_at = now + Duration::days(7);
+        let moved_reset_at = previous_reset_at + Duration::minutes(5);
+        let full_moved_weekly = weekly_window(moved_reset_at, 100);
+        let used_moved_weekly = weekly_window(moved_reset_at, 99);
+
+        assert!(usage_window_needs_ping(
+            &full_moved_weekly,
+            Some(previous_reset_at),
+            now
+        ));
+        assert!(!usage_window_needs_ping(
+            &full_moved_weekly,
+            Some(moved_reset_at),
+            now
+        ));
+        assert!(!usage_window_needs_ping(&full_moved_weekly, None, now));
+        assert!(!usage_window_needs_ping(
+            &used_moved_weekly,
+            Some(previous_reset_at),
+            now
+        ));
+    }
+
+    #[test]
+    fn cached_weekly_window_ignores_login_required_errors() {
+        let account = saved_account(
+            Some(weekly_usage(OffsetDateTime::UNIX_EPOCH)),
+            Some("Login required: Codex auth expired.".to_owned()),
+        );
+
+        assert!(cached_weekly_window(&account).is_none());
+    }
+
+    #[test]
+    fn auto_start_check_preserves_cached_usage_until_ping_succeeds() {
+        let old_usage = weekly_usage(OffsetDateTime::UNIX_EPOCH);
+        let new_usage = weekly_usage(OffsetDateTime::UNIX_EPOCH + Duration::days(7));
+        let account = saved_account(Some(old_usage.clone()), None);
+
+        assert_eq!(
+            auto_start_check_usage_cache(&account, &new_usage, true)
+                .expect("cached usage should remain")
+                .weekly
+                .expect("weekly usage")
+                .reset_at,
+            old_usage.weekly.expect("old weekly usage").reset_at
+        );
+        assert_eq!(
+            auto_start_check_usage_cache(&account, &new_usage, false)
+                .expect("fresh usage should save")
+                .weekly
+                .expect("weekly usage")
+                .reset_at,
+            new_usage.weekly.expect("new weekly usage").reset_at
+        );
+    }
+
+    #[test]
+    fn auto_start_check_skips_cached_due_when_refreshed_window_is_active() {
+        let now = OffsetDateTime::now_utc();
+        let active_weekly = weekly_window(now + Duration::days(7), 99);
+        let full_weekly = weekly_window(now + Duration::days(7), 100);
+
+        assert!(!auto_start_check_needs_ping(
+            true,
+            Some(&active_weekly),
+            Some(now - Duration::minutes(1)),
+            now
+        ));
+        assert!(auto_start_check_needs_ping(
+            true,
+            Some(&full_weekly),
+            Some(now - Duration::minutes(1)),
+            now
+        ));
     }
 
     #[cfg(windows)]

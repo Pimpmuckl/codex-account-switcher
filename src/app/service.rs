@@ -128,7 +128,7 @@ where
         let _ = self.usage(Some(saved.account.id));
     }
 
-    fn load_activation_target(
+    pub(crate) fn load_activation_target(
         &self,
         account_id: Uuid,
     ) -> Result<(SnapshotBlob, DisplayIdentity, DisplayIdentity)> {
