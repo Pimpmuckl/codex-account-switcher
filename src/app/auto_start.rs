@@ -21,11 +21,12 @@ use crate::model::{
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
-use crate::settings::{load_settings, save_settings};
+use crate::settings::{load_settings, save_settings, DEFAULT_AUTO_SWITCH_POLL_SECONDS, DEFAULT_USAGE_WINDOW_POLL_SECONDS};
 
 use super::App;
 
-pub const AUTO_START_USAGE_WINDOW_POLL_SECONDS: u64 = 300;
+pub const NEAR_LIMIT_POLL_SECONDS: u64 = 30;
+pub const URGENT_POLL_SECONDS: u64 = 15;
 
 const PING_INSTRUCTIONS: &str = "Reply only with ACK.";
 const PING_PROMPT: &str = "ACK";
@@ -127,10 +128,8 @@ where
         if !settings.auto_switch_on_limit {
             return Ok(None);
         }
-        let accounts = self.repository.list_accounts(&self.env.kind)?;
-        for account in &accounts {
-            let _ = self.usage(Some(account.id));
-        }
+        let threshold = settings.near_limit_threshold_percent;
+        self.refresh_saved_usage_cache()?;
         let accounts = self.repository.list_accounts(&self.env.kind)?;
         let status = self.status()?;
         let Some(current_id) = status.current_account_saved_id else {
@@ -140,54 +139,40 @@ where
             return Ok(None);
         };
         let now = OffsetDateTime::now_utc();
-        let current_out = current_account
-            .cached_usage
-            .as_ref()
-            .is_some_and(|usage| usage.is_out_of_quota(now))
-            || current_account
-                .cached_usage_error
-                .as_ref()
-                .is_some_and(|err| crate::usage::usage_error_requires_login(err));
-        if !current_out {
+        let switch_reason = current_switch_reason(current_account, now, threshold);
+        if switch_reason.is_none() {
             return Ok(None);
         }
-        let mut candidates = Vec::new();
-        for account in &accounts {
-            if account.id == current_id {
-                continue;
-            }
-            if let Some(err) = &account.cached_usage_error
-                && crate::usage::usage_error_requires_login(err)
-            {
-                continue;
-            }
-            let is_ok = match &account.cached_usage {
-                Some(usage) => !usage.is_out_of_quota(now),
-                None => true,
-            };
-            if is_ok {
-                candidates.push(account);
-            }
-        }
-        if candidates.is_empty() {
+        let switch_reason = switch_reason.expect("checked above");
+        let scores = accounts
+            .iter()
+            .map(|account| {
+                crate::quota_scoring::score_saved_account_for_auto_switch(
+                    account.id,
+                    &account.email,
+                    account.label.as_deref(),
+                    account.cached_usage.as_ref(),
+                    account.cached_usage_error.as_deref(),
+                    now,
+                )
+            })
+            .collect::<Vec<_>>();
+        let Some(target_id) = crate::quota_scoring::pick_switch_target(&scores, current_id) else {
+            return Ok(None);
+        };
+        let target_account = accounts
+            .iter()
+            .find(|account| account.id == target_id)
+            .context("switch target account missing after scoring")?;
+        if !switch_target_is_improvement(
+            switch_reason,
+            current_account.cached_usage.as_ref(),
+            target_account.cached_usage.as_ref(),
+            now,
+            threshold,
+        ) {
             return Ok(None);
         }
-        candidates.sort_by(|a, b| {
-            let a_rem = a
-                .cached_usage
-                .as_ref()
-                .and_then(|u| u.weekly.as_ref())
-                .map(|w| w.remaining_percent)
-                .unwrap_or(50);
-            let b_rem = b
-                .cached_usage
-                .as_ref()
-                .and_then(|u| u.weekly.as_ref())
-                .map(|w| w.remaining_percent)
-                .unwrap_or(50);
-            b_rem.cmp(&a_rem)
-        });
-        let target_id = candidates[0].id;
         let warnings = self.activation_preflight_warnings();
         let was_running = !warnings.is_empty();
 
@@ -213,14 +198,14 @@ where
 
         self.activate_with_running_policy(target_id, true)?;
 
-        let email = candidates[0].email.clone();
-        let plan = candidates[0].plan_label.as_deref().unwrap_or("Free");
+        let email = target_account.email.clone();
+        let plan = target_account.plan_label.as_deref().unwrap_or("Free");
         let msg = if was_running {
             format!(
-                "Auto-switched to account {email} ({plan}) due to quota limit. Codex restarted."
+                "Auto-switched to {email} ({plan}): {switch_reason}. Codex restarted."
             )
         } else {
-            format!("Auto-switched to account {email} ({plan}) due to quota limit.")
+            format!("Auto-switched to {email} ({plan}): {switch_reason}.")
         };
         notify_auto_switch(&msg);
 
@@ -370,10 +355,127 @@ pub fn spawn_auto_start_usage_windows_worker(env: AppEnv) {
                         eprintln!("auto-start usage-window check failed: {error:#}");
                     }
                     notify_auto_start_usage_windows_checked();
-                    thread::sleep(StdDuration::from_secs(AUTO_START_USAGE_WINDOW_POLL_SECONDS));
+                    let poll_seconds = compute_poll_interval(&env);
+                    thread::sleep(StdDuration::from_secs(poll_seconds));
                 }
             });
     });
+}
+
+fn switch_target_is_improvement(
+    reason: &str,
+    current: Option<&crate::model::AccountUsageView>,
+    target: Option<&crate::model::AccountUsageView>,
+    now: OffsetDateTime,
+    near_limit_threshold: u8,
+) -> bool {
+    if reason == "login expired" {
+        return true;
+    }
+    let Some(target) = target else {
+        return false;
+    };
+    if target.is_out_of_quota(now) || target.has_stale_quota_cache(now) {
+        return false;
+    }
+    match reason {
+        "rate limit detected" | "quota exhausted" => {
+            !target.should_switch_account(now, near_limit_threshold)
+        }
+        "quota nearly exhausted" => {
+            let target_remaining = target.min_remaining_percent(now);
+            let current_remaining = current.and_then(|usage| usage.min_remaining_percent(now));
+            match (current_remaining, target_remaining) {
+                (Some(current), Some(target)) => {
+                    target > current && target > near_limit_threshold
+                }
+                (None, Some(target)) => target > near_limit_threshold,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn current_switch_reason(
+    account: &crate::model::SavedAccountMetadata,
+    now: OffsetDateTime,
+    near_limit_threshold: u8,
+) -> Option<&'static str> {
+    if let Some(err) = account.cached_usage_error.as_deref() {
+        if crate::usage::usage_error_indicates_rate_limit(err) {
+            return Some("rate limit detected");
+        }
+        if crate::usage::usage_error_requires_login(err) {
+            return Some("login expired");
+        }
+    }
+    let Some(usage) = account.cached_usage.as_ref() else {
+        return None;
+    };
+    if usage.is_out_of_quota(now) {
+        return Some("quota exhausted");
+    }
+    if usage.is_near_limit(now, near_limit_threshold) {
+        return Some("quota nearly exhausted");
+    }
+    None
+}
+
+fn compute_poll_interval(env: &AppEnv) -> u64 {
+    let settings = load_settings(&env.app_data_dir).unwrap_or_default();
+    let enabled = settings.auto_start_usage_windows || settings.auto_switch_on_limit;
+    if !enabled {
+        return DEFAULT_USAGE_WINDOW_POLL_SECONDS;
+    }
+
+    let interval = if settings.auto_switch_on_limit {
+        settings.auto_switch_poll_seconds.max(15)
+    } else {
+        DEFAULT_USAGE_WINDOW_POLL_SECONDS
+    };
+
+    if !settings.auto_switch_on_limit {
+        return interval;
+    }
+
+    let repository = SnapshotRepository::new(
+        &env.app_data_dir,
+        MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),
+    );
+    let Ok(accounts) = repository.list_accounts(&env.kind) else {
+        return interval;
+    };
+    let now = OffsetDateTime::now_utc();
+    let threshold = settings.near_limit_threshold_percent;
+    let mut urgent = false;
+    let mut near_limit = false;
+
+    for account in &accounts {
+        if let Some(err) = account.cached_usage_error.as_deref()
+            && crate::usage::usage_error_indicates_rate_limit(err)
+        {
+            urgent = true;
+            break;
+        }
+        if let Some(usage) = account.cached_usage.as_ref() {
+            if usage.is_out_of_quota(now) {
+                urgent = true;
+                break;
+            }
+            if usage.is_near_limit(now, threshold) {
+                near_limit = true;
+            }
+        }
+    }
+
+    if urgent {
+        URGENT_POLL_SECONDS
+    } else if near_limit {
+        interval.min(NEAR_LIMIT_POLL_SECONDS)
+    } else {
+        interval
+    }
 }
 
 fn notify_auto_start_usage_windows_checked() {
@@ -405,7 +507,7 @@ fn run_auto_start_usage_windows_for_env(env: AppEnv) -> Result<()> {
 fn auto_start_status_output(enabled: bool) -> AutoStartUsageWindowsStatusOutput {
     AutoStartUsageWindowsStatusOutput {
         enabled,
-        poll_seconds: AUTO_START_USAGE_WINDOW_POLL_SECONDS,
+        poll_seconds: DEFAULT_AUTO_SWITCH_POLL_SECONDS,
     }
 }
 
@@ -846,6 +948,66 @@ mod tests {
         assert!(usage_window_needs_ping(now, now));
         assert!(usage_window_needs_ping(now - Duration::minutes(1), now));
         assert!(!usage_window_needs_ping(now + Duration::minutes(1), now));
+    }
+
+    #[test]
+    fn switch_target_is_improvement_rejects_exhausted_target() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let reset = now + time::Duration::hours(1);
+        let current = crate::model::AccountUsageView {
+            source: crate::model::UsageSource::SavedAccessToken,
+            fetched_at: now,
+            five_hour: Some(crate::model::UsageWindowView {
+                used_percent: 100,
+                remaining_percent: 0,
+                reset_at: reset,
+            }),
+            weekly: None,
+            credits: None,
+        };
+        let target = current.clone();
+        assert!(!switch_target_is_improvement(
+            "quota exhausted",
+            Some(&current),
+            Some(&target),
+            now,
+            5,
+        ));
+    }
+
+    #[test]
+    fn switch_target_is_improvement_rejects_near_limit_ping_pong() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let reset = now + time::Duration::hours(1);
+        let current = crate::model::AccountUsageView {
+            source: crate::model::UsageSource::SavedAccessToken,
+            fetched_at: now,
+            five_hour: Some(crate::model::UsageWindowView {
+                used_percent: 97,
+                remaining_percent: 3,
+                reset_at: reset,
+            }),
+            weekly: None,
+            credits: None,
+        };
+        let target = crate::model::AccountUsageView {
+            source: crate::model::UsageSource::SavedAccessToken,
+            fetched_at: now,
+            five_hour: Some(crate::model::UsageWindowView {
+                used_percent: 96,
+                remaining_percent: 4,
+                reset_at: reset,
+            }),
+            weekly: None,
+            credits: None,
+        };
+        assert!(!switch_target_is_improvement(
+            "quota nearly exhausted",
+            Some(&current),
+            Some(&target),
+            now,
+            5,
+        ));
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]

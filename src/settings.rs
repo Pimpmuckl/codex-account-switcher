@@ -6,7 +6,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::file_store::replace_file_with_recovery;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub const DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT: u8 = 5;
+pub const DEFAULT_AUTO_SWITCH_POLL_SECONDS: u64 = 60;
+pub const DEFAULT_USAGE_WINDOW_POLL_SECONDS: u64 = 300;
+
+fn default_near_limit_threshold_percent() -> u8 {
+    DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT
+}
+
+fn default_auto_switch_poll_seconds() -> u64 {
+    DEFAULT_AUTO_SWITCH_POLL_SECONDS
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppSettings {
     #[serde(default)]
     pub auto_start_usage_windows: bool,
@@ -14,6 +26,24 @@ pub struct AppSettings {
     pub auto_switch_on_limit: bool,
     #[serde(default)]
     pub launch_at_startup: bool,
+    /// Switch proactively when any quota window drops to this remaining % or below.
+    #[serde(default = "default_near_limit_threshold_percent")]
+    pub near_limit_threshold_percent: u8,
+    /// How often to poll usage when auto-switch is enabled.
+    #[serde(default = "default_auto_switch_poll_seconds")]
+    pub auto_switch_poll_seconds: u64,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            auto_start_usage_windows: false,
+            auto_switch_on_limit: false,
+            launch_at_startup: false,
+            near_limit_threshold_percent: DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT,
+            auto_switch_poll_seconds: DEFAULT_AUTO_SWITCH_POLL_SECONDS,
+        }
+    }
 }
 
 pub fn load_settings(app_data_dir: &Path) -> Result<AppSettings> {
@@ -56,6 +86,14 @@ mod tests {
         assert!(!settings.auto_start_usage_windows);
         assert!(!settings.auto_switch_on_limit);
         assert!(!settings.launch_at_startup);
+        assert_eq!(
+            settings.near_limit_threshold_percent,
+            DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT
+        );
+        assert_eq!(
+            settings.auto_switch_poll_seconds,
+            DEFAULT_AUTO_SWITCH_POLL_SECONDS
+        );
     }
 
     #[test]
@@ -67,6 +105,7 @@ mod tests {
                 auto_start_usage_windows: true,
                 auto_switch_on_limit: true,
                 launch_at_startup: true,
+                ..AppSettings::default()
             },
         )
         .expect("save settings");
@@ -89,5 +128,13 @@ mod tests {
         assert!(!settings.auto_start_usage_windows);
         assert!(!settings.auto_switch_on_limit);
         assert!(!settings.launch_at_startup);
+        assert_eq!(
+            settings.near_limit_threshold_percent,
+            DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT
+        );
+        assert_eq!(
+            settings.auto_switch_poll_seconds,
+            DEFAULT_AUTO_SWITCH_POLL_SECONDS
+        );
     }
 }

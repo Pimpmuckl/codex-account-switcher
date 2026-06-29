@@ -325,6 +325,44 @@ impl AccountUsageView {
         }
         false
     }
+
+    /// Lowest remaining quota across active windows, or `None` when no window is active.
+    pub fn min_remaining_percent(&self, now: OffsetDateTime) -> Option<u8> {
+        [self.five_hour.as_ref(), self.weekly.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|window| window.reset_at > now)
+            .map(|window| window.remaining_percent)
+            .min()
+    }
+
+    /// True when any active window is nearly exhausted but not yet at 0%.
+    pub fn is_near_limit(&self, now: OffsetDateTime, threshold_percent: u8) -> bool {
+        if threshold_percent == 0 {
+            return false;
+        }
+        [self.five_hour.as_ref(), self.weekly.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|window| {
+                window.reset_at > now
+                    && window.remaining_percent > 0
+                    && window.remaining_percent <= threshold_percent
+            })
+    }
+
+    /// Whether auto-switch should leave this account (exhausted or proactively near limit).
+    pub fn should_switch_account(&self, now: OffsetDateTime, near_limit_threshold: u8) -> bool {
+        self.is_out_of_quota(now) || self.is_near_limit(now, near_limit_threshold)
+    }
+
+    /// True when any window's reset time has passed and cached usage may be stale.
+    pub fn has_stale_quota_cache(&self, now: OffsetDateTime) -> bool {
+        [self.five_hour.as_ref(), self.weekly.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|window| window.reset_at <= now)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -427,5 +465,46 @@ mod usage_tests {
             }),
         );
         assert!(!usage.is_out_of_quota(OffsetDateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn is_near_limit_when_remaining_is_at_threshold() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let reset = now + time::Duration::hours(1);
+        let usage = usage_view(Some(window(5, reset)), None, None);
+        assert!(usage.is_near_limit(now, 5));
+        assert!(!usage.is_near_limit(now, 4));
+    }
+
+    #[test]
+    fn should_switch_account_when_near_limit_or_exhausted() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let reset = now + time::Duration::hours(1);
+        let near = usage_view(Some(window(3, reset)), None, None);
+        let exhausted = usage_view(Some(window(0, reset)), None, None);
+        let healthy = usage_view(Some(window(50, reset)), None, None);
+        assert!(near.should_switch_account(now, 5));
+        assert!(exhausted.should_switch_account(now, 5));
+        assert!(!healthy.should_switch_account(now, 5));
+    }
+
+    #[test]
+    fn min_remaining_percent_picks_lowest_active_window() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let reset = now + time::Duration::hours(1);
+        let usage = usage_view(
+            Some(window(20, reset)),
+            Some(window(60, reset + time::Duration::days(1))),
+            None,
+        );
+        assert_eq!(usage.min_remaining_percent(now), Some(20));
+    }
+
+    #[test]
+    fn has_stale_quota_cache_when_reset_time_passed() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
+        let reset = now - time::Duration::hours(1);
+        let usage = usage_view(Some(window(0, reset)), None, None);
+        assert!(usage.has_stale_quota_cache(now));
     }
 }

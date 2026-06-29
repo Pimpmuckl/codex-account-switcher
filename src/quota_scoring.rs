@@ -2,7 +2,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::model::{AccountUsageView, UsageWindowView};
-use crate::usage::usage_error_requires_login;
+use crate::usage::{usage_error_indicates_rate_limit, usage_error_requires_login};
 
 const WEEKLY_WINDOW_SECONDS: f64 = 168.0 * 3600.0;
 
@@ -74,6 +74,19 @@ pub fn score_saved_account(
         };
     }
 
+    if cached_usage_error.is_some_and(usage_error_indicates_rate_limit) {
+        return AccountQuotaScore {
+            account_id,
+            email: email.to_owned(),
+            label: label.map(str::to_owned),
+            score: f64::INFINITY,
+            weekly_used_percent: None,
+            five_hour_used_percent: None,
+            eligible: false,
+            detail: Some("rate limited".to_owned()),
+        };
+    }
+
     let Some(usage) = cached_usage else {
         return AccountQuotaScore {
             account_id,
@@ -134,6 +147,51 @@ pub fn pick_best_account_id(scores: &[AccountQuotaScore]) -> Option<Uuid> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|entry| entry.account_id)
+}
+
+/// Pick the best switch target, excluding the current account.
+pub fn pick_switch_target(scores: &[AccountQuotaScore], exclude_id: Uuid) -> Option<Uuid> {
+    scores
+        .iter()
+        .filter(|entry| entry.eligible && entry.account_id != exclude_id)
+        .min_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|entry| entry.account_id)
+}
+
+pub fn score_saved_account_for_auto_switch(
+    account_id: Uuid,
+    email: &str,
+    label: Option<&str>,
+    cached_usage: Option<&AccountUsageView>,
+    cached_usage_error: Option<&str>,
+    now: OffsetDateTime,
+) -> AccountQuotaScore {
+    let mut score = score_saved_account(
+        account_id,
+        email,
+        label,
+        cached_usage,
+        cached_usage_error,
+        now,
+    );
+    if cached_usage.is_none() && score.eligible {
+        score.eligible = false;
+        score.score = f64::INFINITY;
+        score.detail = Some("quota unknown — refresh required".to_owned());
+    }
+    if let Some(usage) = cached_usage
+        && usage.has_stale_quota_cache(now)
+        && score.eligible
+    {
+        score.eligible = false;
+        score.score = f64::INFINITY;
+        score.detail = Some("quota stale — refresh required".to_owned());
+    }
+    score
 }
 
 fn effective_used_percent(window: &UsageWindowView, now: OffsetDateTime) -> u8 {
@@ -227,5 +285,89 @@ mod tests {
             pick_best_account_id(&[blocked, eligible.clone()]),
             Some(eligible.account_id)
         );
+    }
+
+    #[test]
+    fn pick_switch_target_excludes_current_account() {
+        let current = AccountQuotaScore {
+            account_id: Uuid::new_v4(),
+            email: "current@example.com".to_owned(),
+            label: None,
+            score: 0.0,
+            weekly_used_percent: Some(10),
+            five_hour_used_percent: Some(5),
+            eligible: true,
+            detail: None,
+        };
+        let better = AccountQuotaScore {
+            account_id: Uuid::new_v4(),
+            email: "better@example.com".to_owned(),
+            label: None,
+            score: 5.0,
+            weekly_used_percent: Some(20),
+            five_hour_used_percent: Some(10),
+            eligible: true,
+            detail: None,
+        };
+        assert_eq!(
+            pick_switch_target(&[current.clone(), better.clone()], current.account_id),
+            Some(better.account_id)
+        );
+    }
+
+    #[test]
+    fn auto_switch_marks_unknown_quota_ineligible() {
+        let score = score_saved_account_for_auto_switch(
+            Uuid::new_v4(),
+            "user@example.com",
+            None,
+            None,
+            None,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert!(!score.eligible);
+        assert!(score.detail.as_deref().is_some_and(|d| d.contains("unknown")));
+    }
+
+    #[test]
+    fn auto_switch_marks_rate_limited_account_ineligible() {
+        let score = score_saved_account_for_auto_switch(
+            Uuid::new_v4(),
+            "user@example.com",
+            None,
+            Some(&usage(
+                Some(window(50, OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1))),
+                None,
+            )),
+            Some("rate limit exceeded"),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert!(!score.eligible);
+        assert_eq!(score.detail.as_deref(), Some("rate limited"));
+    }
+
+    #[test]
+    fn pick_switch_target_returns_none_when_all_accounts_exhausted() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let reset = now + time::Duration::hours(1);
+        let accounts = [
+            score_saved_account_for_auto_switch(
+                Uuid::new_v4(),
+                "a@example.com",
+                None,
+                Some(&usage(Some(window(100, reset)), None)),
+                None,
+                now,
+            ),
+            score_saved_account_for_auto_switch(
+                Uuid::new_v4(),
+                "b@example.com",
+                None,
+                Some(&usage(Some(window(100, reset)), None)),
+                None,
+                now,
+            ),
+        ];
+        assert!(pick_switch_target(&accounts, accounts[0].account_id).is_none());
     }
 }

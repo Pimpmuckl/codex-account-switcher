@@ -122,6 +122,19 @@ pub fn usage_error_requires_login(error: &str) -> bool {
                 || error.contains("sign in")))
 }
 
+/// True when the usage API or upstream signals an active rate/quota block.
+pub fn usage_error_indicates_rate_limit(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("rate limit")
+        || error.contains("rate_limit")
+        || error.contains("too many requests")
+        || error.contains("quota exceeded")
+        || error.contains("usage limit")
+        || error.contains("limit reached")
+        || error.contains("429")
+        || error.contains("resource_exhausted")
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredAuth {
     tokens: StoredTokens,
@@ -282,6 +295,10 @@ fn fetch_usage_response(access_token: &str, account_id: Option<&str>) -> Result<
     let status = response.status();
     if status == 401 || status == 403 {
         bail!("usage authorization failed");
+    }
+    if status.as_u16() == 429 {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        bail!("usage rate limit exceeded (429): {body}");
     }
     if status.as_u16() >= 400 {
         let body = response.body_mut().read_to_string().unwrap_or_default();
@@ -532,6 +549,15 @@ mod tests {
         ));
         assert!(usage_error_requires_login("snapshot refresh token missing"));
         assert!(!usage_error_requires_login("failed to query Codex usage"));
+    }
+
+    #[test]
+    fn usage_error_indicates_rate_limit_detects_quota_signals() {
+        assert!(usage_error_indicates_rate_limit(
+            "usage rate limit exceeded (429): too many requests"
+        ));
+        assert!(usage_error_indicates_rate_limit("quota exceeded for this window"));
+        assert!(!usage_error_indicates_rate_limit("usage authorization failed"));
     }
 
     #[test]
