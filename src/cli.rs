@@ -469,6 +469,9 @@ where
             match app.interactive(InteractiveMode::Persistent, false)? {
                 InteractiveExit::Quit => return Ok(()),
                 InteractiveExit::SendToTray => {
+                    if crate::tray::spawn_detached_tray_instance()? {
+                        return Ok(());
+                    }
                     crate::tray::hide_console_window();
                     match crate::tray::run(app)? {
                         crate::tray::TrayExit::ShowTui => crate::tray::show_console_window(),

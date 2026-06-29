@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -10,23 +11,28 @@ use tray_icon::menu::{
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use uuid::Uuid;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
 use crate::app::App;
 use crate::codex;
+use crate::env::AppEnv;
 use crate::model::{
     AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountView, DisplayIdentity, QUOTA_PAST_RESET_LABEL,
+    SwitchWhenRunning,
 };
 use crate::repository::SnapshotRepository;
-use crate::secrets::SecretStore;
+use crate::secrets::{MigratingSecretStore, SecretStore};
 use crate::usage::usage_error_requires_login;
 
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
     AutoStartUsageWindowsChecked,
+    BackgroundTaskDone {
+        notification: Option<(String, String)>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +71,19 @@ pub(crate) fn run<S>(app: &App<S>) -> Result<TrayExit>
 where
     S: SecretStore,
 {
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
+    #[cfg(target_os = "macos")]
+    ignore_terminal_hangup();
+
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        builder
+            .with_activation_policy(ActivationPolicy::Accessory)
+            .with_activate_ignoring_other_apps(false)
+            .with_default_menu(false);
+    }
+    let event_loop = builder
         .build()
         .context("failed to create tray event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -110,7 +128,48 @@ impl<S> ApplicationHandler<UserEvent> for TrayState<'_, S>
 where
     S: SecretStore,
 {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        // tray-icon must be created once the event loop is running (tauri-apps/tray-icon#90).
+        if cause == StartCause::Init {
+            self.ensure_tray_icon();
+        }
+    }
+
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+        self.ensure_tray_icon();
+    }
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        _event: WindowEvent,
+    ) {
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::AutoStartUsageWindowsChecked | UserEvent::BackgroundTaskDone { .. } => {
+                if let UserEvent::BackgroundTaskDone {
+                    notification: Some((title, body)),
+                } = &event
+                {
+                    tray_notify(title, body);
+                }
+                if let Err(error) = self.update_tray_menu() {
+                    eprintln!("failed to refresh tray menu: {error:#}");
+                }
+            }
+            UserEvent::Menu(event) => self.handle_menu_event(event_loop, event),
+        }
+    }
+}
+
+impl<S> TrayState<'_, S>
+where
+    S: SecretStore,
+{
+    fn ensure_tray_icon(&mut self) {
         if self.tray_icon.is_some() {
             return;
         }
@@ -123,156 +182,115 @@ where
                 let tooltip = self.get_tooltip_text(&status, &list);
                 match self.rebuild_menu_with_status_and_list(&status, &list) {
                     Ok(menu) => {
+                        let (icon, template) = load_tray_icon();
                         let mut builder = TrayIconBuilder::new()
                             .with_tooltip(tooltip)
-                            .with_icon(load_codex_icon())
+                            .with_icon(icon)
                             .with_menu(Box::new(menu));
                         #[cfg(target_os = "macos")]
                         {
-                            builder = builder.with_icon_as_template(true);
+                            builder = builder.with_icon_as_template(template);
                         }
                         match builder.build() {
                             Ok(tray_icon) => {
                                 self.tray_icon = Some(tray_icon);
                                 self.spawn_startup_usage_refresh();
+                                #[cfg(target_os = "macos")]
+                                wake_main_run_loop();
+                                log_tray_message(
+                                    self.app,
+                                    &format!(
+                                        "tray icon created (template={template}, pid={})",
+                                        std::process::id()
+                                    ),
+                                );
                             }
-                            Err(error) => eprintln!("failed to create tray icon: {error:#}"),
+                            Err(error) => log_tray_error(
+                                self.app,
+                                &format!("failed to create tray icon: {error:#}"),
+                            ),
                         }
                     }
-                    Err(error) => eprintln!("failed to build tray menu: {error:#}"),
+                    Err(error) => log_tray_error(self.app, &format!("failed to build tray menu: {error:#}")),
                 }
             }
-            Err(error) => eprintln!("failed to query app status and list: {error:#}"),
+            Err(error) => log_tray_error(self.app, &format!("failed to query app status and list: {error:#}")),
         }
     }
 
-    fn window_event(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        _event: WindowEvent,
-    ) {
-    }
-
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::Menu(event) = event else {
-            if let Err(error) = self.update_tray_menu() {
-                eprintln!("failed to refresh tray menu: {error:#}");
-            }
-            return;
-        };
+    fn handle_menu_event(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
         let command = self.commands.get(event.id.as_ref()).cloned();
         match command {
             Some(TrayCommand::Activate(account_id)) => {
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = std::process::Command::new("osascript")
-                        .args(["-e", "quit app \"Codex\""])
-                        .output();
-                    let _ = std::process::Command::new("pkill")
-                        .args(["-x", "Codex"])
-                        .output();
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                let was_running = !self.app.activation_preflight_warnings().is_empty();
+                let policy = if was_running {
+                    crate::process::prompt_switch_when_running()
+                } else {
+                    SwitchWhenRunning::WaitAndSwitch
+                };
+                if was_running && policy == SwitchWhenRunning::Cancel {
+                    return;
                 }
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/f", "/im", "Codex.exe"])
-                        .output();
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-
-                let mut activated_info = None;
-                match self.app.activate_with_running_policy(account_id, false) {
-                    Ok(output) => {
-                        let email = output.account.email.clone();
-                        let plan = format_plan_label_simple(output.account.plan_label.as_deref());
-                        activated_info = Some((email, plan));
+                let proxy = self.event_proxy.clone();
+                let env = self.app.env().clone();
+                spawn_tray_background(proxy, move || {
+                    let app = tray_app_for_env(&env);
+                    if was_running && policy == SwitchWhenRunning::SwitchNow {
+                        crate::process::quit_running_codex_app();
+                    } else if was_running {
+                        crate::process::wait_for_codex_processes_to_exit();
                     }
-                    Err(error) => {
-                        eprintln!("failed to activate account from tray: {error:#}");
-                    }
-                }
-
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = std::process::Command::new("open")
-                        .args(["-a", "Codex"])
-                        .spawn();
-                    if let Some((email, plan)) = activated_info {
-                        let msg = format!("Switched to account {email} ({plan}). Codex restarted.");
-                        let _ = std::process::Command::new("osascript")
-                            .arg("-e")
-                            .arg(format!(
-                                "display notification \"{}\" with title \"Codex Switcher\"",
-                                msg.replace('"', "\\\"")
-                            ))
-                            .spawn();
-                    }
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("cmd")
-                        .args(["/c", "start", "", "Codex"])
-                        .spawn();
-                }
-
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                    let force = was_running && policy == SwitchWhenRunning::SwitchNow;
+                    let output = app.activate_with_running_policy(account_id, force)?;
+                    crate::process::launch_codex_app();
+                    let email = output.account.email;
+                    let plan = format_plan_label_simple(output.account.plan_label.as_deref());
+                    let detail = if was_running && policy == SwitchWhenRunning::WaitAndSwitch {
+                        " Codex restarted after tasks finished."
+                    } else {
+                        " Codex restarted."
+                    };
+                    Ok(Some((
+                        "Codex Switcher".to_owned(),
+                        format!("Switched to account {email} ({plan}).{detail}"),
+                    )))
+                });
             }
             Some(TrayCommand::Login(account_id)) => {
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = std::process::Command::new("osascript")
-                        .args(["-e", "quit app \"Codex\""])
-                        .output();
-                    let _ = std::process::Command::new("pkill")
-                        .args(["-x", "Codex"])
-                        .output();
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/f", "/im", "Codex.exe"])
-                        .output();
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-
-                if let Err(error) = self.app.activate_with_running_policy(account_id, false) {
-                    eprintln!("failed to activate account from tray: {error:#}");
-                }
-
-                #[cfg(target_os = "macos")]
-                {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new("osascript")
-                            .arg("-e")
-                            .arg(format!(
-                                "tell application \"Terminal\" to do script \"codex login && '{}' save\"",
-                                exe.display()
-                            ))
-                            .spawn();
+                let proxy = self.event_proxy.clone();
+                let env = self.app.env().clone();
+                spawn_tray_background(proxy, move || {
+                    let app = tray_app_for_env(&env);
+                    crate::process::quit_running_codex_app();
+                    app.activate_with_running_policy(account_id, false)?;
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new("osascript")
+                                .arg("-e")
+                                .arg(format!(
+                                    "tell application \"Terminal\" to do script \"codex login && '{}' save\"",
+                                    exe.display()
+                                ))
+                                .spawn();
+                        }
                     }
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    if let Ok(exe) = std::env::current_exe() {
-                        let _ = std::process::Command::new("cmd")
-                            .args([
-                                "/c",
-                                "start",
-                                "cmd",
-                                "/k",
-                                &format!("codex login && \"{}\" save", exe.display()),
-                            ])
-                            .spawn();
+                    #[cfg(target_os = "windows")]
+                    {
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new("cmd")
+                                .args([
+                                    "/c",
+                                    "start",
+                                    "cmd",
+                                    "/k",
+                                    &format!("codex login && \"{}\" save", exe.display()),
+                                ])
+                                .spawn();
+                        }
                     }
-                }
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                    Ok(None)
+                });
             }
             Some(TrayCommand::SaveCurrent) => {
                 let msg = match self.app.save_current() {
@@ -291,12 +309,16 @@ where
             Some(TrayCommand::StartAddAccount) => {
                 match self.app.begin_add_account_session() {
                     Ok(()) => {
-                        quit_codex_app();
-                        launch_codex_app();
-                        tray_notify(
-                            "Codex Switcher",
-                            "Login in Codex with the new account, then choose Finish Adding Account.",
-                        );
+                        let proxy = self.event_proxy.clone();
+                        spawn_tray_background(proxy, move || {
+                            crate::process::quit_running_codex_app();
+                            crate::process::launch_codex_app();
+                            Ok(Some((
+                                "Codex Switcher".to_owned(),
+                                "Login in Codex with the new account, then choose Finish Adding Account."
+                                    .to_owned(),
+                            )))
+                        });
                     }
                     Err(error) => {
                         tray_notify(
@@ -310,62 +332,85 @@ where
                 }
             }
             Some(TrayCommand::FinishAddAccount) => {
-                let msg = match self.app.save_during_add_account_session() {
-                    Ok(output) => {
-                        quit_codex_app();
-                        if let Err(error) = codex::restore_add_account_backup(self.app.env()) {
-                            format!(
-                                "Saved {} but failed to restore original login: {error:#}",
-                                output.account.email
-                            )
-                        } else {
-                            launch_codex_app();
-                            format!("Added account {} successfully.", output.account.email)
+                let proxy = self.event_proxy.clone();
+                let env = self.app.env().clone();
+                spawn_tray_background(proxy, move || {
+                    let app = tray_app_for_env(&env);
+                    let msg = match app.save_during_add_account_session() {
+                        Ok(output) => {
+                            crate::process::quit_running_codex_app();
+                            if let Err(error) = codex::restore_add_account_backup(app.env()) {
+                                format!(
+                                    "Saved {} but failed to restore original login: {error:#}",
+                                    output.account.email
+                                )
+                            } else {
+                                crate::process::launch_codex_app();
+                                format!("Added account {} successfully.", output.account.email)
+                            }
                         }
-                    }
-                    Err(error) => format!("Failed to finish adding account: {error:#}"),
-                };
-                tray_notify("Codex Switcher", &msg);
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                        Err(error) => format!("Failed to finish adding account: {error:#}"),
+                    };
+                    Ok(Some(("Codex Switcher".to_owned(), msg)))
+                });
             }
             Some(TrayCommand::CancelAddAccount) => {
-                quit_codex_app();
-                let msg = match self.app.cancel_add_account_session() {
-                    Ok(()) => {
-                        launch_codex_app();
-                        "Cancelled. Original account restored.".to_owned()
-                    }
-                    Err(error) => format!("Failed to cancel add account: {error:#}"),
-                };
-                tray_notify("Codex Switcher", &msg);
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                let proxy = self.event_proxy.clone();
+                let env = self.app.env().clone();
+                spawn_tray_background(proxy, move || {
+                    let app = tray_app_for_env(&env);
+                    crate::process::quit_running_codex_app();
+                    let msg = match app.cancel_add_account_session() {
+                        Ok(()) => {
+                            crate::process::launch_codex_app();
+                            "Cancelled. Original account restored.".to_owned()
+                        }
+                        Err(error) => format!("Failed to cancel add account: {error:#}"),
+                    };
+                    Ok(Some(("Codex Switcher".to_owned(), msg)))
+                });
             }
             Some(TrayCommand::PickBestQuota) => {
                 let was_running = !self.app.activation_preflight_warnings().is_empty();
-                if was_running {
-                    quit_codex_app();
-                }
-                let msg = match self.app.pick_best_account(true, true) {
-                    Ok(output) => {
-                        if output.switched {
-                            format!("Switched to best quota account {}.", output.account.email)
-                        } else {
-                            format!("Already on best quota account {}.", output.account.email)
-                        }
-                    }
-                    Err(error) => format!("Pick best quota failed: {error:#}"),
+                let policy = if was_running {
+                    crate::process::prompt_switch_when_running()
+                } else {
+                    SwitchWhenRunning::WaitAndSwitch
                 };
-                if was_running && msg.starts_with("Switched to best") {
-                    launch_codex_app();
+                if was_running && policy == SwitchWhenRunning::Cancel {
+                    return;
                 }
-                tray_notify("Codex Switcher", &msg);
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                let proxy = self.event_proxy.clone();
+                let env = self.app.env().clone();
+                spawn_tray_background(proxy, move || {
+                    let app = tray_app_for_env(&env);
+                    if was_running && policy == SwitchWhenRunning::SwitchNow {
+                        crate::process::quit_running_codex_app();
+                    } else if was_running {
+                        crate::process::wait_for_codex_processes_to_exit();
+                    }
+                    let msg = match app.pick_best_account(true, true) {
+                        Ok(output) => {
+                            if output.switched {
+                                if was_running && policy == SwitchWhenRunning::WaitAndSwitch {
+                                    format!(
+                                        "Switched to best quota account {} after Codex finished.",
+                                        output.account.email
+                                    )
+                                } else {
+                                    format!("Switched to best quota account {}.", output.account.email)
+                                }
+                            } else {
+                                format!("Already on best quota account {}.", output.account.email)
+                            }
+                        }
+                        Err(error) => format!("Pick best quota failed: {error:#}"),
+                    };
+                    if was_running && msg.starts_with("Switched to best") {
+                        crate::process::launch_codex_app();
+                    }
+                    Ok(Some(("Codex Switcher".to_owned(), msg)))
+                });
             }
             Some(TrayCommand::Delete(account_id, email)) => {
                 let confirmed = {
@@ -532,12 +577,7 @@ where
             None => {}
         }
     }
-}
 
-impl<S> TrayState<'_, S>
-where
-    S: SecretStore,
-{
     fn update_tray_menu(&mut self) -> Result<()> {
         let status = self.app.status()?;
         let list = self.app.list()?;
@@ -932,39 +972,31 @@ fn format_remaining_percent(percent: u8) -> String {
     format!("{percent:>3}").replace(' ', "\u{2007}")
 }
 
-fn quit_codex_app() {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("osascript")
-            .args(["-e", "quit app \"Codex\""])
-            .output();
-        let _ = std::process::Command::new("pkill")
-            .args(["-x", "Codex"])
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/f", "/im", "Codex.exe"])
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
+fn tray_app_for_env(env: &AppEnv) -> App<impl SecretStore> {
+    let repository = SnapshotRepository::new(
+        &env.app_data_dir,
+        MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),
+    );
+    App::new(env.clone(), repository)
 }
 
-fn launch_codex_app() {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open")
-            .args(["-a", "Codex"])
-            .spawn();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", "Codex"])
-            .spawn();
-    }
+fn spawn_tray_background(
+    proxy: EventLoopProxy<UserEvent>,
+    job: impl FnOnce() -> Result<Option<(String, String)>> + Send + 'static,
+) {
+    thread::spawn(move || {
+        let notification = match job() {
+            Ok(notification) => notification,
+            Err(error) => {
+                eprintln!("background tray task failed: {error:#}");
+                Some((
+                    "Codex Switcher".to_owned(),
+                    format!("Operation failed: {error:#}"),
+                ))
+            }
+        };
+        let _ = proxy.send_event(UserEvent::BackgroundTaskDone { notification });
+    });
 }
 
 fn tray_notify(title: &str, body: &str) {
@@ -981,6 +1013,18 @@ fn tray_notify(title: &str, body: &str) {
     }
 }
 
+fn load_tray_icon() -> (Icon, bool) {
+    #[cfg(target_os = "macos")]
+    {
+        for bytes in macos_menubar_icon_candidates() {
+            if let Ok(icon) = decode_menubar_icon_bytes(bytes) {
+                return (icon, true);
+            }
+        }
+    }
+    (load_codex_icon(), false)
+}
+
 fn load_codex_icon() -> Icon {
     for bytes in embedded_icon_candidates() {
         if let Ok(icon) = decode_icon_bytes(bytes) {
@@ -994,27 +1038,128 @@ fn load_codex_icon() -> Icon {
 }
 
 fn embedded_icon_candidates() -> &'static [&'static [u8]] {
-    #[cfg(target_os = "macos")]
-    {
-        &[
-            include_bytes!("../assets/codex-account-switcher-transparent.png"),
-            include_bytes!("../assets/codex-account-switcher.ico"),
-            include_bytes!("../assets/codex-account-switcher-dock.png"),
-        ]
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        &[
-            include_bytes!("../assets/codex-account-switcher.ico"),
-            include_bytes!("../assets/codex-account-switcher-dock.png"),
-            include_bytes!("../assets/codex-account-switcher-transparent.png"),
-        ]
-    }
+    &[
+        include_bytes!("../assets/codex-account-switcher.ico"),
+        include_bytes!("../assets/codex-account-switcher-dock.png"),
+        include_bytes!("../assets/codex-account-switcher-transparent.png"),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn macos_menubar_icon_candidates() -> &'static [&'static [u8]] {
+    &[
+        include_bytes!("../assets/codex-account-switcher-transparent.png"),
+        include_bytes!("../assets/codex-account-switcher-dock.png"),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+const MENUBAR_ICON_SIZE: u32 = 22;
+
+#[cfg(target_os = "macos")]
+fn decode_menubar_icon_bytes(bytes: &[u8]) -> Result<Icon> {
+    let image = image::load_from_memory(bytes)
+        .context("failed to decode menubar icon bytes")?
+        .into_rgba8();
+    let resized = image::imageops::resize(
+        &image,
+        MENUBAR_ICON_SIZE,
+        MENUBAR_ICON_SIZE,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let (width, height) = resized.dimensions();
+    Icon::from_rgba(resized.into_raw(), width, height).context("failed to create menubar tray icon")
 }
 
 pub(crate) fn hide_console_window() {
     #[cfg(target_os = "windows")]
     release_console();
+}
+
+#[cfg(target_os = "macos")]
+fn wake_main_run_loop() {
+    // tray-icon may not paint until the main run loop is nudged (winit #3835).
+    unsafe {
+        use core_foundation::runloop::{CFRunLoopGetMain, CFRunLoopWakeUp};
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ignore_terminal_hangup() {
+    // Keep the menu-bar agent alive when the launching terminal session closes.
+    // SAFETY: installing SIG_IGN is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+}
+
+fn log_tray_error<S: SecretStore>(app: &App<S>, message: &str) {
+    eprintln!("{message}");
+    log_tray_message(app, message);
+}
+
+fn log_tray_message<S: SecretStore>(app: &App<S>, message: &str) {
+    let log_path = tray_log_path(app);
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let timestamp = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "unknown-time".to_owned());
+        let _ = writeln!(file, "[{timestamp}] {message}");
+    }
+}
+
+fn tray_log_path<S: SecretStore>(app: &App<S>) -> PathBuf {
+    app.env().app_data_dir.join("tray.log")
+}
+
+#[cfg(target_os = "macos")]
+fn default_tray_log_path() -> PathBuf {
+    directories::ProjectDirs::from("com", "nextide", "codex-account-switcher")
+        .map(|dirs| dirs.data_local_dir().join("tray.log"))
+        .unwrap_or_else(|| PathBuf::from("tray.log"))
+}
+
+/// Start a detached tray instance and return `true` when the current process should exit.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_detached_tray_instance() -> Result<bool> {
+    use std::fs::OpenOptions;
+    use std::process::{Command, Stdio};
+
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let log_path = default_tray_log_path();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stderr = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .context("failed to open tray log for detached tray instance")?;
+    Command::new("nohup")
+        .arg(exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .context("failed to spawn detached tray instance")?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn spawn_detached_tray_instance() -> Result<bool> {
+    Ok(false)
 }
 
 pub(crate) fn show_console_window() {

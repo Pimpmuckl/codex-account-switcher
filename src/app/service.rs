@@ -3,6 +3,8 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use std::sync::{Mutex, OnceLock};
+
 use crate::codex;
 use crate::env::AppEnv;
 use crate::model::{
@@ -19,6 +21,8 @@ use super::{
     App, account_view, match_saved_account, saved_identity, should_verify_activation_stability,
     subject_bound_identity_matches,
 };
+
+static ACCOUNT_SWITCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 impl<S> App<S>
 where
@@ -118,6 +122,10 @@ where
         account_id: Uuid,
         force_running: bool,
     ) -> Result<ActivateOutput> {
+        let _switch_guard = ACCOUNT_SWITCH_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("account switch lock poisoned"))?;
         let warnings = crate::process::detect_running_codex_processes();
         self.refresh_current_saved_account_before_activation();
         let (snapshot, snapshot_identity, restore_identity) =

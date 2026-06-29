@@ -240,6 +240,113 @@ fn truncate_cell(value: &str, width: usize) -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
+const MACOS_CODEX_MAIN_PROCESS_PATTERN: &str = "/Applications/Codex.app/Contents/MacOS/Codex";
+
+/// Gracefully stop the Codex desktop app before swapping auth snapshots.
+pub fn quit_running_codex_app() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", "quit app \"Codex\""])
+            .output();
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", MACOS_CODEX_MAIN_PROCESS_PATTERN])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/f", "/im", "Codex.exe"])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+pub const SWITCH_WAIT_POLL_MS: u64 = 2_000;
+
+/// Block until no Codex processes remain (polls every [`SWITCH_WAIT_POLL_MS`]).
+pub fn wait_for_codex_processes_to_exit() {
+    while !detect_running_codex_processes().is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(SWITCH_WAIT_POLL_MS));
+    }
+}
+
+/// Ask how to proceed when Codex is running. Defaults to waiting when the dialog fails.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn prompt_switch_when_running() -> crate::model::SwitchWhenRunning {
+    use crate::model::SwitchWhenRunning;
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"tell application "System Events" to display dialog "Codex is running with active tasks.
+
+Switch now quits Codex and switches immediately.
+Wait and switch defers until Codex finishes." buttons {"Cancel", "Wait and Switch", "Switch Now"} default button "Wait and Switch" with icon caution"#;
+        let output = std::process::Command::new("osascript")
+            .args(["-e", script])
+            .output();
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.contains("button returned:Switch Now") {
+                return SwitchWhenRunning::SwitchNow;
+            }
+            if stdout.contains("button returned:Wait and Switch") {
+                return SwitchWhenRunning::WaitAndSwitch;
+            }
+            return SwitchWhenRunning::Cancel;
+        }
+        SwitchWhenRunning::WaitAndSwitch
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = r#"Add-Type -AssemblyName Microsoft.VisualBasic
+$result = [Microsoft.VisualBasic.Interaction]::MsgBox(
+  'Codex is running with active tasks.' + [Environment]::NewLine + [Environment]::NewLine +
+  'Yes = Switch now (quit Codex immediately)' + [Environment]::NewLine +
+  'No = Wait and switch (defer until Codex finishes)' + [Environment]::NewLine +
+  'Cancel = Cancel',
+  [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
+  'Codex Account Switcher'
+)
+switch ($result) {
+  'Yes' { 'SwitchNow' }
+  'No' { 'WaitAndSwitch' }
+  default { 'Cancel' }
+}"#;
+        let output = std::process::Command::new("powershell")
+            .args(["-Command", script])
+            .output();
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            return match stdout.as_str() {
+                "SwitchNow" => SwitchWhenRunning::SwitchNow,
+                "WaitAndSwitch" => SwitchWhenRunning::WaitAndSwitch,
+                _ => SwitchWhenRunning::Cancel,
+            };
+        }
+        SwitchWhenRunning::WaitAndSwitch
+    }
+}
+
+/// Relaunch the Codex desktop app after auth has been restored.
+pub fn launch_codex_app() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .args(["-a", "Codex"])
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", "Codex"])
+            .spawn();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

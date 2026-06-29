@@ -287,6 +287,14 @@ pub struct RunningCodexProcess {
     pub summary: Option<String>,
 }
 
+/// User choice when switching accounts while Codex processes are running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchWhenRunning {
+    Cancel,
+    WaitAndSwitch,
+    SwitchNow,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DeleteOutput {
     pub deleted_account_id: Uuid,

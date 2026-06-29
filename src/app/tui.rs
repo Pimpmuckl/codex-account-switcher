@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::model::{
     AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountView, AutoStartUsageWindowsRunOutput,
     BatchRefreshOutput, ListOutput, PickBestOutput, QUOTA_PAST_RESET_LABEL, RunningCodexProcess,
-    SaveAction, StatusOutput,
+    SaveAction, StatusOutput, SwitchWhenRunning,
 };
 use crate::process::format_process_table;
 use crate::secrets::SecretStore;
@@ -100,13 +100,23 @@ where
                 }
                 InteractiveAction::Activate(account_id) => {
                     let warnings = self.activation_preflight_warnings();
-                    let showed_preflight = !warnings.is_empty();
-                    if showed_preflight && !confirm_activation(&warnings)? {
-                        continue;
-                    }
-                    let output = match self
-                        .activate_with_running_policy(account_id, force_running || showed_preflight)
-                    {
+                    let was_running = !warnings.is_empty();
+                    let force = if was_running {
+                        match prompt_switch_policy(
+                            "Switch account while Codex is running?",
+                            &warnings,
+                        )? {
+                            SwitchWhenRunning::Cancel => continue,
+                            SwitchWhenRunning::SwitchNow => true,
+                            SwitchWhenRunning::WaitAndSwitch => {
+                                crate::process::wait_for_codex_processes_to_exit();
+                                false
+                            }
+                        }
+                    } else {
+                        force_running
+                    };
+                    let output = match self.activate_with_running_policy(account_id, force) {
                         Ok(output) => output,
                         Err(error) => {
                             if matches!(mode, InteractiveMode::Persistent) {
@@ -115,7 +125,8 @@ where
                                     "Account activation failed.",
                                     &rendered_error,
                                 );
-                                if showed_preflight
+                                if was_running
+                                    && force
                                     && error_indicates_running_process_instability(&rendered_error)
                                 {
                                     feedback.push(
@@ -132,13 +143,13 @@ where
                         "Activated {} ({})",
                         output.account.email, output.account.id
                     ));
-                    if showed_preflight {
+                    if was_running && force {
                         feedback.push(
                             "Codex was still running during activation. If the account does not change in Codex, close those processes fully and retry."
                                 .to_owned(),
                         );
                     }
-                    if !showed_preflight && !output.warnings.is_empty() {
+                    if !was_running && !output.warnings.is_empty() {
                         feedback.extend(process_summary_lines("Codex processes", &output.warnings));
                     }
                     if matches!(mode, InteractiveMode::ActivateOnce) {
@@ -208,14 +219,26 @@ where
                 },
                 InteractiveAction::PickBestQuota => {
                     let warnings = self.activation_preflight_warnings();
-                    let showed_preflight = !warnings.is_empty();
-                    if showed_preflight && !confirm_pick_best(&warnings)? {
-                        continue;
-                    }
+                    let was_running = !warnings.is_empty();
+                    let forced_switch = if was_running {
+                        match prompt_switch_policy(
+                            "Switch to best quota while Codex is running?",
+                            &warnings,
+                        )? {
+                            SwitchWhenRunning::Cancel => continue,
+                            SwitchWhenRunning::SwitchNow => true,
+                            SwitchWhenRunning::WaitAndSwitch => {
+                                crate::process::wait_for_codex_processes_to_exit();
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
                     match self.pick_best_account(true, true) {
                         Ok(output) => {
                             feedback.extend(pick_best_feedback(&output));
-                            if showed_preflight && output.switched {
+                            if forced_switch && output.switched {
                                 feedback.push(
                                     "Codex was still running during the switch. Close those processes fully if the account does not change in Codex."
                                         .to_owned(),
@@ -997,24 +1020,89 @@ fn prompt_for_account_label(account: &AccountView) -> Result<Option<String>> {
     })
 }
 
-fn confirm_pick_best(warnings: &[RunningCodexProcess]) -> Result<bool> {
-    if warnings.is_empty() {
-        return Ok(true);
-    }
+fn prompt_switch_policy(
+    prompt: &str,
+    warnings: &[RunningCodexProcess],
+) -> Result<SwitchWhenRunning> {
     let body = vec![
         "Codex appears to be running.".to_owned(),
-        "Close every listed process first for a reliable swap, or force the best-quota switch anyway."
-            .to_owned(),
+        "Wait and switch defers until Codex finishes.".to_owned(),
+        "Switch now forces the swap immediately.".to_owned(),
     ];
     let details = process_summary_lines("Codex processes", warnings);
-    confirm_with_menu(
-        "Continue with best-quota switch?",
+    let selection = prompt_choice_menu(
+        prompt,
         &body,
         &details,
-        "Yes, force switch",
-        "No, cancel",
-        false,
-    )
+        &["Cancel", "Wait and switch", "Switch now"],
+        1,
+    )?;
+    Ok(match selection {
+        0 => SwitchWhenRunning::Cancel,
+        1 => SwitchWhenRunning::WaitAndSwitch,
+        2 => SwitchWhenRunning::SwitchNow,
+        _ => SwitchWhenRunning::Cancel,
+    })
+}
+
+fn prompt_choice_menu(
+    prompt: &str,
+    body_lines: &[String],
+    trailing_lines: &[String],
+    options: &[&str],
+    default_index: usize,
+) -> Result<usize> {
+    let term = Term::stderr();
+    let mut selection = default_index.min(options.len().saturating_sub(1));
+    let mut rendered_lines = 0usize;
+    term.hide_cursor()?;
+    loop {
+        if rendered_lines > 0 {
+            term.clear_last_lines(rendered_lines)?;
+        }
+        rendered_lines = 0;
+        term.write_line(&style(prompt).bold().to_string())?;
+        rendered_lines += 1;
+        for line in body_lines {
+            term.write_line(line)?;
+            rendered_lines += 1;
+        }
+        if !body_lines.is_empty() || !trailing_lines.is_empty() {
+            term.write_line("")?;
+            rendered_lines += 1;
+        }
+        for (index, option) in options.iter().enumerate() {
+            term.write_line(&render_confirm_option(option, selection == index))?;
+            rendered_lines += 1;
+        }
+        if !trailing_lines.is_empty() {
+            term.write_line("")?;
+            rendered_lines += 1;
+            for line in trailing_lines {
+                term.write_line(line)?;
+                rendered_lines += 1;
+            }
+        }
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('k') => {
+                selection = selection.checked_sub(1).unwrap_or(options.len() - 1);
+            }
+            Key::ArrowDown | Key::Char('j') => {
+                selection = (selection + 1) % options.len();
+            }
+            Key::Enter => {
+                term.clear_last_lines(rendered_lines)?;
+                term.show_cursor()?;
+                return Ok(selection);
+            }
+            Key::Escape | Key::Char('q') => {
+                term.clear_last_lines(rendered_lines)?;
+                term.show_cursor()?;
+                return Ok(0);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn confirm_delete(account: &AccountView) -> Result<bool> {
@@ -1028,23 +1116,6 @@ fn confirm_delete(account: &AccountView) -> Result<bool> {
         &[],
         "Yes, delete",
         "No, keep it",
-        false,
-    )
-}
-
-fn confirm_activation(warnings: &[RunningCodexProcess]) -> Result<bool> {
-    let body = vec![
-        "Codex appears to be running.".to_owned(),
-        "Close every listed process first for a reliable swap, or force activation anyway."
-            .to_owned(),
-    ];
-    let details = process_summary_lines("Codex processes", warnings);
-    confirm_with_menu(
-        "Continue with account activation?",
-        &body,
-        &details,
-        "Yes, force activation",
-        "No, cancel",
         false,
     )
 }

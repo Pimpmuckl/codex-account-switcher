@@ -173,56 +173,16 @@ where
         ) {
             return Ok(None);
         }
-        let warnings = self.activation_preflight_warnings();
-        let was_running = !warnings.is_empty();
-
-        if was_running {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("osascript")
-                    .args(["-e", "quit app \"Codex\""])
-                    .output();
-                let _ = std::process::Command::new("pkill")
-                    .args(["-x", "Codex"])
-                    .output();
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/f", "/im", "Codex.exe"])
-                    .output();
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
+        if !self.activation_preflight_warnings().is_empty() {
+            return Ok(None);
         }
 
-        self.activate_with_running_policy(target_id, true)?;
+        self.activate_with_running_policy(target_id, false)?;
 
         let email = target_account.email.clone();
         let plan = target_account.plan_label.as_deref().unwrap_or("Free");
-        let msg = if was_running {
-            format!(
-                "Auto-switched to {email} ({plan}): {switch_reason}. Codex restarted."
-            )
-        } else {
-            format!("Auto-switched to {email} ({plan}): {switch_reason}.")
-        };
+        let msg = format!("Auto-switched to {email} ({plan}): {switch_reason}.");
         notify_auto_switch(&msg);
-
-        if was_running {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .args(["-a", "Codex"])
-                    .spawn();
-            }
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("cmd")
-                    .args(["/c", "start", "", "Codex"])
-                    .spawn();
-            }
-        }
 
         Ok(Some(target_id))
     }
@@ -1192,10 +1152,18 @@ mod tests {
 
         app.set_auto_switch_on_limit(true)?;
 
+        let codex_running = !crate::process::detect_running_codex_processes().is_empty();
         let switched = app.auto_switch_on_limit_once()?;
-        assert_eq!(switched, Some(saved_candidate.id));
-        let current = crate::codex::read_live_auth_bundle(&env)?;
-        assert_eq!(current.identity.email, "candidate@example.com");
+        if codex_running {
+            assert!(
+                switched.is_none(),
+                "auto-switch should defer while Codex processes are running"
+            );
+        } else {
+            assert_eq!(switched, Some(saved_candidate.id));
+            let current = crate::codex::read_live_auth_bundle(&env)?;
+            assert_eq!(current.identity.email, "candidate@example.com");
+        }
 
         Ok(())
     }
