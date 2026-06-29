@@ -29,12 +29,9 @@ install -m 755 "$SOURCE_BIN" "$INSTALL_BIN"
 if [[ -f "$LOCK_FILE" ]]; then
   OLD_PID="$(tr -d '[:space:]' <"$LOCK_FILE" 2>/dev/null || true)"
   if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "Stopping existing tray instance (pid=$OLD_PID)"
-    kill "$OLD_PID" 2>/dev/null || true
-    for _ in $(seq 1 20); do
-      kill -0 "$OLD_PID" 2>/dev/null || break
-      sleep 0.25
-    done
+    echo "Already running (pid=$OLD_PID). Check menu bar (Control Center → Menu Bar if hidden)."
+    echo "Log: $LOG_FILE"
+    exit 0
   fi
 fi
 

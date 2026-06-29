@@ -30,6 +30,19 @@ use super::App;
 
 pub const NEAR_LIMIT_POLL_SECONDS: u64 = 30;
 pub const URGENT_POLL_SECONDS: u64 = 15;
+const AUTO_SWITCH_CODEX_WAIT_SECONDS: u64 = 120;
+
+#[allow(dead_code)]
+fn auto_switch_codex_wait_timeout() -> StdDuration {
+    #[cfg(test)]
+    {
+        return StdDuration::ZERO;
+    }
+    #[cfg(not(test))]
+    {
+        StdDuration::from_secs(AUTO_SWITCH_CODEX_WAIT_SECONDS)
+    }
+}
 
 const PING_INSTRUCTIONS: &str = "Reply only with ACK.";
 const PING_PROMPT: &str = "ACK";
@@ -177,7 +190,18 @@ where
             return Ok(None);
         }
         if !self.activation_preflight_warnings().is_empty() {
-            return Ok(None);
+            let urgent = matches!(
+                switch_reason,
+                "quota exhausted" | "rate limit detected" | "login expired"
+            );
+            if !urgent {
+                return Ok(None);
+            }
+            if !crate::process::wait_for_codex_processes_to_exit_timeout(
+                auto_switch_codex_wait_timeout(),
+            ) {
+                return Ok(None);
+            }
         }
 
         self.activate_with_running_policy(target_id, false)?;
@@ -564,7 +588,7 @@ exit 1
 }
 
 #[cfg(target_os = "macos")]
-fn macos_launch_agent_plist_content(launcher_path: &Path) -> String {
+fn macos_launch_agent_plist_content(program_path: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -578,9 +602,11 @@ fn macos_launch_agent_plist_content(launcher_path: &Path) -> String {
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
 </dict>
 </plist>"#,
-        launcher_path.display()
+        program_path.display()
     )
 }
 
@@ -602,13 +628,35 @@ fn write_macos_launcher_script(home_dir: &Path, exe: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn write_macos_launch_agent_plist(home_dir: &Path, launcher_path: &Path) -> Result<PathBuf> {
+fn write_macos_launch_agent_plist(home_dir: &Path, program_path: &Path) -> Result<PathBuf> {
     let plist_path = macos_launch_agent_plist_path(home_dir);
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&plist_path, macos_launch_agent_plist_content(launcher_path))?;
+    fs::write(&plist_path, macos_launch_agent_plist_content(program_path))?;
     Ok(plist_path)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_is_loaded() -> Result<bool> {
+    let domain = macos_launch_agent_domain()?;
+    let service = format!("{domain}/{MACOS_LAUNCH_AGENT_LABEL}");
+    let output = Command::new("launchctl")
+        .args(["print", &service])
+        .output()
+        .context("failed to run launchctl print")?;
+    Ok(output.status.success())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_launch_agent_loaded(plist_path: &Path) -> Result<()> {
+    if macos_launch_agent_is_loaded()? {
+        return Ok(());
+    }
+    if !plist_path.exists() {
+        return Ok(());
+    }
+    reload_macos_launch_agent(plist_path)
 }
 
 #[cfg(target_os = "macos")]
@@ -645,8 +693,9 @@ fn unload_macos_launch_agent(plist_path: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install_macos_launch_at_startup(home_dir: &Path, exe: &Path) -> Result<()> {
-    let launcher_path = write_macos_launcher_script(home_dir, exe)?;
-    let plist_path = write_macos_launch_agent_plist(home_dir, &launcher_path)?;
+    let installed_exe = install_macos_menubar_binary(home_dir, exe)?;
+    write_macos_launcher_script(home_dir, exe)?;
+    let plist_path = write_macos_launch_agent_plist(home_dir, &installed_exe)?;
     reload_macos_launch_agent(&plist_path)
 }
 
@@ -663,25 +712,20 @@ fn uninstall_macos_launch_at_startup(home_dir: &Path) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn update_macos_launch_at_startup_if_needed(home_dir: &Path, exe: &Path) -> Result<()> {
     let installed_exe = install_macos_menubar_binary(home_dir, exe)?;
-    let launcher_path = macos_launcher_script_path(home_dir);
+    write_macos_launcher_script(home_dir, exe)?;
     let plist_path = macos_launch_agent_plist_path(home_dir);
-    let launcher_content = macos_launcher_script_content(&installed_exe, exe);
-    let plist_content = macos_launch_agent_plist_content(&launcher_path);
-
-    let launcher_changed = fs::read_to_string(&launcher_path)
-        .map(|content| content != launcher_content)
-        .unwrap_or(true);
+    let plist_content = macos_launch_agent_plist_content(&installed_exe);
     let plist_changed = fs::read_to_string(&plist_path)
         .map(|content| content != plist_content)
         .unwrap_or(true);
 
-    if !launcher_changed && !plist_changed {
-        return Ok(());
+    if plist_changed {
+        write_macos_launch_agent_plist(home_dir, &installed_exe)?;
+        reload_macos_launch_agent(&plist_path)?;
+    } else {
+        ensure_macos_launch_agent_loaded(&plist_path)?;
     }
-
-    write_macos_launcher_script(home_dir, exe)?;
-    write_macos_launch_agent_plist(home_dir, &launcher_path)?;
-    reload_macos_launch_agent(&plist_path)
+    Ok(())
 }
 
 fn usage_window_needs_ping(reset_at: OffsetDateTime, now: OffsetDateTime) -> bool {
@@ -1249,7 +1293,8 @@ mod tests {
             .join("codex-account-switcher-menubar");
         assert!(installed.exists());
         let plist = fs::read_to_string(&plist_path)?;
-        assert!(plist.contains("codex-account-switcher-launcher.sh"));
+        assert!(plist.contains("codex-account-switcher-menubar"));
+        assert!(!plist.contains("codex-account-switcher-launcher.sh"));
 
         // Remove file to test update recreation
         std::fs::remove_file(&plist_path)?;

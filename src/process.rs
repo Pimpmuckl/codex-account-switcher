@@ -273,6 +273,21 @@ pub fn wait_for_codex_processes_to_exit() {
     }
 }
 
+/// Wait up to `timeout` for Codex processes to exit. Returns `true` when none remain.
+pub fn wait_for_codex_processes_to_exit_timeout(timeout: std::time::Duration) -> bool {
+    if timeout.is_zero() {
+        return detect_running_codex_processes().is_empty();
+    }
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if detect_running_codex_processes().is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(SWITCH_WAIT_POLL_MS));
+    }
+    detect_running_codex_processes().is_empty()
+}
+
 /// Ask how to proceed when Codex is running. Defaults to waiting when the dialog fails.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn prompt_switch_when_running() -> crate::model::SwitchWhenRunning {
