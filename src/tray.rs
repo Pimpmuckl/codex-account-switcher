@@ -1,7 +1,10 @@
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::fs::{self, OpenOptions};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -72,7 +75,21 @@ where
     S: SecretStore,
 {
     #[cfg(target_os = "macos")]
-    ignore_terminal_hangup();
+    detach_from_controlling_terminal();
+
+    let _instance_lock = match TrayInstanceLock::acquire(&tray_lock_path(app))? {
+        Some(lock) => lock,
+        None => {
+            log_tray_message(
+                app,
+                &format!(
+                    "tray already running (pid={}), exiting duplicate instance",
+                    read_tray_lock_pid(&tray_lock_path(app)).unwrap_or(0)
+                ),
+            );
+            return Ok(TrayExit::Quit);
+        }
+    };
 
     let mut builder = EventLoop::<UserEvent>::with_user_event();
     #[cfg(target_os = "macos")]
@@ -102,9 +119,16 @@ where
         event_proxy: proxy,
         exit: TrayExit::Quit,
     };
-    event_loop
-        .run_app(&mut state)
-        .context("tray event loop failed")?;
+    let run_result = event_loop.run_app(&mut state);
+    log_tray_message(
+        app,
+        &format!(
+            "tray event loop finished (exit={:?}, pid={})",
+            state.exit,
+            std::process::id()
+        ),
+    );
+    run_result.context("tray event loop failed")?;
     Ok(state.exit)
 }
 
@@ -211,10 +235,15 @@ where
                             ),
                         }
                     }
-                    Err(error) => log_tray_error(self.app, &format!("failed to build tray menu: {error:#}")),
+                    Err(error) => {
+                        log_tray_error(self.app, &format!("failed to build tray menu: {error:#}"))
+                    }
                 }
             }
-            Err(error) => log_tray_error(self.app, &format!("failed to query app status and list: {error:#}")),
+            Err(error) => log_tray_error(
+                self.app,
+                &format!("failed to query app status and list: {error:#}"),
+            ),
         }
     }
 
@@ -398,7 +427,10 @@ where
                                         output.account.email
                                     )
                                 } else {
-                                    format!("Switched to best quota account {}.", output.account.email)
+                                    format!(
+                                        "Switched to best quota account {}.",
+                                        output.account.email
+                                    )
                                 }
                             } else {
                                 format!("Already on best quota account {}.", output.account.email)
@@ -1086,12 +1118,66 @@ fn wake_main_run_loop() {
 }
 
 #[cfg(target_os = "macos")]
-fn ignore_terminal_hangup() {
-    // Keep the menu-bar agent alive when the launching terminal session closes.
-    // SAFETY: installing SIG_IGN is async-signal-safe.
+fn detach_from_controlling_terminal() {
+    // Detach from the launching terminal session so SIGHUP cannot stop the agent.
+    // SAFETY: setsid and SIG_IGN are async-signal-safe POSIX calls.
     unsafe {
+        libc::setsid();
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
+}
+
+struct TrayInstanceLock {
+    #[cfg(unix)]
+    file: fs::File,
+}
+
+impl TrayInstanceLock {
+    fn acquire(path: &Path) -> Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        #[cfg(unix)]
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("failed to open tray lock {}", path.display()))?;
+            let fd = file.as_raw_fd();
+            let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
+            if !locked {
+                return Ok(None);
+            }
+            file.set_len(0)?;
+            writeln!(file, "{}", std::process::id())?;
+            Ok(Some(Self { file }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(Some(Self {}))
+        }
+    }
+}
+
+fn tray_lock_path<S: SecretStore>(app: &App<S>) -> PathBuf {
+    app.env().app_data_dir.join("tray.lock")
+}
+
+fn read_tray_lock_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.trim().parse().ok())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn tray_instance_pid() -> Option<u32> {
+    directories::ProjectDirs::from("com", "nextide", "codex-account-switcher")
+        .map(|dirs| dirs.data_local_dir().join("tray.lock"))
+        .and_then(|path| read_tray_lock_pid(&path))
+        .filter(|pid| unsafe { libc::kill(*pid as i32, 0) == 0 })
 }
 
 fn log_tray_error<S: SecretStore>(app: &App<S>, message: &str) {
@@ -1135,6 +1221,9 @@ pub(crate) fn spawn_detached_tray_instance() -> Result<bool> {
     use std::process::{Command, Stdio};
 
     if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    if tray_instance_pid().is_some() {
         return Ok(false);
     }
     let exe = std::env::current_exe().context("failed to resolve current executable")?;

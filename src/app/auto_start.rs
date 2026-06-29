@@ -21,7 +21,10 @@ use crate::model::{
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
-use crate::settings::{load_settings, save_settings, DEFAULT_AUTO_SWITCH_POLL_SECONDS, DEFAULT_USAGE_WINDOW_POLL_SECONDS};
+use crate::settings::{
+    DEFAULT_AUTO_SWITCH_POLL_SECONDS, DEFAULT_USAGE_WINDOW_POLL_SECONDS, load_settings,
+    save_settings,
+};
 
 use super::App;
 
@@ -346,9 +349,7 @@ fn switch_target_is_improvement(
             let target_remaining = target.min_remaining_percent(now);
             let current_remaining = current.and_then(|usage| usage.min_remaining_percent(now));
             match (current_remaining, target_remaining) {
-                (Some(current), Some(target)) => {
-                    target > current && target > near_limit_threshold
-                }
+                (Some(current), Some(target)) => target > current && target > near_limit_threshold,
                 (None, Some(target)) => target > near_limit_threshold,
                 _ => false,
             }
@@ -510,20 +511,55 @@ fn macos_launch_agent_domain() -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_launcher_script_content(exe: &Path) -> String {
+fn macos_installed_menubar_binary_path(home_dir: &Path) -> PathBuf {
+    home_dir
+        .join(".local")
+        .join("bin")
+        .join("codex-account-switcher-menubar")
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_menubar_binary(home_dir: &Path, exe: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let installed = macos_installed_menubar_binary_path(home_dir);
+    if let Some(parent) = installed.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let needs_copy = fs::read(exe)
+        .ok()
+        .zip(fs::read(&installed).ok())
+        .is_none_or(|(source, existing)| source != existing);
+    if needs_copy {
+        fs::copy(exe, &installed)
+            .with_context(|| format!("failed to install menubar binary to {}", installed.display()))?;
+        let mut permissions = fs::metadata(&installed)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&installed, permissions)?;
+    }
+    Ok(installed)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launcher_script_content(installed_exe: &Path, fallback_exe: &Path) -> String {
     format!(
         r#"#!/bin/bash
-# Wait for the app binary to become available (e.g. external volume mount).
+# Prefer the installed copy on the boot volume; fall back to the dev build path.
 TARGET="{}"
+FALLBACK="{}"
+if [ -x "$TARGET" ]; then
+    exec "$TARGET"
+fi
 for i in $(seq 1 {MACOS_LAUNCH_AGENT_WAIT_SECONDS}); do
-    if [ -f "$TARGET" ]; then
-        exec "$TARGET"
+    if [ -f "$FALLBACK" ]; then
+        exec "$FALLBACK"
     fi
     sleep 1
 done
 exit 1
 "#,
-        exe.display().to_string().replace('"', "\\\"")
+        installed_exe.display().to_string().replace('"', "\\\""),
+        fallback_exe.display().to_string().replace('"', "\\\"")
     )
 }
 
@@ -552,11 +588,12 @@ fn macos_launch_agent_plist_content(launcher_path: &Path) -> String {
 fn write_macos_launcher_script(home_dir: &Path, exe: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
+    let installed_exe = install_macos_menubar_binary(home_dir, exe)?;
     let launcher_path = macos_launcher_script_path(home_dir);
     if let Some(parent) = launcher_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let content = macos_launcher_script_content(exe);
+    let content = macos_launcher_script_content(&installed_exe, exe);
     fs::write(&launcher_path, content)?;
     let mut permissions = fs::metadata(&launcher_path)?.permissions();
     permissions.set_mode(0o755);
@@ -570,10 +607,7 @@ fn write_macos_launch_agent_plist(home_dir: &Path, launcher_path: &Path) -> Resu
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(
-        &plist_path,
-        macos_launch_agent_plist_content(launcher_path),
-    )?;
+    fs::write(&plist_path, macos_launch_agent_plist_content(launcher_path))?;
     Ok(plist_path)
 }
 
@@ -628,9 +662,10 @@ fn uninstall_macos_launch_at_startup(home_dir: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn update_macos_launch_at_startup_if_needed(home_dir: &Path, exe: &Path) -> Result<()> {
+    let installed_exe = install_macos_menubar_binary(home_dir, exe)?;
     let launcher_path = macos_launcher_script_path(home_dir);
     let plist_path = macos_launch_agent_plist_path(home_dir);
-    let launcher_content = macos_launcher_script_content(exe);
+    let launcher_content = macos_launcher_script_content(&installed_exe, exe);
     let plist_content = macos_launch_agent_plist_content(&launcher_path);
 
     let launcher_changed = fs::read_to_string(&launcher_path)
@@ -1205,6 +1240,14 @@ mod tests {
             .join("bin")
             .join("codex-account-switcher-launcher.sh");
         assert!(launcher_path.exists());
+        let launcher = fs::read_to_string(&launcher_path)?;
+        assert!(launcher.contains("codex-account-switcher-menubar"));
+        let installed = env
+            .home_dir
+            .join(".local")
+            .join("bin")
+            .join("codex-account-switcher-menubar");
+        assert!(installed.exists());
         let plist = fs::read_to_string(&plist_path)?;
         assert!(plist.contains("codex-account-switcher-launcher.sh"));
 
