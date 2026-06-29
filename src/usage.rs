@@ -41,12 +41,19 @@ pub(crate) fn with_test_http_endpoints<R>(
     refresh_endpoint: &str,
     run: impl FnOnce() -> R,
 ) -> R {
+    struct TestHttpEndpointsGuard;
+
+    impl Drop for TestHttpEndpointsGuard {
+        fn drop(&mut self) {
+            TEST_USAGE_ENDPOINT.with(|slot| *slot.borrow_mut() = None);
+            TEST_REFRESH_ENDPOINT.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
     TEST_USAGE_ENDPOINT.with(|slot| *slot.borrow_mut() = Some(usage_endpoint.to_owned()));
     TEST_REFRESH_ENDPOINT.with(|slot| *slot.borrow_mut() = Some(refresh_endpoint.to_owned()));
-    let result = run();
-    TEST_USAGE_ENDPOINT.with(|slot| *slot.borrow_mut() = None);
-    TEST_REFRESH_ENDPOINT.with(|slot| *slot.borrow_mut() = None);
-    result
+    let _guard = TestHttpEndpointsGuard;
+    run()
 }
 
 #[derive(Clone, Debug)]
@@ -280,8 +287,59 @@ fn parse_usage_response_json(value: &str) -> Result<UsageResponse> {
     serde_json::from_str(value).context("failed to parse usage response json")
 }
 
-fn fetch_usage_response(access_token: &str, account_id: Option<&str>) -> Result<UsageResponse> {
-    let mut request = ureq::get(&usage_endpoint())
+#[cfg(test)]
+fn using_test_http_endpoints() -> bool {
+    TEST_USAGE_ENDPOINT.with(|slot| slot.borrow().is_some())
+}
+
+#[cfg(test)]
+fn isolated_http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .max_idle_connections(1)
+        .max_idle_connections_per_host(1)
+        .build()
+        .into()
+}
+
+#[cfg(test)]
+fn usage_http_get(
+    url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    if using_test_http_endpoints() {
+        let mut request = isolated_http_agent()
+            .get(url)
+            .header("Authorization", &format!("Bearer {access_token}"))
+            .header("User-Agent", "codex-account-switcher");
+        if let Some(account_id) = account_id {
+            request = request.header("ChatGPT-Account-Id", account_id);
+        }
+        request.call().context("failed to query Codex usage")
+    } else {
+        let mut request = ureq::get(url)
+            .header("Authorization", &format!("Bearer {access_token}"))
+            .header("User-Agent", "codex-account-switcher")
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build();
+        if let Some(account_id) = account_id {
+            request = request.header("ChatGPT-Account-Id", account_id);
+        }
+        request.call().context("failed to query Codex usage")
+    }
+}
+
+#[cfg(not(test))]
+fn usage_http_get(
+    url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let mut request = ureq::get(url)
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("User-Agent", "codex-account-switcher")
         .config()
@@ -291,7 +349,44 @@ fn fetch_usage_response(access_token: &str, account_id: Option<&str>) -> Result<
     if let Some(account_id) = account_id {
         request = request.header("ChatGPT-Account-Id", account_id);
     }
-    let mut response = request.call().context("failed to query Codex usage")?;
+    request.call().context("failed to query Codex usage")
+}
+
+#[cfg(test)]
+fn usage_http_post_json(url: &str, payload_json: &str) -> Result<ureq::http::Response<ureq::Body>> {
+    if using_test_http_endpoints() {
+        isolated_http_agent()
+            .post(url)
+            .header("Content-Type", "application/json")
+            .send(payload_json)
+            .context("failed to refresh Codex auth tokens")
+    } else {
+        ureq::post(url)
+            .header("Content-Type", "application/json")
+            .config()
+            .http_status_as_error(false)
+            .timeout_global(Some(std::time::Duration::from_secs(5)))
+            .build()
+            .send(payload_json)
+            .context("failed to refresh Codex auth tokens")
+    }
+}
+
+#[cfg(not(test))]
+fn usage_http_post_json(url: &str, payload_json: &str) -> Result<ureq::http::Response<ureq::Body>> {
+    ureq::post(url)
+        .header("Content-Type", "application/json")
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
+        .send(payload_json)
+        .context("failed to refresh Codex auth tokens")
+}
+
+fn fetch_usage_response(access_token: &str, account_id: Option<&str>) -> Result<UsageResponse> {
+    let url = usage_endpoint();
+    let mut response = usage_http_get(&url, access_token, account_id)?;
     let status = response.status();
     if status == 401 || status == 403 {
         bail!("usage authorization failed");
@@ -336,14 +431,8 @@ fn refresh_auth(auth: &SnapshotAuth) -> Result<SnapshotAuth> {
     });
     let payload_json =
         serde_json::to_string(&payload).context("failed to encode refresh payload")?;
-    let mut response = ureq::post(&refresh_endpoint())
-        .header("Content-Type", "application/json")
-        .config()
-        .http_status_as_error(false)
-        .timeout_global(Some(std::time::Duration::from_secs(5)))
-        .build()
-        .send(&payload_json)
-        .context("failed to refresh Codex auth tokens")?;
+    let url = refresh_endpoint();
+    let mut response = usage_http_post_json(&url, &payload_json)?;
     let status = response.status();
     if status.as_u16() >= 400 {
         let body = response.body_mut().read_to_string().unwrap_or_default();
@@ -464,7 +553,7 @@ mod tests {
     use anyhow::anyhow;
     use base64::Engine;
 
-    use crate::usage_http::MockHttpServer;
+    use crate::usage_http::{MockEndpoint, MockHttpServer};
     use crate::{codex::auth_json_fixture, model::EnvironmentKind};
 
     use super::*;
@@ -472,7 +561,9 @@ mod tests {
     static HTTP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_http_test_lock<R>(run: impl FnOnce() -> R) -> R {
-        let _guard = HTTP_TEST_LOCK.lock().expect("http integration test lock");
+        let _guard = HTTP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         run()
     }
 
@@ -556,8 +647,12 @@ mod tests {
         assert!(usage_error_indicates_rate_limit(
             "usage rate limit exceeded (429): too many requests"
         ));
-        assert!(usage_error_indicates_rate_limit("quota exceeded for this window"));
-        assert!(!usage_error_indicates_rate_limit("usage authorization failed"));
+        assert!(usage_error_indicates_rate_limit(
+            "quota exceeded for this window"
+        ));
+        assert!(!usage_error_indicates_rate_limit(
+            "usage authorization failed"
+        ));
     }
 
     #[test]
@@ -599,21 +694,30 @@ mod tests {
     }
 
     #[test]
-    fn fetch_usage_refreshes_after_authorization_failure() {
+    fn fetch_usage_http_mock_scenarios() {
         with_http_test_lock(|| {
-            let server = MockHttpServer::bind();
-            server.enqueue(401, r#"{"error":"expired"}"#);
-            server.enqueue(
-                200,
-                r#"{
+            fetch_usage_refreshes_after_authorization_failure_scenario();
+            fetch_usage_does_not_refresh_when_disabled_scenario();
+            fetch_usage_surfaces_refresh_invalid_grant_as_login_required_scenario();
+        });
+    }
+
+    fn fetch_usage_refreshes_after_authorization_failure_scenario() {
+        let server = MockHttpServer::bind();
+        server.enqueue(MockEndpoint::Usage, 401, r#"{"error":"expired"}"#);
+        server.enqueue(
+            MockEndpoint::Refresh,
+            200,
+            r#"{
                 "access_token": "access-new",
                 "refresh_token": "refresh-new",
                 "id_token": "id-new"
             }"#,
-            );
-            server.enqueue(
-                200,
-                r#"{
+        );
+        server.enqueue(
+            MockEndpoint::Usage,
+            200,
+            r#"{
                 "email": "user@example.com",
                 "plan_type": "plus",
                 "rate_limit": {
@@ -621,92 +725,92 @@ mod tests {
                     "secondary_window": { "used_percent": 10, "reset_at": 1700100000 }
                 }
             }"#,
-            );
+        );
 
-            let snapshot = usage_snapshot_fixture();
-            let target = UsageTarget {
-                environment: EnvironmentKind::Macos,
-                identity: DisplayIdentity {
-                    email: "user@example.com".to_owned(),
-                    subject: Some("sub-user".to_owned()),
-                    name: None,
-                    plan_label: Some("Plus".to_owned()),
-                },
-                snapshot,
-                source: UsageSource::SavedAccessToken,
-                allow_refresh: true,
-            };
+        let snapshot = usage_snapshot_fixture();
+        let target = UsageTarget {
+            environment: EnvironmentKind::Macos,
+            identity: DisplayIdentity {
+                email: "user@example.com".to_owned(),
+                subject: Some("sub-user".to_owned()),
+                name: None,
+                plan_label: Some("Plus".to_owned()),
+            },
+            snapshot,
+            source: UsageSource::SavedAccessToken,
+            allow_refresh: true,
+        };
 
-            let (output, updated_snapshot) =
-                with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
-                    fetch_usage(target).expect("fetch usage with refresh")
-                });
+        let (output, updated_snapshot) =
+            with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
+                fetch_usage(target).expect("fetch usage with refresh")
+            });
 
-            assert_eq!(output.account.email, "user@example.com");
-            assert_eq!(output.usage.source, UsageSource::SavedRefreshToken);
-            assert_eq!(output.usage.weekly.as_ref().unwrap().remaining_percent, 90);
-            let updated_auth = snapshot_auth(&updated_snapshot).expect("updated auth");
-            assert_eq!(updated_auth.access_token, "access-new");
-            assert_eq!(updated_auth.refresh_token.as_deref(), Some("refresh-new"));
-        });
+        assert_eq!(output.account.email, "user@example.com");
+        assert_eq!(output.usage.source, UsageSource::SavedRefreshToken);
+        assert_eq!(output.usage.weekly.as_ref().unwrap().remaining_percent, 90);
+        let updated_auth = snapshot_auth(&updated_snapshot).expect("updated auth");
+        assert_eq!(updated_auth.access_token, "access-new");
+        assert_eq!(updated_auth.refresh_token.as_deref(), Some("refresh-new"));
     }
 
-    #[test]
-    fn fetch_usage_does_not_refresh_when_disabled() {
-        with_http_test_lock(|| {
-            let server = MockHttpServer::bind();
-            server.enqueue(401, r#"{"error":"expired"}"#);
+    fn fetch_usage_does_not_refresh_when_disabled_scenario() {
+        let server = MockHttpServer::bind();
+        server.enqueue(MockEndpoint::Usage, 401, r#"{"error":"expired"}"#);
 
-            let target = UsageTarget {
-                environment: EnvironmentKind::Linux,
-                identity: DisplayIdentity {
-                    email: "user@example.com".to_owned(),
-                    subject: Some("sub-user".to_owned()),
-                    name: None,
-                    plan_label: None,
-                },
-                snapshot: usage_snapshot_fixture(),
-                source: UsageSource::SavedAccessToken,
-                allow_refresh: false,
-            };
+        let target = UsageTarget {
+            environment: EnvironmentKind::Linux,
+            identity: DisplayIdentity {
+                email: "user@example.com".to_owned(),
+                subject: Some("sub-user".to_owned()),
+                name: None,
+                plan_label: None,
+            },
+            snapshot: usage_snapshot_fixture(),
+            source: UsageSource::SavedAccessToken,
+            allow_refresh: false,
+        };
 
-            let error =
-                with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
-                    fetch_usage(target).expect_err("usage should fail without refresh")
-                });
-            assert!(format!("{error:#}").contains("usage authorization failed"));
+        let error = with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
+            fetch_usage(target).expect_err("usage should fail without refresh")
         });
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("usage authorization failed"),
+            "unexpected usage error: {rendered}"
+        );
     }
 
-    #[test]
-    fn fetch_usage_surfaces_refresh_invalid_grant_as_login_required() {
-        with_http_test_lock(|| {
-            let server = MockHttpServer::bind();
-            server.enqueue(401, r#"{"error":"expired"}"#);
-            server.enqueue(
+    fn fetch_usage_surfaces_refresh_invalid_grant_as_login_required_scenario() {
+        let server = MockHttpServer::bind();
+        server.enqueue(MockEndpoint::Usage, 401, r#"{"error":"expired"}"#);
+        server.enqueue(
+            MockEndpoint::Refresh,
             400,
             r#"{"error":"invalid_grant","error_description":"Please log out and sign in again."}"#,
         );
 
-            let target = UsageTarget {
-                environment: EnvironmentKind::Windows,
-                identity: DisplayIdentity {
-                    email: "user@example.com".to_owned(),
-                    subject: Some("sub-user".to_owned()),
-                    name: None,
-                    plan_label: None,
-                },
-                snapshot: usage_snapshot_fixture(),
-                source: UsageSource::SavedAccessToken,
-                allow_refresh: true,
-            };
+        let target = UsageTarget {
+            environment: EnvironmentKind::Windows,
+            identity: DisplayIdentity {
+                email: "user@example.com".to_owned(),
+                subject: Some("sub-user".to_owned()),
+                name: None,
+                plan_label: None,
+            },
+            snapshot: usage_snapshot_fixture(),
+            source: UsageSource::SavedAccessToken,
+            allow_refresh: true,
+        };
 
-            let error =
-                with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
-                    fetch_usage(target).expect_err("refresh should fail")
-                });
-            let message = usage_error_message(&error);
-            assert_eq!(usage_error_label(&message), "Login required");
+        let error = with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
+            fetch_usage(target).expect_err("refresh should fail")
         });
+        let message = usage_error_message(&error);
+        assert_eq!(
+            usage_error_label(&message),
+            "Login required",
+            "unexpected usage error: {error:#}"
+        );
     }
 }

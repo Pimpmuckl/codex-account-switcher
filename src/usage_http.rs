@@ -2,17 +2,22 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug)]
+pub enum MockEndpoint {
+    Usage,
+    Refresh,
+}
+
 pub struct MockHttpServer {
     pub base_url: String,
-    responses: Arc<Mutex<Vec<(u16, String)>>>,
-    expected: Arc<AtomicUsize>,
-    #[allow(dead_code)]
-    served: Arc<AtomicUsize>,
+    usage_responses: Arc<Mutex<Vec<(u16, String)>>>,
+    refresh_responses: Arc<Mutex<Vec<(u16, String)>>>,
+    shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -23,30 +28,48 @@ impl MockHttpServer {
             .set_nonblocking(true)
             .expect("mock server nonblocking");
         let addr = listener.local_addr().expect("mock server addr");
-        let responses = Arc::new(Mutex::new(Vec::new()));
-        let expected = Arc::new(AtomicUsize::new(0));
-        let served = Arc::new(AtomicUsize::new(0));
-        let handle = thread::spawn({
-            let responses = Arc::clone(&responses);
-            let expected = Arc::clone(&expected);
-            let served = Arc::clone(&served);
-            move || serve(listener, responses, expected, served)
+        let usage_responses = Arc::new(Mutex::new(Vec::new()));
+        let refresh_responses = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let usage_for_thread = Arc::clone(&usage_responses);
+        let refresh_for_thread = Arc::clone(&refresh_responses);
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            ready_tx.send(()).ok();
+            serve(
+                listener,
+                usage_for_thread,
+                refresh_for_thread,
+                shutdown_for_thread,
+            );
         });
+        ready_rx
+            .recv()
+            .expect("mock server thread should start promptly");
         Self {
             base_url: format!("http://{addr}"),
-            responses,
-            expected,
-            served,
+            usage_responses,
+            refresh_responses,
+            shutdown,
             handle: Some(handle),
         }
     }
 
-    pub fn enqueue(&self, status: u16, body: impl Into<String>) {
-        self.responses
-            .lock()
-            .expect("mock responses lock")
-            .push((status, body.into()));
-        self.expected.fetch_add(1, Ordering::SeqCst);
+    pub fn enqueue(&self, endpoint: MockEndpoint, status: u16, body: impl Into<String>) {
+        let body = body.into();
+        match endpoint {
+            MockEndpoint::Usage => self
+                .usage_responses
+                .lock()
+                .expect("mock usage responses lock")
+                .push((status, body)),
+            MockEndpoint::Refresh => self
+                .refresh_responses
+                .lock()
+                .expect("mock refresh responses lock")
+                .push((status, body)),
+        }
     }
 
     pub fn usage_url(&self) -> String {
@@ -60,6 +83,7 @@ impl MockHttpServer {
 
 impl Drop for MockHttpServer {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -68,32 +92,14 @@ impl Drop for MockHttpServer {
 
 fn serve(
     listener: TcpListener,
-    responses: Arc<Mutex<Vec<(u16, String)>>>,
-    expected: Arc<AtomicUsize>,
-    served: Arc<AtomicUsize>,
+    usage_responses: Arc<Mutex<Vec<(u16, String)>>>,
+    refresh_responses: Arc<Mutex<Vec<(u16, String)>>>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    let started = std::time::Instant::now();
-    let max_runtime = Duration::from_secs(3);
-    let idle_shutdown = Duration::from_millis(150);
-    let mut idle_since: Option<std::time::Instant> = None;
-
-    while started.elapsed() < max_runtime {
-        let served_count = served.load(Ordering::SeqCst);
-        let expected_count = expected.load(Ordering::SeqCst);
-        if served_count >= expected_count && expected_count > 0 {
-            idle_since.get_or_insert_with(std::time::Instant::now);
-            if idle_since.is_some_and(|since| since.elapsed() >= idle_shutdown) {
-                break;
-            }
-        } else {
-            idle_since = None;
-        }
-
+    while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
-                idle_since = None;
-                handle_connection(stream, &responses);
-                served.fetch_add(1, Ordering::SeqCst);
+                handle_connection(stream, &usage_responses, &refresh_responses);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(2));
@@ -103,7 +109,11 @@ fn serve(
     }
 }
 
-fn handle_connection(mut stream: TcpStream, responses: &Arc<Mutex<Vec<(u16, String)>>>) {
+fn handle_connection(
+    mut stream: TcpStream,
+    usage_responses: &Arc<Mutex<Vec<(u16, String)>>>,
+    refresh_responses: &Arc<Mutex<Vec<(u16, String)>>>,
+) {
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -120,6 +130,11 @@ fn handle_connection(mut stream: TcpStream, responses: &Arc<Mutex<Vec<(u16, Stri
         }
     }
 
+    let responses = if request_line.contains("/oauth/token") {
+        refresh_responses
+    } else {
+        usage_responses
+    };
     let (status, body) = {
         let mut guard = responses.lock().expect("mock responses lock");
         guard
