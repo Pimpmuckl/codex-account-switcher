@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.7 - 2026-06-29
+
+### Fixed
+
+- Detect floating weekly usage reset times before auto-starting saved Codex weekly windows.
+- Preserve auto-start retry state until the weekly-window ping succeeds.
+- Avoid refreshing saved weekly usage from the persistent TUI before the auto-start worker can inspect due windows.
+
 ## v0.1.6 - 2026-06-13
 
 ### Fixed
