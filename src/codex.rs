@@ -72,8 +72,17 @@ pub fn read_live_auth_bundle(env: &AppEnv) -> Result<LiveAuthBundle> {
     let mut auth_json_bytes = None;
     for file_name in AUTH_FILES {
         let path = env.codex_root.join(file_name);
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error)
+                if file_name == "cap_sid" && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Vec::new()
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
         if file_name == "auth.json" {
             auth_json_bytes = Some(bytes.clone());
         }
@@ -830,6 +839,31 @@ mod tests {
 
         assert!(!codex_root.join("auth.json").exists());
         assert!(!codex_root.join("cap_sid").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn read_live_auth_bundle_treats_missing_cap_sid_as_empty() -> Result<()> {
+        let temp = tempdir()?;
+        let codex_root = temp.path().join(".codex");
+        fs::create_dir_all(&codex_root)?;
+        fs::write(
+            codex_root.join("auth.json"),
+            auth_json_fixture("person@example.com", "sub-1", Some("pro")),
+        )?;
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root,
+            app_data_dir: temp.path().join("data"),
+        };
+
+        let bundle = read_live_auth_bundle(&env)?;
+
+        assert_eq!(bundle.identity.email, "person@example.com");
+        assert!(bundle.snapshot.files.iter().any(|file| {
+            file.name == "cap_sid" && file.bytes_base64 == STANDARD.encode(Vec::<u8>::new())
+        }));
         Ok(())
     }
 }

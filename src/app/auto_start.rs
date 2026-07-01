@@ -193,15 +193,13 @@ where
             return Ok(None);
         }
         if !self.activation_preflight_warnings().is_empty() {
-            let urgent = matches!(
-                switch_reason,
-                "quota exhausted" | "rate limit detected" | "login expired"
-            );
-            if !urgent {
+            if !auto_switch_should_quit_running_codex(switch_reason) {
                 return Ok(None);
             }
-            if switch_reason == "login expired" {
+            #[cfg(not(test))]
+            {
                 crate::process::quit_running_codex_app();
+                crate::process::force_quit_switch_blocking_codex_processes();
             }
             if !crate::process::wait_for_codex_processes_to_exit_timeout(
                 auto_switch_codex_wait_timeout(),
@@ -396,6 +394,13 @@ fn current_switch_reason(
         return Some("quota exhausted");
     }
     None
+}
+
+fn auto_switch_should_quit_running_codex(reason: &str) -> bool {
+    matches!(
+        reason,
+        "quota exhausted" | "rate limit detected" | "login expired"
+    )
 }
 
 fn compute_poll_interval(env: &AppEnv) -> u64 {
@@ -1041,6 +1046,14 @@ mod tests {
         };
 
         assert_eq!(current_switch_reason(&account, now), None);
+    }
+
+    #[test]
+    fn auto_switch_quits_codex_for_urgent_reasons_only() {
+        assert!(auto_switch_should_quit_running_codex("quota exhausted"));
+        assert!(auto_switch_should_quit_running_codex("rate limit detected"));
+        assert!(auto_switch_should_quit_running_codex("login expired"));
+        assert!(!auto_switch_should_quit_running_codex("near limit"));
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]

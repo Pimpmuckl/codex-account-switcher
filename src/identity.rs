@@ -82,7 +82,12 @@ fn extract_workspace(value: &Value) -> (Option<String>, Option<String>) {
         };
         workspace_id = workspace_id.or_else(|| workspace_id_from_object(child, true));
         workspace_name = workspace_name.or_else(|| workspace_name_from_object(child, true));
+        workspace_name = workspace_name
+            .or_else(|| workspace_name_from_collections(child, workspace_id.as_deref()));
     }
+
+    workspace_name =
+        workspace_name.or_else(|| workspace_name_from_collections(value, workspace_id.as_deref()));
 
     (workspace_id, workspace_name)
 }
@@ -125,6 +130,9 @@ fn workspace_name_from_object(value: &Value, allow_generic_name: bool) -> Option
         "accountName",
         "chatgpt_account_name",
         "chatgptAccountName",
+        "title",
+        "display_name",
+        "displayName",
     ];
     keys.iter()
         .find_map(|key| string_field(value, key))
@@ -133,6 +141,30 @@ fn workspace_name_from_object(value: &Value, allow_generic_name: bool) -> Option
                 .then(|| string_field(value, "name"))
                 .flatten()
         })
+}
+
+fn workspace_name_from_collections(value: &Value, workspace_id: Option<&str>) -> Option<String> {
+    for key in ["organizations", "workspaces", "accounts", "groups"] {
+        let Some(items) = value.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        if let Some(workspace_id) = workspace_id
+            && let Some(name) = items.iter().find_map(|item| {
+                let item_id = workspace_id_from_object(item, true)?;
+                (item_id == workspace_id)
+                    .then(|| workspace_name_from_object(item, true))
+                    .flatten()
+            })
+        {
+            return Some(name);
+        }
+        if items.len() == 1
+            && let Some(name) = workspace_name_from_object(&items[0], true)
+        {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -205,6 +237,16 @@ mod tests {
         let identity = parse_identity_from_id_token(&token).expect("identity");
         assert_eq!(identity.workspace_id.as_deref(), Some("ws_123"));
         assert_eq!(identity.workspace_name.as_deref(), Some("Team Space"));
+    }
+
+    #[test]
+    fn parses_workspace_name_from_organization_claims() {
+        let token = token(
+            r#"{"email":"person@example.com","sub":"abc","https://api.openai.com/auth":{"chatgpt_account_id":"acct_123","organizations":[{"id":"acct_123","title":"Team Org","role":"owner"}]}}"#,
+        );
+        let identity = parse_identity_from_id_token(&token).expect("identity");
+        assert_eq!(identity.workspace_id.as_deref(), Some("acct_123"));
+        assert_eq!(identity.workspace_name.as_deref(), Some("Team Org"));
     }
 
     #[test]

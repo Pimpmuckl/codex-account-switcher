@@ -133,6 +133,7 @@ fn handle_connection(
         return;
     }
     let mut content_length = 0usize;
+    let mut chunked = false;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() || line == "\r\n" {
@@ -143,12 +144,20 @@ fn handle_connection(
         {
             content_length = value.trim().parse().unwrap_or(0);
         }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("transfer-encoding")
+            && value.trim().eq_ignore_ascii_case("chunked")
+        {
+            chunked = true;
+        }
     }
     if content_length > 0 {
         let mut body = vec![0u8; content_length];
         if reader.read_exact(&mut body).is_err() {
             return;
         }
+    } else if chunked && read_chunked_body(&mut reader).is_err() {
+        return;
     }
 
     let responses = if request_line.contains("/oauth/token") {
@@ -177,4 +186,24 @@ fn handle_connection(
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> std::io::Result<()> {
+    loop {
+        let mut size_line = String::new();
+        reader.read_line(&mut size_line)?;
+        let size_hex = size_line
+            .trim()
+            .split_once(';')
+            .map(|(size, _)| size)
+            .unwrap_or_else(|| size_line.trim());
+        let size = usize::from_str_radix(size_hex, 16).unwrap_or(0);
+        if size == 0 {
+            let mut trailer = String::new();
+            reader.read_line(&mut trailer)?;
+            return Ok(());
+        }
+        let mut chunk = vec![0u8; size + 2];
+        reader.read_exact(&mut chunk)?;
+    }
 }

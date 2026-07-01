@@ -732,11 +732,29 @@ mod tests {
     }
 
     #[test]
-    fn fetch_usage_http_mock_scenarios() {
+    fn fetch_usage_proactively_refreshes_stale_snapshot() {
         with_mock_http_test_lock(|| {
             fetch_usage_proactively_refreshes_stale_snapshot_scenario();
+        });
+    }
+
+    #[test]
+    fn fetch_usage_refreshes_after_authorization_failure() {
+        with_mock_http_test_lock(|| {
             fetch_usage_refreshes_after_authorization_failure_scenario();
+        });
+    }
+
+    #[test]
+    fn fetch_usage_does_not_refresh_when_disabled() {
+        with_mock_http_test_lock(|| {
             fetch_usage_does_not_refresh_when_disabled_scenario();
+        });
+    }
+
+    #[test]
+    fn fetch_usage_surfaces_refresh_invalid_grant_as_login_required() {
+        with_mock_http_test_lock(|| {
             fetch_usage_surfaces_refresh_invalid_grant_as_login_required_scenario();
         });
     }

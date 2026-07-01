@@ -292,6 +292,40 @@ pub fn quit_running_codex_app() {
     }
 }
 
+/// Force-stop Codex processes that can hold live auth open during an urgent switch.
+pub fn force_quit_switch_blocking_codex_processes() {
+    let processes = detect_switch_blocking_codex_processes();
+    if processes.is_empty() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        for process in &processes {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &process.pid.to_string()])
+                .output();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for process in detect_switch_blocking_codex_processes() {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &process.pid.to_string()])
+                .output();
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        for process in &processes {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/f", "/pid", &process.pid.to_string()])
+                .output();
+        }
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
 pub const SWITCH_WAIT_POLL_MS: u64 = 2_000;
 
 /// Block until no switch-blocking Codex processes remain (polls every [`SWITCH_WAIT_POLL_MS`]).

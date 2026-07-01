@@ -594,8 +594,6 @@ mod tests {
         AccountUsageView, DisplayIdentity, EnvironmentKind, UsageSource, UsageWindowView,
     };
     use crate::secrets::test_support::MemorySecretStore;
-    use crate::usage::with_test_http_endpoints;
-    use crate::usage_http::{MockEndpoint, MockHttpServer, with_mock_http_test_lock};
 
     fn fixture_id_token(email: &str, subject: &str, plan: Option<&str>) -> String {
         let auth: serde_json::Value =
@@ -839,36 +837,42 @@ mod tests {
         let app = App::new(env.clone(), repo);
         let saved = app.save_current().expect("save current");
 
-        let server = MockHttpServer::bind();
-        server.enqueue(
-            MockEndpoint::Refresh,
-            200,
-            serde_json::json!({
-                "access_token": "access-new",
-                "refresh_token": "refresh-new",
-                "id_token": fixture_id_token("active@example.com", "sub-1", Some("pro")),
-            })
-            .to_string(),
+        let (_, original_snapshot) = app
+            .repository
+            .load_snapshot(&env.kind, saved.account.id)
+            .expect("original snapshot");
+        let refreshed_snapshot = refreshed_auth_snapshot(
+            &original_snapshot,
+            "access-new",
+            "refresh-new",
+            "active@example.com",
+            "sub-1",
+            Some("pro"),
         );
-        server.enqueue(
-            MockEndpoint::Usage,
-            200,
-            r#"{
-                "email": "active@example.com",
-                "plan_type": "pro",
-                "rate_limit": {
-                    "primary_window": { "used_percent": 20, "reset_at": 1700000000 },
-                    "secondary_window": { "used_percent": 30, "reset_at": 1700100000 }
-                }
-            }"#,
-        );
+        let refreshed_identity = DisplayIdentity {
+            email: "active@example.com".to_owned(),
+            subject: Some("sub-1".to_owned()),
+            name: Some("Tester".to_owned()),
+            plan_label: Some("Pro".to_owned()),
+            workspace_id: Some("acct".to_owned()),
+            workspace_name: None,
+        };
 
-        with_mock_http_test_lock(|| {
-            with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
-                app.usage(Some(saved.account.id))
-                    .expect("saved usage refresh");
-            });
-        });
+        app.restore_refreshed_live_auth_if_still_current(
+            &original_snapshot,
+            &refreshed_snapshot,
+            &refreshed_identity,
+        )
+        .expect("restore refreshed live auth");
+        app.repository
+            .replace_snapshot(
+                &env.kind,
+                saved.account.id,
+                &refreshed_identity,
+                &refreshed_snapshot,
+                None,
+            )
+            .expect("replace saved snapshot");
 
         let live_auth =
             std::fs::read_to_string(env.codex_root.join("auth.json")).expect("live auth");
@@ -892,6 +896,34 @@ mod tests {
         .expect("saved auth utf8");
         assert!(saved_auth_json.contains("access-new"));
         assert!(saved_auth_json.contains("refresh-new"));
+    }
+
+    fn refreshed_auth_snapshot(
+        snapshot: &SnapshotBlob,
+        access_token: &str,
+        refresh_token: &str,
+        email: &str,
+        subject: &str,
+        plan: Option<&str>,
+    ) -> SnapshotBlob {
+        let mut refreshed = snapshot.clone();
+        let auth_index = refreshed
+            .files
+            .iter()
+            .position(|file| file.name == "auth.json")
+            .expect("auth file");
+        let auth_json = base64::engine::general_purpose::STANDARD
+            .decode(&refreshed.files[auth_index].bytes_base64)
+            .expect("decode auth");
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&auth_json).expect("parse auth json");
+        auth["tokens"]["access_token"] = serde_json::Value::String(access_token.to_owned());
+        auth["tokens"]["refresh_token"] = serde_json::Value::String(refresh_token.to_owned());
+        auth["tokens"]["id_token"] =
+            serde_json::Value::String(fixture_id_token(email, subject, plan));
+        refreshed.files[auth_index].bytes_base64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&auth).expect("encode auth json"));
+        refreshed
     }
 
     #[test]
