@@ -544,6 +544,8 @@ mod tests {
             subject: None,
             name: bundle.identity.name.clone(),
             plan_label: bundle.identity.plan_label.clone(),
+            workspace_id: None,
+            workspace_name: None,
         };
         restore_snapshot(&env, &bundle.snapshot, &expected, false)?;
         Ok(())
@@ -582,6 +584,8 @@ mod tests {
             subject: Some("sub-2".to_owned()),
             name: None,
             plan_label: None,
+            workspace_id: None,
+            workspace_name: None,
         };
 
         let error = restore_snapshot(&env, &snapshot, &expected, false)
@@ -655,6 +659,8 @@ mod tests {
             subject: Some("sub-2".to_owned()),
             name: Some("Tester".to_owned()),
             plan_label: Some("Plus".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let expected_snapshot = read_live_auth_bundle(&env)?.snapshot;
         let auth_path = codex_root.join("auth.json");
@@ -700,6 +706,8 @@ mod tests {
             subject: Some("sub-2".to_owned()),
             name: Some("Tester".to_owned()),
             plan_label: Some("Plus".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let expected_snapshot = read_live_auth_bundle(&env)?.snapshot;
         let cap_sid_path = codex_root.join("cap_sid");

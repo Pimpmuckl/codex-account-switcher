@@ -511,8 +511,12 @@ fn render_account_summary(account: &AccountView) -> String {
         .as_deref()
         .map(|name| format!(" [{name}]"))
         .unwrap_or_default();
+    let workspace = account
+        .workspace_label()
+        .map(|name| format!("  |  workspace: {name}"))
+        .unwrap_or_default();
     let mut parts = vec![
-        format!("{}{}", account.email, label),
+        format!("{}{}{}", account.email, label, workspace),
         account_status_summary(account),
     ];
     if let Some(usage_summary) = account_usage_summary(account) {
@@ -731,6 +735,8 @@ mod tests {
             subject: Some("sub".to_owned()),
             name: None,
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
             environment: EnvironmentKind::Macos,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,

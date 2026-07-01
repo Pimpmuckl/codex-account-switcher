@@ -132,6 +132,8 @@ pub fn export_accounts<S: SecretStore>(
             subject: account.subject.clone(),
             name: account.name.clone(),
             plan_label: account.plan_label.clone(),
+            workspace_id: account.workspace_id.clone(),
+            workspace_name: account.workspace_name.clone(),
             snapshot,
         });
     }
@@ -219,6 +221,8 @@ pub fn import_export_bundle<S: SecretStore>(
             subject: account.subject.clone(),
             name: account.name.clone(),
             plan_label: account.plan_label.clone(),
+            workspace_id: account.workspace_id.clone(),
+            workspace_name: account.workspace_name.clone(),
         };
         outputs.push(import_snapshot(
             repository,
@@ -301,6 +305,8 @@ mod tests {
                 subject: Some("sub-1".to_owned()),
                 name: None,
                 plan_label: Some("Plus".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
                 snapshot,
             }],
         };

@@ -497,11 +497,7 @@ fn account_menu_tone(account: &AccountView) -> MenuLabelTone {
 }
 
 fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> String {
-    let display_email = if let Some(label) = &account.label {
-        format!("{} [{label}]", account.email)
-    } else {
-        account.email.clone()
-    };
+    let display_email = account_display_name(account);
     let email = format!("{:<width$}", display_email, width = widths.email);
     let plan = format!(
         "{:<width$}",
@@ -601,11 +597,7 @@ fn account_status_label(account: &AccountView) -> String {
 fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
     let mut widths = AccountLabelWidths::default();
     for account in accounts {
-        let display_email = if let Some(label) = &account.label {
-            format!("{} [{label}]", account.email)
-        } else {
-            account.email.clone()
-        };
+        let display_email = account_display_name(account);
         widths.email = widths.email.max(display_email.len());
         widths.plan = widths.plan.max(
             account
@@ -653,6 +645,19 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
         widths.reset = widths.reset.max(reset);
     }
     widths
+}
+
+fn account_display_name(account: &AccountView) -> String {
+    let label = account
+        .label
+        .as_deref()
+        .map(|label| format!(" [{label}]"))
+        .unwrap_or_default();
+    let workspace = account
+        .workspace_label()
+        .map(|workspace| format!(" ({workspace})"))
+        .unwrap_or_default();
+    format!("{}{}{}", account.email, label, workspace)
 }
 
 pub(crate) fn build_menu(
@@ -704,8 +709,12 @@ pub(crate) fn build_menu(
         .or_else(|| {
             status.current_account.as_ref().map(|current| {
                 format!(
-                    "{}{}",
+                    "{}{}{}",
                     current.email,
+                    current
+                        .workspace_label()
+                        .map(|workspace| format!(" ({workspace})"))
+                        .unwrap_or_default(),
                     if current_saved.is_some() {
                         " [saved]"
                     } else {
@@ -719,9 +728,23 @@ pub(crate) fn build_menu(
         if let Some(current) = status.current_account.as_ref() {
             actions.push(InteractiveItem {
                 label: if current_saved.is_some() {
-                    format!("Refresh saved snapshot for {}", current.email)
+                    format!(
+                        "Refresh saved snapshot for {}{}",
+                        current.email,
+                        current
+                            .workspace_label()
+                            .map(|workspace| format!(" ({workspace})"))
+                            .unwrap_or_default()
+                    )
                 } else {
-                    format!("Add current account {} to switcher", current.email)
+                    format!(
+                        "Add current account {}{} to switcher",
+                        current.email,
+                        current
+                            .workspace_label()
+                            .map(|workspace| format!(" ({workspace})"))
+                            .unwrap_or_default()
+                    )
                 },
                 action: InteractiveAction::SaveCurrent,
                 tone: MenuLabelTone::Normal,
@@ -1390,6 +1413,8 @@ mod tests {
                 subject: Some("sub-1".to_owned()),
                 name: Some("Tester".to_owned()),
                 plan_label: Some("Pro".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             }),
             current_account_saved_id: current_saved_id,
             saved_accounts: usize::from(current_saved_id.is_some()),
@@ -1410,6 +1435,8 @@ mod tests {
                 subject: Some("sub-1".to_owned()),
                 name: Some("Tester".to_owned()),
                 plan_label: Some("Pro".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
                 environment: EnvironmentKind::Windows,
                 is_active,
                 created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1705,6 +1732,8 @@ mod tests {
                 subject: Some("sub-2".to_owned()),
                 name: Some("Other".to_owned()),
                 plan_label: Some("Plus".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             }),
             current_account_saved_id: None,
             saved_accounts: 1,
@@ -1757,6 +1786,8 @@ mod tests {
                 subject: Some("sub-1".to_owned()),
                 name: None,
                 plan_label: Some("Pro".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             },
             &SnapshotBlob {
                 schema_version: 1,

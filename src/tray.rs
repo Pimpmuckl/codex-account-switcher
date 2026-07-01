@@ -628,7 +628,9 @@ where
                     .unwrap_or_default();
                 format!(
                     "Codex Account Switcher — {}{} ({})",
-                    account.email, usage_info, plan
+                    identity_display_name(account),
+                    usage_info,
+                    plan
                 )
             }
             None => "Codex Account Switcher — Not logged in".to_owned(),
@@ -658,7 +660,11 @@ where
         menu.append(&MenuItem::new("Active Account", false, None))?;
         if let Some(current) = &status.current_account {
             // Line 1: Full Email
-            menu.append(&MenuItem::new(format!("  {}", current.email), false, None))?;
+            menu.append(&MenuItem::new(
+                format!("  {}", identity_display_name(current)),
+                false,
+                None,
+            ))?;
 
             // Line 2: Details
             let plan = format_plan_label_simple(current.plan_label.as_deref());
@@ -734,7 +740,7 @@ where
                     MenuId::new(&id),
                     format!(
                         "  {}  —  {}",
-                        account.email,
+                        account_display_name(account),
                         account_status_label_simple(account)
                     ),
                     true,
@@ -774,7 +780,7 @@ where
                 let delete_id = format!("delete:{}", account.id);
                 delete_submenu.append(&MenuItem::with_id(
                     MenuId::new(&delete_id),
-                    &account.email,
+                    account_display_name(account),
                     true,
                     None,
                 ))?;
@@ -919,10 +925,29 @@ fn find_active_tray_account<'a>(
 }
 
 fn account_matches_identity(account: &AccountView, identity: &DisplayIdentity) -> bool {
-    match (&account.subject, &identity.subject) {
-        (Some(left), Some(right)) => left == right,
-        _ => account.email.eq_ignore_ascii_case(&identity.email),
+    DisplayIdentity {
+        email: account.email.clone(),
+        subject: account.subject.clone(),
+        name: account.name.clone(),
+        plan_label: account.plan_label.clone(),
+        workspace_id: account.workspace_id.clone(),
+        workspace_name: account.workspace_name.clone(),
     }
+    .matches(identity)
+}
+
+fn account_display_name(account: &AccountView) -> String {
+    display_name_with_workspace(&account.email, account.workspace_label())
+}
+
+fn identity_display_name(identity: &DisplayIdentity) -> String {
+    display_name_with_workspace(&identity.email, identity.workspace_label())
+}
+
+fn display_name_with_workspace(email: &str, workspace: Option<&str>) -> String {
+    workspace
+        .map(|workspace| format!("{email} ({workspace})"))
+        .unwrap_or_else(|| email.to_owned())
 }
 
 fn format_plan_label_simple(plan: Option<&str>) -> String {
@@ -1410,6 +1435,8 @@ mod tests {
             subject: Some("sub".to_owned()),
             name: None,
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
             environment: EnvironmentKind::Windows,
             is_active: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1441,6 +1468,8 @@ mod tests {
             subject: Some("sub".to_owned()),
             name: None,
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
             environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1473,6 +1502,8 @@ mod tests {
             subject: Some("sub".to_owned()),
             name: None,
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
             environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1487,12 +1518,16 @@ mod tests {
             subject: Some("sub".to_owned()),
             name: None,
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let mismatched_identity = DisplayIdentity {
             email: "other@example.com".to_owned(),
             subject: Some("other-sub".to_owned()),
             name: None,
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let accounts = vec![account];
 

@@ -623,6 +623,8 @@ mod tests {
                 subject: Some("sub-1".to_owned()),
                 name: None,
                 plan_label: Some("Pro".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             },
             &SnapshotBlob {
                 schema_version: 1,
@@ -660,6 +662,8 @@ mod tests {
                 subject: Some("sub-1".to_owned()),
                 name: None,
                 plan_label: Some("Pro".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             },
             &SnapshotBlob {
                 schema_version: 1,
@@ -692,6 +696,8 @@ mod tests {
                     subject: Some("sub-1".to_owned()),
                     name: None,
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &SnapshotBlob {
                     schema_version: 1,
@@ -708,6 +714,8 @@ mod tests {
                 subject: Some("sub-1".to_owned()),
                 name: None,
                 plan_label: Some("Pro".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             },
             &SnapshotBlob {
                 schema_version: 1,
@@ -758,6 +766,8 @@ mod tests {
             subject: Some("sub-1".to_owned()),
             name: None,
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let snapshot = SnapshotBlob {
             schema_version: 1,
@@ -884,24 +894,32 @@ mod tests {
             subject: Some("sub-1".to_owned()),
             name: Some("Tester".to_owned()),
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let missing_subject = DisplayIdentity {
             email: "person@example.com".to_owned(),
             subject: None,
             name: Some("Tester".to_owned()),
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let wrong_subject = DisplayIdentity {
             email: "person@example.com".to_owned(),
             subject: Some("sub-2".to_owned()),
             name: Some("Tester".to_owned()),
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let matching_subject = DisplayIdentity {
             email: "other@example.com".to_owned(),
             subject: Some("sub-1".to_owned()),
             name: Some("Tester".to_owned()),
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         assert!(!subject_bound_identity_matches(&expected, &missing_subject));
         assert!(!subject_bound_identity_matches(&expected, &wrong_subject));
@@ -934,6 +952,8 @@ mod tests {
                     subject: Some("sub-1".to_owned()),
                     name: Some("Before".to_owned()),
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &SnapshotBlob {
                     schema_version: 1,
@@ -989,6 +1009,8 @@ mod tests {
                     subject: Some("sub-expected".to_owned()),
                     name: Some("Expected".to_owned()),
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &SnapshotBlob {
                     schema_version: 1,
@@ -1042,6 +1064,8 @@ mod tests {
                     subject: None,
                     name: Some("Old".to_owned()),
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &SnapshotBlob {
                     schema_version: 1,
@@ -1086,6 +1110,8 @@ mod tests {
                     subject: Some("sub-test".to_owned()),
                     name: Some("Test".to_owned()),
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &SnapshotBlob {
                     schema_version: 1,
@@ -1148,6 +1174,8 @@ mod tests {
                     subject: Some("sub-temp".to_owned()),
                     name: Some("Temp".to_owned()),
                     plan_label: Some("Plus".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &SnapshotBlob {
                     schema_version: 1,

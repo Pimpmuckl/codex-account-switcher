@@ -49,14 +49,36 @@ pub struct DisplayIdentity {
     pub subject: Option<String>,
     pub name: Option<String>,
     pub plan_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
 }
 
 impl DisplayIdentity {
     pub fn matches(&self, other: &Self) -> bool {
-        match (&self.subject, &other.subject) {
+        let same_user = match (&self.subject, &other.subject) {
             (Some(left), Some(right)) => left == right,
             _ => self.email.eq_ignore_ascii_case(&other.email),
+        };
+        same_user && self.workspace_matches(other)
+    }
+
+    pub fn workspace_matches(&self, other: &Self) -> bool {
+        match (&self.workspace_id, &other.workspace_id) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => match (&self.workspace_name, &other.workspace_name) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                _ => true,
+            },
+            _ => true,
         }
+    }
+
+    pub fn workspace_label(&self) -> Option<&str> {
+        self.workspace_name
+            .as_deref()
+            .or(self.workspace_id.as_deref())
     }
 }
 
@@ -70,6 +92,8 @@ mod tests {
             subject: subject.map(str::to_owned),
             name: None,
             plan_label: None,
+            workspace_id: None,
+            workspace_name: None,
         }
     }
 
@@ -101,6 +125,10 @@ pub struct SavedAccountMetadata {
     pub subject: Option<String>,
     pub name: Option<String>,
     pub plan_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
     pub secret_key: String,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
@@ -128,6 +156,10 @@ pub struct AccountView {
     pub subject: Option<String>,
     pub name: Option<String>,
     pub plan_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
     pub environment: EnvironmentKind,
     pub is_active: bool,
     pub created_at: OffsetDateTime,
@@ -137,6 +169,14 @@ pub struct AccountView {
     pub usage_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+impl AccountView {
+    pub fn workspace_label(&self) -> Option<&str> {
+        self.workspace_name
+            .as_deref()
+            .or(self.workspace_id.as_deref())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -244,6 +284,10 @@ pub struct ExportBundleAccount {
     pub subject: Option<String>,
     pub name: Option<String>,
     pub plan_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
     pub snapshot: SnapshotBlob,
 }
 

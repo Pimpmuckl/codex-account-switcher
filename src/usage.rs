@@ -224,6 +224,8 @@ impl UsageResponse {
             subject: None,
             name: None,
             plan_label: normalize_plan_label(self.plan_type.as_deref()),
+            workspace_id: None,
+            workspace_name: None,
         }))
     }
 
@@ -526,6 +528,8 @@ fn merge_identity(base: &DisplayIdentity, fetched: Option<DisplayIdentity>) -> D
         subject: base.subject.clone(),
         name: base.name.clone(),
         plan_label: fetched.plan_label.or_else(|| base.plan_label.clone()),
+        workspace_id: base.workspace_id.clone(),
+        workspace_name: base.workspace_name.clone(),
     }
 }
 
@@ -673,17 +677,22 @@ mod tests {
             subject: Some("sub-123".to_owned()),
             name: Some("Saved User".to_owned()),
             plan_label: Some("Pro".to_owned()),
+            workspace_id: Some("ws_saved".to_owned()),
+            workspace_name: Some("Saved Workspace".to_owned()),
         };
         let fetched = DisplayIdentity {
             email: "live@example.com".to_owned(),
             subject: None,
             name: None,
             plan_label: Some("Plus".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
         };
         let merged = merge_identity(&base, Some(fetched));
         assert_eq!(merged.email, "live@example.com");
         assert_eq!(merged.subject.as_deref(), Some("sub-123"));
         assert_eq!(merged.plan_label.as_deref(), Some("Plus"));
+        assert_eq!(merged.workspace_id.as_deref(), Some("ws_saved"));
     }
 
     fn usage_snapshot_fixture() -> SnapshotBlob {
@@ -763,6 +772,8 @@ mod tests {
                 subject: Some("sub-user".to_owned()),
                 name: None,
                 plan_label: Some("Plus".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             },
             snapshot: stale_usage_snapshot_fixture(),
             source: UsageSource::SavedAccessToken,
@@ -814,6 +825,8 @@ mod tests {
                 subject: Some("sub-user".to_owned()),
                 name: None,
                 plan_label: Some("Plus".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             },
             snapshot,
             source: UsageSource::SavedAccessToken,
@@ -844,6 +857,8 @@ mod tests {
                 subject: Some("sub-user".to_owned()),
                 name: None,
                 plan_label: None,
+                workspace_id: None,
+                workspace_name: None,
             },
             snapshot: usage_snapshot_fixture(),
             source: UsageSource::SavedAccessToken,
@@ -876,6 +891,8 @@ mod tests {
                 subject: Some("sub-user".to_owned()),
                 name: None,
                 plan_label: None,
+                workspace_id: None,
+                workspace_name: None,
             },
             snapshot: usage_snapshot_fixture(),
             source: UsageSource::SavedAccessToken,

@@ -57,6 +57,8 @@ fn account_view(
         subject: account.subject,
         name: account.name,
         plan_label: account.plan_label,
+        workspace_id: account.workspace_id,
+        workspace_name: account.workspace_name,
         environment: account.environment,
         is_active: active_id.is_some_and(|id| id == account.id),
         created_at: account.created_at,
@@ -83,6 +85,8 @@ fn account_view_matches_identity(account: &AccountView, identity: &DisplayIdenti
         subject: account.subject.clone(),
         name: account.name.clone(),
         plan_label: account.plan_label.clone(),
+        workspace_id: account.workspace_id.clone(),
+        workspace_name: account.workspace_name.clone(),
     }
     .matches(identity)
 }
@@ -93,12 +97,14 @@ fn saved_identity(account: &SavedAccountMetadata) -> DisplayIdentity {
         subject: account.subject.clone(),
         name: account.name.clone(),
         plan_label: account.plan_label.clone(),
+        workspace_id: account.workspace_id.clone(),
+        workspace_name: account.workspace_name.clone(),
     }
 }
 
 fn subject_bound_identity_matches(expected: &DisplayIdentity, snapshot: &DisplayIdentity) -> bool {
     match (&expected.subject, &snapshot.subject) {
-        (Some(left), Some(right)) => left == right,
+        (Some(left), Some(right)) => left == right && expected.workspace_matches(snapshot),
         _ => false,
     }
 }

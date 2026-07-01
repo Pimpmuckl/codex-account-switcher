@@ -73,6 +73,8 @@ where
                     subject: account.subject.clone(),
                     name: account.name.clone(),
                     plan_label: account.plan_label.clone(),
+                    workspace_id: account.workspace_id.clone(),
+                    workspace_name: account.workspace_name.clone(),
                 }
                 .matches(identity)
         });
@@ -83,6 +85,8 @@ where
             account.subject = identity.subject.clone();
             account.name = identity.name.clone();
             account.plan_label = identity.plan_label.clone();
+            account.workspace_id = identity.workspace_id.clone();
+            account.workspace_name = identity.workspace_name.clone();
             account.cached_usage_error = None;
             account.updated_at = now;
             (account.clone(), false)
@@ -95,6 +99,8 @@ where
                 subject: identity.subject.clone(),
                 name: identity.name.clone(),
                 plan_label: identity.plan_label.clone(),
+                workspace_id: identity.workspace_id.clone(),
+                workspace_name: identity.workspace_name.clone(),
                 secret_key: format!("snapshot:{id}"),
                 created_at: now,
                 updated_at: now,
@@ -154,6 +160,8 @@ where
         account.subject = identity.subject.clone();
         account.name = identity.name.clone();
         account.plan_label = identity.plan_label.clone();
+        account.workspace_id = identity.workspace_id.clone();
+        account.workspace_name = identity.workspace_name.clone();
         account.cached_usage = usage;
         account.cached_usage_error = None;
         let metadata = account.clone();
@@ -268,6 +276,8 @@ where
                         subject: account.subject.clone(),
                         name: account.name.clone(),
                         plan_label: account.plan_label.clone(),
+                        workspace_id: account.workspace_id.clone(),
+                        workspace_name: account.workspace_name.clone(),
                     }
                     .matches(identity)
             })
@@ -288,6 +298,8 @@ where
         account.subject = identity.subject.clone();
         account.name = identity.name.clone();
         account.plan_label = identity.plan_label.clone();
+        account.workspace_id = identity.workspace_id.clone();
+        account.workspace_name = identity.workspace_name.clone();
         account.last_activated_at = Some(now);
         account.updated_at = now;
         let updated = account.clone();
@@ -328,6 +340,16 @@ mod tests {
             subject: Some(subject.to_owned()),
             name: Some("Tester".to_owned()),
             plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
+        }
+    }
+
+    fn workspace_identity(email: &str, subject: &str, workspace_id: &str) -> DisplayIdentity {
+        DisplayIdentity {
+            workspace_id: Some(workspace_id.to_owned()),
+            workspace_name: Some(format!("Workspace {workspace_id}")),
+            ..identity(email, subject)
         }
     }
 
@@ -364,6 +386,38 @@ mod tests {
         assert!(!created);
         assert_eq!(first.id, second.id);
         assert_eq!(second.email, "person2@example.com");
+    }
+
+    #[test]
+    fn keeps_same_user_accounts_separate_by_workspace() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+        let env = EnvironmentKind::Macos;
+        let snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![],
+        };
+
+        let (first, first_created) = repo
+            .save_snapshot(
+                &env,
+                &workspace_identity("person@example.com", "sub-1", "acct-a"),
+                &snapshot,
+            )
+            .expect("save first");
+        let (second, second_created) = repo
+            .save_snapshot(
+                &env,
+                &workspace_identity("person@example.com", "sub-1", "acct-b"),
+                &snapshot,
+            )
+            .expect("save second");
+
+        assert!(first_created);
+        assert!(second_created);
+        assert_ne!(first.id, second.id);
+        let accounts = repo.list_accounts(&env).expect("list");
+        assert_eq!(accounts.len(), 2);
     }
 
     #[derive(Clone, Default)]
@@ -697,6 +751,8 @@ mod tests {
                     subject: None,
                     name: Some("Tester".to_owned()),
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &snapshot,
             )
@@ -741,6 +797,8 @@ mod tests {
                     subject: None,
                     name: Some("Tester".to_owned()),
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &snapshot,
             )

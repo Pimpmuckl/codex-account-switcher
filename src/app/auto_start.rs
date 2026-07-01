@@ -159,7 +159,7 @@ where
             return Ok(None);
         };
         let now = OffsetDateTime::now_utc();
-        let switch_reason = current_switch_reason(current_account, now, threshold);
+        let switch_reason = current_switch_reason(current_account, now);
         if switch_reason.is_none() {
             return Ok(None);
         }
@@ -186,7 +186,6 @@ where
             .context("switch target account missing after scoring")?;
         if !switch_target_is_improvement(
             switch_reason,
-            current_account.cached_usage.as_ref(),
             target_account.cached_usage.as_ref(),
             now,
             threshold,
@@ -359,7 +358,6 @@ pub fn spawn_auto_start_usage_windows_worker(env: AppEnv) {
 
 fn switch_target_is_improvement(
     reason: &str,
-    current: Option<&crate::model::AccountUsageView>,
     target: Option<&crate::model::AccountUsageView>,
     now: OffsetDateTime,
     near_limit_threshold: u8,
@@ -377,15 +375,6 @@ fn switch_target_is_improvement(
         "rate limit detected" | "quota exhausted" => {
             !target.should_switch_account(now, near_limit_threshold)
         }
-        "quota nearly exhausted" => {
-            let target_remaining = target.min_remaining_percent(now);
-            let current_remaining = current.and_then(|usage| usage.min_remaining_percent(now));
-            match (current_remaining, target_remaining) {
-                (Some(current), Some(target)) => target > current && target > near_limit_threshold,
-                (None, Some(target)) => target > near_limit_threshold,
-                _ => false,
-            }
-        }
         _ => false,
     }
 }
@@ -393,7 +382,6 @@ fn switch_target_is_improvement(
 fn current_switch_reason(
     account: &crate::model::SavedAccountMetadata,
     now: OffsetDateTime,
-    near_limit_threshold: u8,
 ) -> Option<&'static str> {
     if let Some(err) = account.cached_usage_error.as_deref() {
         if crate::usage::usage_error_indicates_rate_limit(err) {
@@ -406,9 +394,6 @@ fn current_switch_reason(
     let usage = account.cached_usage.as_ref()?;
     if usage.is_out_of_quota(now) {
         return Some("quota exhausted");
-    }
-    if usage.is_near_limit(now, near_limit_threshold) {
-        return Some("quota nearly exhausted");
     }
     None
 }
@@ -1017,7 +1002,6 @@ mod tests {
         let target = current.clone();
         assert!(!switch_target_is_improvement(
             "quota exhausted",
-            Some(&current),
             Some(&target),
             now,
             5,
@@ -1025,38 +1009,38 @@ mod tests {
     }
 
     #[test]
-    fn switch_target_is_improvement_rejects_near_limit_ping_pong() {
+    fn current_switch_reason_ignores_near_limit_quota() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let reset = now + time::Duration::hours(1);
-        let current = crate::model::AccountUsageView {
-            source: crate::model::UsageSource::SavedAccessToken,
-            fetched_at: now,
-            five_hour: Some(crate::model::UsageWindowView {
-                used_percent: 97,
-                remaining_percent: 3,
-                reset_at: reset,
+        let account = crate::model::SavedAccountMetadata {
+            id: uuid::Uuid::new_v4(),
+            environment: crate::model::EnvironmentKind::Macos,
+            email: "active@example.com".to_owned(),
+            subject: Some("sub-active".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
+            secret_key: "snapshot:test".to_owned(),
+            created_at: now,
+            updated_at: now,
+            last_activated_at: None,
+            cached_usage: Some(crate::model::AccountUsageView {
+                source: crate::model::UsageSource::SavedAccessToken,
+                fetched_at: now,
+                five_hour: Some(crate::model::UsageWindowView {
+                    used_percent: 97,
+                    remaining_percent: 3,
+                    reset_at: reset,
+                }),
+                weekly: None,
+                credits: None,
             }),
-            weekly: None,
-            credits: None,
+            cached_usage_error: None,
+            label: None,
         };
-        let target = crate::model::AccountUsageView {
-            source: crate::model::UsageSource::SavedAccessToken,
-            fetched_at: now,
-            five_hour: Some(crate::model::UsageWindowView {
-                used_percent: 96,
-                remaining_percent: 4,
-                reset_at: reset,
-            }),
-            weekly: None,
-            credits: None,
-        };
-        assert!(!switch_target_is_improvement(
-            "quota nearly exhausted",
-            Some(&current),
-            Some(&target),
-            now,
-            5,
-        ));
+
+        assert_eq!(current_switch_reason(&account, now), None);
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1167,6 +1151,8 @@ mod tests {
                     subject: Some("sub-active".to_owned()),
                     name: None,
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &active_snapshot,
             )?
@@ -1180,6 +1166,8 @@ mod tests {
                     subject: Some("sub-candidate".to_owned()),
                     name: None,
                     plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
                 },
                 &candidate_snapshot,
             )?
@@ -1194,6 +1182,8 @@ mod tests {
                 subject: Some("sub-active".to_owned()),
                 name: None,
                 plan_label: Some("Pro".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             },
             &active_snapshot,
             Some(crate::model::AccountUsageView {
@@ -1217,6 +1207,8 @@ mod tests {
                 subject: Some("sub-candidate".to_owned()),
                 name: None,
                 plan_label: Some("Pro".to_owned()),
+                workspace_id: None,
+                workspace_name: None,
             },
             &candidate_snapshot,
             Some(crate::model::AccountUsageView {
