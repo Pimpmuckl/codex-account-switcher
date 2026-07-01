@@ -15,24 +15,33 @@ SOURCE_BIN=""
 
 mkdir -p "$LOG_DIR" "$(dirname "$INSTALL_BIN")"
 
-if [[ -x "$APP_BUNDLE/Contents/MacOS/codex-account-switcher" ]]; then
-  SOURCE_BIN="$APP_BUNDLE/Contents/MacOS/codex-account-switcher"
-elif [[ -x "$PROJECT_DIR/target/release/codex-account-switcher" ]]; then
+# Prefer a freshly built cargo binary over an older packaged .app bundle.
+if [[ -x "$PROJECT_DIR/target/release/codex-account-switcher" ]]; then
   SOURCE_BIN="$PROJECT_DIR/target/release/codex-account-switcher"
+elif [[ -x "$APP_BUNDLE/Contents/MacOS/codex-account-switcher" ]]; then
+  SOURCE_BIN="$APP_BUNDLE/Contents/MacOS/codex-account-switcher"
 else
   echo "Build first: cargo build --release && ./scripts/build_macos_app.sh" >&2
   exit 1
 fi
 
 install -m 755 "$SOURCE_BIN" "$INSTALL_BIN"
+echo "Installed menubar binary from: $SOURCE_BIN"
 
+OLD_PID=""
 if [[ -f "$LOCK_FILE" ]]; then
   OLD_PID="$(tr -d '[:space:]' <"$LOCK_FILE" 2>/dev/null || true)"
-  if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "Already running (pid=$OLD_PID). Check menu bar (Control Center → Menu Bar if hidden)."
-    echo "Log: $LOG_FILE"
-    exit 0
-  fi
+fi
+
+if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+  echo "Restarting tray (pid=$OLD_PID) to load updated binary..."
+  kill "$OLD_PID" 2>/dev/null || true
+  for _ in {1..10}; do
+    if ! kill -0 "$OLD_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.2
+  done
 fi
 
 echo "Launching installed menubar binary: $INSTALL_BIN"

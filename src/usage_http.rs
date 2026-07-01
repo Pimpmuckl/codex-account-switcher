@@ -1,11 +1,20 @@
 #![cfg(test)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+static MOCK_HTTP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn with_mock_http_test_lock<R>(run: impl FnOnce() -> R) -> R {
+    let _guard = MOCK_HTTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run()
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum MockEndpoint {
@@ -123,10 +132,22 @@ fn handle_connection(
     if reader.read_line(&mut request_line).is_err() {
         return;
     }
+    let mut content_length = 0usize;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() || line == "\r\n" {
             break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0u8; content_length];
+        if reader.read_exact(&mut body).is_err() {
+            return;
         }
     }
 

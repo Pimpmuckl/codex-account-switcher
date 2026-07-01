@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
@@ -19,6 +20,43 @@ use crate::model::{
 pub struct LiveAuthBundle {
     pub identity: DisplayIdentity,
     pub snapshot: SnapshotBlob,
+}
+
+pub struct AuthWriteLock {
+    #[cfg(unix)]
+    _file: fs::File,
+    #[cfg(not(unix))]
+    _file: fs::File,
+}
+
+pub fn acquire_auth_write_lock(env: &AppEnv) -> Result<AuthWriteLock> {
+    fs::create_dir_all(&env.codex_root)
+        .with_context(|| format!("failed to create {}", env.codex_root.display()))?;
+    let lock_path = env.codex_root.join(".cas-auth.lock");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open auth lock {}", lock_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0;
+        if !locked {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to lock {}", lock_path.display()));
+        }
+    }
+
+    file.set_len(0)
+        .with_context(|| format!("failed to clear auth lock {}", lock_path.display()))?;
+    writeln!(file, "{}", std::process::id())
+        .with_context(|| format!("failed to write auth lock {}", lock_path.display()))?;
+    Ok(AuthWriteLock { _file: file })
 }
 
 pub fn try_read_live_auth_bundle(env: &AppEnv) -> Result<Option<LiveAuthBundle>> {
@@ -73,6 +111,17 @@ pub fn restore_snapshot(
     expected_identity: &DisplayIdentity,
     verify_stable: bool,
 ) -> Result<()> {
+    let lock = acquire_auth_write_lock(env)?;
+    restore_snapshot_with_lock(&lock, env, snapshot, expected_identity, verify_stable)
+}
+
+pub fn restore_snapshot_with_lock(
+    _lock: &AuthWriteLock,
+    env: &AppEnv,
+    snapshot: &SnapshotBlob,
+    expected_identity: &DisplayIdentity,
+    verify_stable: bool,
+) -> Result<()> {
     ensure_snapshot_complete(snapshot)?;
     fs::create_dir_all(&env.codex_root)
         .with_context(|| format!("failed to create {}", env.codex_root.display()))?;
@@ -87,15 +136,24 @@ pub fn restore_snapshot(
     fs::create_dir_all(&temp_dir)
         .with_context(|| format!("failed to create {}", temp_dir.display()))?;
 
-    if let Err(error) = stage_and_restore(&env.codex_root, &backup_dir, &temp_dir, snapshot) {
-        let _ = restore_from_backup(&env.codex_root, &backup_dir);
+    let backup_state = match backup_live_files(&env.codex_root, &backup_dir) {
+        Ok(backup_state) => backup_state,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temp_dir);
+            let _ = fs::remove_dir_all(&backup_dir);
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = stage_and_restore(&env.codex_root, &temp_dir, snapshot) {
+        let _ = restore_from_backup(&env.codex_root, &backup_dir, &backup_state);
         let _ = fs::remove_dir_all(&temp_dir);
         let _ = fs::remove_dir_all(&backup_dir);
         return Err(error);
     }
 
     if let Err(error) = verify_live_snapshot_once(env, snapshot, expected_identity) {
-        let _ = restore_from_backup(&env.codex_root, &backup_dir);
+        let _ = restore_from_backup(&env.codex_root, &backup_dir, &backup_state);
         let _ = fs::remove_dir_all(&temp_dir);
         let _ = fs::remove_dir_all(&backup_dir);
         return Err(error);
@@ -110,7 +168,7 @@ pub fn restore_snapshot(
             Duration::from_millis(250),
         )
     {
-        let _ = restore_from_backup(&env.codex_root, &backup_dir);
+        let _ = restore_from_backup(&env.codex_root, &backup_dir, &backup_state);
         let _ = fs::remove_dir_all(&temp_dir);
         let _ = fs::remove_dir_all(&backup_dir);
         return Err(error);
@@ -143,9 +201,27 @@ pub fn verify_live_snapshot_stable(
 }
 
 fn ensure_snapshot_complete(snapshot: &SnapshotBlob) -> Result<()> {
+    for file in &snapshot.files {
+        if !AUTH_FILES.contains(&file.name.as_str()) {
+            return Err(anyhow!(
+                "snapshot contains unmanaged auth file {}",
+                file.name
+            ));
+        }
+    }
     for file_name in AUTH_FILES {
-        if !snapshot.files.iter().any(|file| file.name == file_name) {
+        let count = snapshot
+            .files
+            .iter()
+            .filter(|file| file.name == file_name)
+            .count();
+        if count == 0 {
             return Err(anyhow!("snapshot missing managed auth file {file_name}"));
+        }
+        if count > 1 {
+            return Err(anyhow!(
+                "snapshot contains duplicate managed auth file {file_name}"
+            ));
         }
     }
     Ok(())
@@ -155,12 +231,7 @@ pub fn validate_import_snapshot(snapshot: &SnapshotBlob) -> Result<()> {
     ensure_snapshot_complete(snapshot)
 }
 
-fn stage_and_restore(
-    codex_root: &Path,
-    backup_dir: &Path,
-    temp_dir: &Path,
-    snapshot: &SnapshotBlob,
-) -> Result<()> {
+fn stage_and_restore(codex_root: &Path, temp_dir: &Path, snapshot: &SnapshotBlob) -> Result<()> {
     for file in &snapshot.files {
         let decoded = STANDARD
             .decode(&file.bytes_base64)
@@ -172,18 +243,7 @@ fn stage_and_restore(
 
     for file_name in AUTH_FILES {
         let live_path = codex_root.join(file_name);
-        if live_path.exists() {
-            let backup_path = backup_dir.join(file_name);
-            fs::copy(&live_path, &backup_path).with_context(|| {
-                format!(
-                    "failed to back up {} to {}",
-                    live_path.display(),
-                    backup_path.display()
-                )
-            })?;
-            fs::remove_file(&live_path)
-                .with_context(|| format!("failed to remove {}", live_path.display()))?;
-        }
+        remove_live_file_if_exists(&live_path)?;
         let staged_path = temp_dir.join(file_name);
         fs::copy(&staged_path, &live_path).with_context(|| {
             format!(
@@ -196,15 +256,52 @@ fn stage_and_restore(
     Ok(())
 }
 
-fn restore_from_backup(codex_root: &Path, backup_dir: &Path) -> Result<()> {
+#[derive(Clone, Debug)]
+struct ManagedFileBackup {
+    file_name: &'static str,
+    existed: bool,
+}
+
+fn backup_live_files(codex_root: &Path, backup_dir: &Path) -> Result<Vec<ManagedFileBackup>> {
+    let mut backups = Vec::with_capacity(AUTH_FILES.len());
     for file_name in AUTH_FILES {
-        let backup_path = backup_dir.join(file_name);
         let live_path = codex_root.join(file_name);
-        if backup_path.exists() {
-            if live_path.exists() {
-                fs::remove_file(&live_path)
-                    .with_context(|| format!("failed to remove {}", live_path.display()))?;
-            }
+        let existed = live_path.exists();
+        if existed {
+            let backup_path = backup_dir.join(file_name);
+            fs::copy(&live_path, &backup_path).with_context(|| {
+                format!(
+                    "failed to back up {} to {}",
+                    live_path.display(),
+                    backup_path.display()
+                )
+            })?;
+        }
+        backups.push(ManagedFileBackup { file_name, existed });
+    }
+    Ok(backups)
+}
+
+fn remove_live_file_if_exists(live_path: &Path) -> Result<()> {
+    match fs::remove_file(live_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove {}", live_path.display()))
+        }
+    }
+}
+
+fn restore_from_backup(
+    codex_root: &Path,
+    backup_dir: &Path,
+    backups: &[ManagedFileBackup],
+) -> Result<()> {
+    for backup in backups {
+        let backup_path = backup_dir.join(backup.file_name);
+        let live_path = codex_root.join(backup.file_name);
+        if backup.existed {
+            remove_live_file_if_exists(&live_path)?;
             fs::copy(&backup_path, &live_path).with_context(|| {
                 format!(
                     "failed to restore backup {} to {}",
@@ -212,6 +309,8 @@ fn restore_from_backup(codex_root: &Path, backup_dir: &Path) -> Result<()> {
                     live_path.display()
                 )
             })?;
+        } else {
+            remove_live_file_if_exists(&live_path)?;
         }
     }
     Ok(())
@@ -283,6 +382,7 @@ pub fn begin_add_account_session(env: &AppEnv) -> Result<()> {
     if add_account_session_active(env) {
         bail!("add account session already in progress");
     }
+    let _lock = acquire_auth_write_lock(env)?;
     let auth = env.codex_root.join("auth.json");
     if !auth.exists() {
         bail!("not logged in");
@@ -315,6 +415,7 @@ pub fn begin_add_account_session(env: &AppEnv) -> Result<()> {
 }
 
 pub fn ensure_cap_sid_exists(env: &AppEnv) -> Result<()> {
+    let _lock = acquire_auth_write_lock(env)?;
     let cap_sid = env.codex_root.join("cap_sid");
     if !cap_sid.exists() {
         fs::write(&cap_sid, b"")
@@ -324,6 +425,7 @@ pub fn ensure_cap_sid_exists(env: &AppEnv) -> Result<()> {
 }
 
 pub fn restore_add_account_backup(env: &AppEnv) -> Result<()> {
+    let _lock = acquire_auth_write_lock(env)?;
     let auth = env.codex_root.join("auth.json");
     let cap_sid = env.codex_root.join("cap_sid");
     let backup_auth = env.codex_root.join(ADD_ACCOUNT_AUTH_BACKUP);
@@ -445,6 +547,91 @@ mod tests {
         };
         restore_snapshot(&env, &bundle.snapshot, &expected, false)?;
         Ok(())
+    }
+
+    #[test]
+    fn failed_restore_removes_files_that_did_not_exist_beforehand() -> Result<()> {
+        let temp = tempdir()?;
+        let codex_root = temp.path().join(".codex");
+        fs::create_dir_all(&codex_root)?;
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: codex_root.clone(),
+            app_data_dir: temp.path().join("data"),
+        };
+        let snapshot = SnapshotBlob {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            files: vec![
+                SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: STANDARD.encode(auth_json_fixture(
+                        "person@example.com",
+                        "sub-1",
+                        Some("pro"),
+                    )),
+                },
+                SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: STANDARD.encode("sid-1"),
+                },
+            ],
+        };
+        let expected = DisplayIdentity {
+            email: "other@example.com".to_owned(),
+            subject: Some("sub-2".to_owned()),
+            name: None,
+            plan_label: None,
+        };
+
+        let error = restore_snapshot(&env, &snapshot, &expected, false)
+            .expect_err("identity mismatch should fail restore verification");
+
+        assert!(format!("{error:#}").contains("restore verification failed"));
+        assert!(!codex_root.join("auth.json").exists());
+        assert!(!codex_root.join("cap_sid").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn import_validation_rejects_duplicate_or_unmanaged_files() {
+        let duplicate = SnapshotBlob {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            files: vec![
+                SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: STANDARD.encode("{}"),
+                },
+                SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: STANDARD.encode("{}"),
+                },
+                SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: STANDARD.encode("sid"),
+                },
+            ],
+        };
+        assert!(validate_import_snapshot(&duplicate).is_err());
+
+        let unmanaged = SnapshotBlob {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            files: vec![
+                SnapshotFile {
+                    name: "auth.json".to_owned(),
+                    bytes_base64: STANDARD.encode("{}"),
+                },
+                SnapshotFile {
+                    name: "cap_sid".to_owned(),
+                    bytes_base64: STANDARD.encode("sid"),
+                },
+                SnapshotFile {
+                    name: "../outside".to_owned(),
+                    bytes_base64: STANDARD.encode("nope"),
+                },
+            ],
+        };
+        assert!(validate_import_snapshot(&unmanaged).is_err());
     }
 
     #[test]

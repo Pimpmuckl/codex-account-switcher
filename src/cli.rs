@@ -511,38 +511,80 @@ fn render_account_summary(account: &AccountView) -> String {
         .as_deref()
         .map(|name| format!(" [{name}]"))
         .unwrap_or_default();
-    let mut line = format!(
-        "{} {}{}{}",
-        account.id,
-        account.email,
-        label,
-        if account.is_active { " [active]" } else { "" }
-    );
+    let mut parts = vec![
+        format!("{}{}", account.email, label),
+        account_status_summary(account),
+    ];
+    if let Some(usage_summary) = account_usage_summary(account) {
+        parts.push(usage_summary);
+    }
+    parts.push(format!("id: {}", account.id));
+    parts.join("  |  ")
+}
+
+fn account_status_summary(account: &AccountView) -> String {
+    let mut parts = Vec::new();
+    if account.is_active {
+        parts.push("active");
+    }
     if account
         .usage_error
         .as_deref()
         .is_some_and(usage_error_requires_login)
     {
-        line.push_str(&format!(
-            " [{}]",
-            usage_error_label(account.usage_error.as_deref().unwrap_or_default()).to_lowercase()
-        ));
-    } else if let Some(usage) = &account.usage
-        && let Some(weekly) = &usage.weekly
-    {
-        if weekly.reset_at <= OffsetDateTime::now_utc() {
-            line.push_str(&format!(" [weekly: {QUOTA_PAST_RESET_LABEL}]"));
+        parts.push("login required");
+    } else if let Some(usage) = &account.usage {
+        let now = OffsetDateTime::now_utc();
+        if usage.is_out_of_quota(now) {
+            parts.push("quota depleted");
+        } else if usage.is_near_limit(now, 10) {
+            parts.push("low quota");
         } else {
-            line.push_str(&format!(
-                " [weekly remaining: {}%, reset {}]",
-                weekly.remaining_percent,
-                format_local_reset_at(weekly.reset_at)
-            ));
+            parts.push("ready");
         }
-    } else if let Some(error) = &account.usage_error {
-        line.push_str(&format!(" [{}]", usage_error_label(error).to_lowercase()));
+    } else if account.usage_error.is_some() {
+        parts.push("usage stale");
+    } else {
+        parts.push("no usage");
     }
-    line
+    format!("status: {}", parts.join(", "))
+}
+
+fn account_usage_summary(account: &AccountView) -> Option<String> {
+    if account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        return Some(usage_error_label(account.usage_error.as_deref()?).to_owned());
+    }
+    if let Some(usage) = &account.usage {
+        let now = OffsetDateTime::now_utc();
+        let mut parts = Vec::new();
+        if let Some(five_hour) = &usage.five_hour
+            && five_hour.reset_at > now
+        {
+            parts.push(format!("5h {}%", five_hour.remaining_percent));
+        }
+        if let Some(weekly) = &usage.weekly {
+            if weekly.reset_at <= now {
+                parts.push(format!("weekly {QUOTA_PAST_RESET_LABEL}"));
+            } else {
+                parts.push(format!(
+                    "weekly {}%, reset {}",
+                    weekly.remaining_percent,
+                    format_local_reset_at(weekly.reset_at)
+                ));
+            }
+        }
+        if !parts.is_empty() {
+            return Some(parts.join("; "));
+        }
+    }
+    account
+        .usage_error
+        .as_deref()
+        .map(|error| usage_error_label(error).to_owned())
 }
 
 fn print_usage_output(output: &UsageOutput) {
@@ -674,5 +716,49 @@ fn print_usage_summary(usage: &AccountUsageView) {
             "Credits: {} (has_credits={}, unlimited={})",
             credits.balance, credits.has_credits, credits.unlimited
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{EnvironmentKind, UsageSource, UsageWindowView};
+
+    fn account() -> AccountView {
+        AccountView {
+            id: Uuid::new_v4(),
+            email: "person@example.com".to_owned(),
+            subject: Some("sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            environment: EnvironmentKind::Macos,
+            is_active: true,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: Some(UsageWindowView {
+                    used_percent: 92,
+                    remaining_percent: 8,
+                    reset_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                }),
+                weekly: None,
+                credits: None,
+            }),
+            usage_error: None,
+            label: Some("work".to_owned()),
+        }
+    }
+
+    #[test]
+    fn account_summary_leads_with_human_status_before_id() {
+        let rendered = render_account_summary(&account());
+
+        assert!(rendered.starts_with("person@example.com [work]"));
+        assert!(rendered.contains("status: active, low quota"));
+        assert!(rendered.contains("5h 8%"));
+        assert!(rendered.contains("id: "));
     }
 }

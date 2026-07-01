@@ -399,6 +399,7 @@ pub(crate) enum MenuLabelTone {
 pub(crate) struct InteractiveMenu {
     pub(crate) prompt: &'static str,
     pub(crate) environment: String,
+    pub(crate) saved_account_count: usize,
     pub(crate) process_warning_count: usize,
     pub(crate) current_status_label: Option<String>,
     pub(crate) current_status_tone: MenuLabelTone,
@@ -415,6 +416,7 @@ struct PersistentRenderState {
 struct AccountLabelWidths {
     email: usize,
     plan: usize,
+    status: usize,
     remaining: usize,
     reset: usize,
 }
@@ -510,6 +512,11 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
             .unwrap_or_default(),
         width = widths.plan
     );
+    let status = format!(
+        "{:<width$}",
+        account_status_label(account),
+        width = widths.status
+    );
 
     let (remaining, reset) = if account
         .usage_error
@@ -546,11 +553,49 @@ fn render_account_label(account: &AccountView, widths: AccountLabelWidths) -> St
     let remaining = format!("{:<width$}", remaining, width = widths.remaining);
     let reset = format!("{:<width$}", reset, width = widths.reset);
 
-    [email, plan, remaining, reset]
+    [email, plan, status, remaining, reset]
         .into_iter()
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
         .join("  ")
+}
+
+fn account_status_label(account: &AccountView) -> String {
+    let mut parts = Vec::new();
+    if account.is_active {
+        parts.push("Active");
+    }
+    if account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        parts.push("Login required");
+    } else if let Some(usage) = &account.usage {
+        let now = OffsetDateTime::now_utc();
+        if usage.is_out_of_quota(now) {
+            parts.push("Quota depleted");
+        } else {
+            let lowest = [usage.five_hour.as_ref(), usage.weekly.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter(|window| window.reset_at > now)
+                .map(|window| window.remaining_percent)
+                .min();
+            if lowest.is_some_and(|percent| percent <= 10) {
+                parts.push("Low quota");
+            } else if lowest.is_some_and(|percent| percent <= 25) {
+                parts.push("Watch quota");
+            } else {
+                parts.push("Ready");
+            }
+        }
+    } else if account.usage_error.is_some() {
+        parts.push("Usage stale");
+    } else {
+        parts.push("No usage");
+    }
+    parts.join(" / ")
 }
 
 fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
@@ -569,6 +614,7 @@ fn account_label_widths(accounts: &[&AccountView]) -> AccountLabelWidths {
                 .map(|plan| format!("Plan: {plan}").len())
                 .unwrap_or(0),
         );
+        widths.status = widths.status.max(account_status_label(account).len());
         let (remaining, reset) = if account
             .usage_error
             .as_deref()
@@ -760,6 +806,7 @@ pub(crate) fn build_menu(
     InteractiveMenu {
         prompt,
         environment: status.environment.to_string(),
+        saved_account_count: list.accounts.len(),
         process_warning_count: status.process_warnings.len(),
         current_status_label,
         current_status_tone,
@@ -847,7 +894,10 @@ fn render_persistent_menu(
         term.write_line(&style(menu.prompt).bold().to_string())?;
         lines += 1;
     }
-    term.write_line(&render_app_header(&menu.environment))?;
+    term.write_line(&render_app_header(
+        &menu.environment,
+        menu.saved_account_count,
+    ))?;
     lines += 1;
     if menu.process_warning_count > 0 {
         term.write_line(
@@ -909,11 +959,12 @@ fn render_menu_row(menu: &InteractiveMenu, selection: usize, index: usize) -> St
     render_menu_row_explicit(menu, index, selection == index)
 }
 
-fn render_app_header(environment: &str) -> String {
+fn render_app_header(environment: &str, saved_account_count: usize) -> String {
     style(format!(
-        "Codex Account Switcher v{}  ·  {}",
+        "Codex Account Switcher v{}  ·  {}  ·  {} saved",
         env!("CARGO_PKG_VERSION"),
-        environment
+        environment,
+        saved_account_count
     ))
     .magenta()
     .bold()
@@ -1457,7 +1508,33 @@ mod tests {
         );
 
         assert!(label.contains("Weekly Remaining: 90%"));
+        assert!(label.contains("Ready"));
         assert!(!label.contains("Usage unavailable"));
+    }
+
+    #[test]
+    fn account_label_surfaces_status_for_fast_scanning() {
+        let id = Uuid::new_v4();
+        let mut list = sample_list(id, true);
+        list.accounts[0].usage = Some(AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: Some(UsageWindowView {
+                used_percent: 93,
+                remaining_percent: 7,
+                reset_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+            }),
+            weekly: None,
+            credits: None,
+        });
+
+        let label = render_account_label(
+            &list.accounts[0],
+            account_label_widths(&[&list.accounts[0]]),
+        );
+
+        assert!(label.contains("Active / Low quota"));
+        assert!(label.contains("5h Remaining: 7%"));
     }
 
     #[test]

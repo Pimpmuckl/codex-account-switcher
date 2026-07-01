@@ -6,6 +6,21 @@ const SUMMARY_LIMIT: usize = 72;
 const EXECUTABLE_WIDTH: usize = 12;
 const ROLE_WIDTH: usize = 14;
 
+#[cfg(target_os = "macos")]
+const MACOS_CODEX_CLI_PATH: &str = "/Applications/Codex.app/Contents/Resources/codex";
+
+/// Resolve the Codex CLI binary. GUI-launched processes often lack shell aliases on PATH.
+pub fn codex_cli_path() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::path::PathBuf::from(MACOS_CODEX_CLI_PATH);
+        if path.is_file() {
+            return path;
+        }
+    }
+    std::path::PathBuf::from("codex")
+}
+
 pub fn detect_running_codex_processes() -> Vec<RunningCodexProcess> {
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -44,6 +59,19 @@ pub fn detect_running_codex_processes() -> Vec<RunningCodexProcess> {
             .then_with(|| left.pid.cmp(&right.pid))
     });
     processes
+}
+
+/// IDE/extension `codex app-server` processes do not hold live auth and should not
+/// block account switching.
+pub fn is_switch_blocking_process(process: &RunningCodexProcess) -> bool {
+    process.role != "app-server"
+}
+
+pub fn detect_switch_blocking_codex_processes() -> Vec<RunningCodexProcess> {
+    detect_running_codex_processes()
+        .into_iter()
+        .filter(is_switch_blocking_process)
+        .collect()
 }
 
 pub fn format_process_table(processes: &[RunningCodexProcess]) -> Vec<String> {
@@ -266,26 +294,26 @@ pub fn quit_running_codex_app() {
 
 pub const SWITCH_WAIT_POLL_MS: u64 = 2_000;
 
-/// Block until no Codex processes remain (polls every [`SWITCH_WAIT_POLL_MS`]).
+/// Block until no switch-blocking Codex processes remain (polls every [`SWITCH_WAIT_POLL_MS`]).
 pub fn wait_for_codex_processes_to_exit() {
-    while !detect_running_codex_processes().is_empty() {
+    while !detect_switch_blocking_codex_processes().is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(SWITCH_WAIT_POLL_MS));
     }
 }
 
-/// Wait up to `timeout` for Codex processes to exit. Returns `true` when none remain.
+/// Wait up to `timeout` for switch-blocking Codex processes to exit. Returns `true` when none remain.
 pub fn wait_for_codex_processes_to_exit_timeout(timeout: std::time::Duration) -> bool {
     if timeout.is_zero() {
-        return detect_running_codex_processes().is_empty();
+        return detect_switch_blocking_codex_processes().is_empty();
     }
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
-        if detect_running_codex_processes().is_empty() {
+        if detect_switch_blocking_codex_processes().is_empty() {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(SWITCH_WAIT_POLL_MS));
     }
-    detect_running_codex_processes().is_empty()
+    detect_switch_blocking_codex_processes().is_empty()
 }
 
 /// Ask how to proceed when Codex is running. Defaults to waiting when the dialog fails.
@@ -366,9 +394,27 @@ pub fn launch_codex_app() {
 mod tests {
     use super::{
         classify_process, clean_token, detect_flag_value, format_process_table,
-        matches_codex_process, truncate_summary,
+        is_switch_blocking_process, matches_codex_process, truncate_summary,
     };
     use crate::model::RunningCodexProcess;
+
+    #[test]
+    fn app_server_processes_do_not_block_account_switch() {
+        let app_server = RunningCodexProcess {
+            pid: 1,
+            executable: "codex".to_owned(),
+            role: "app-server".to_owned(),
+            summary: None,
+        };
+        let renderer = RunningCodexProcess {
+            pid: 2,
+            executable: "codex (renderer)".to_owned(),
+            role: "renderer".to_owned(),
+            summary: None,
+        };
+        assert!(!is_switch_blocking_process(&app_server));
+        assert!(is_switch_blocking_process(&renderer));
+    }
 
     #[test]
     fn matches_codex_process_detects_wrapped_cli() {

@@ -100,7 +100,7 @@ pub fn score_saved_account(
         };
     };
 
-    if usage.is_out_of_quota(now) {
+    if usage.is_fully_exhausted(now) {
         return AccountQuotaScore {
             account_id,
             email: email.to_owned(),
@@ -326,7 +326,12 @@ mod tests {
             OffsetDateTime::UNIX_EPOCH,
         );
         assert!(!score.eligible);
-        assert!(score.detail.as_deref().is_some_and(|d| d.contains("unknown")));
+        assert!(
+            score
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("unknown"))
+        );
     }
 
     #[test]
@@ -336,7 +341,10 @@ mod tests {
             "user@example.com",
             None,
             Some(&usage(
-                Some(window(50, OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1))),
+                Some(window(
+                    50,
+                    OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+                )),
                 None,
             )),
             Some("rate limit exceeded"),

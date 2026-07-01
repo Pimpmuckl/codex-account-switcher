@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
-use std::thread;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::thread;
 
 use anyhow::{Context, Result};
 use time::OffsetDateTime;
@@ -292,33 +292,12 @@ where
                     let app = tray_app_for_env(&env);
                     crate::process::quit_running_codex_app();
                     app.activate_with_running_policy(account_id, false)?;
-                    #[cfg(target_os = "macos")]
-                    {
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = std::process::Command::new("osascript")
-                                .arg("-e")
-                                .arg(format!(
-                                    "tell application \"Terminal\" to do script \"codex login && '{}' save\"",
-                                    exe.display()
-                                ))
-                                .spawn();
-                        }
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = std::process::Command::new("cmd")
-                                .args([
-                                    "/c",
-                                    "start",
-                                    "cmd",
-                                    "/k",
-                                    &format!("codex login && \"{}\" save", exe.display()),
-                                ])
-                                .spawn();
-                        }
-                    }
-                    Ok(None)
+                    crate::process::launch_codex_app();
+                    Ok(Some((
+                        "Codex Switcher".to_owned(),
+                        "Log in to Codex with this account, then choose Save Current Account."
+                            .to_owned(),
+                    )))
                 });
             }
             Some(TrayCommand::SaveCurrent) => {
@@ -344,7 +323,7 @@ where
                             crate::process::launch_codex_app();
                             Ok(Some((
                                 "Codex Switcher".to_owned(),
-                                "Login in Codex with the new account, then choose Finish Adding Account."
+                                "Log in to Codex with the new account, then choose Finish Adding Account."
                                     .to_owned(),
                             )))
                         });
@@ -638,10 +617,12 @@ where
                 let usage_info = active_account
                     .map(|act| {
                         let (remaining, _) = account_usage_labels_simple(act);
-                        if remaining.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" - {remaining}")
+                        let status = account_status_label_simple(act);
+                        match (status.is_empty(), remaining.is_empty()) {
+                            (true, true) => String::new(),
+                            (false, true) => format!(" - {status}"),
+                            (true, false) => format!(" - {remaining}"),
+                            (false, false) => format!(" - {status}, {remaining}"),
                         }
                     })
                     .unwrap_or_default();
@@ -749,8 +730,16 @@ where
             for account in &saved_accounts {
                 let id = format!("activate:{}", account.id);
                 // Line 1: Full Email (clickable)
-                let item =
-                    MenuItem::with_id(MenuId::new(&id), format!("  {}", account.email), true, None);
+                let item = MenuItem::with_id(
+                    MenuId::new(&id),
+                    format!(
+                        "  {}  —  {}",
+                        account.email,
+                        account_status_label_simple(account)
+                    ),
+                    true,
+                    None,
+                );
                 menu.append(&item)?;
                 self.commands.insert(id, TrayCommand::Activate(account.id));
 
@@ -981,6 +970,31 @@ fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
     }
 }
 
+fn account_status_label_simple(account: &AccountView) -> String {
+    if account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        return "Login required".to_owned();
+    }
+    if let Some(usage) = &account.usage {
+        let now = OffsetDateTime::now_utc();
+        if usage.is_out_of_quota(now) {
+            return "Quota depleted".to_owned();
+        }
+        if usage.is_near_limit(now, 10) {
+            return "Low quota".to_owned();
+        }
+        return "Ready".to_owned();
+    }
+    if account.usage_error.is_some() {
+        "Usage stale".to_owned()
+    } else {
+        "No usage".to_owned()
+    }
+}
+
 fn format_details_line(
     plan: String,
     remaining: String,
@@ -1129,7 +1143,7 @@ fn detach_from_controlling_terminal() {
 
 struct TrayInstanceLock {
     #[cfg(unix)]
-    file: fs::File,
+    _file: fs::File,
 }
 
 impl TrayInstanceLock {
@@ -1141,6 +1155,7 @@ impl TrayInstanceLock {
         {
             let mut file = OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(path)
@@ -1152,7 +1167,7 @@ impl TrayInstanceLock {
             }
             file.set_len(0)?;
             writeln!(file, "{}", std::process::id())?;
-            Ok(Some(Self { file }))
+            Ok(Some(Self { _file: file }))
         }
         #[cfg(not(unix))]
         {
@@ -1348,7 +1363,7 @@ fn fallback_icon() -> Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::EnvironmentKind;
+    use crate::model::{AccountUsageView, EnvironmentKind, UsageSource, UsageWindowView};
     use time::OffsetDateTime;
 
     #[test]
@@ -1385,6 +1400,37 @@ mod tests {
         assert_eq!(format_remaining_percent(2), "\u{2007}\u{2007}2");
         assert_eq!(format_remaining_percent(89), "\u{2007}89");
         assert_eq!(format_remaining_percent(100), "100");
+    }
+
+    #[test]
+    fn tray_status_label_surfaces_account_health() {
+        let account = AccountView {
+            id: Uuid::new_v4(),
+            email: "low@example.com".to_owned(),
+            subject: Some("sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            environment: EnvironmentKind::Windows,
+            is_active: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: Some(UsageWindowView {
+                    used_percent: 96,
+                    remaining_percent: 4,
+                    reset_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                }),
+                weekly: None,
+                credits: None,
+            }),
+            usage_error: None,
+            label: None,
+        };
+
+        assert_eq!(account_status_label_simple(&account), "Low quota");
     }
 
     #[test]

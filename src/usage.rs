@@ -69,6 +69,17 @@ pub fn fetch_usage(target: UsageTarget) -> Result<(UsageOutput, SnapshotBlob)> {
     let mut auth = snapshot_auth(&target.snapshot)?;
     let mut source = target.source;
 
+    if target.allow_refresh && should_refresh_proactively(&auth) {
+        match refresh_auth(&auth) {
+            Ok(refreshed) => {
+                auth = refreshed;
+                source = refresh_source(source);
+            }
+            Err(error) if usage_error_requires_login(&format!("{error:#}")) => return Err(error),
+            Err(_) => {}
+        }
+    }
+
     let response = match fetch_usage_response(&auth.access_token, auth.account_id.as_deref()) {
         Ok(response) => response,
         Err(error) if target.allow_refresh && should_refresh_after_error(&error, &auth) => {
@@ -417,6 +428,15 @@ fn should_refresh_after_error(error: &anyhow::Error, auth: &SnapshotAuth) -> boo
     true
 }
 
+fn should_refresh_proactively(auth: &SnapshotAuth) -> bool {
+    if auth.refresh_token.as_deref().is_none_or(str::is_empty) {
+        return false;
+    }
+    auth.last_refresh.is_none_or(|last_refresh| {
+        OffsetDateTime::now_utc() - last_refresh >= *TOKEN_REFRESH_INTERVAL
+    })
+}
+
 fn refresh_auth(auth: &SnapshotAuth) -> Result<SnapshotAuth> {
     let refresh_token = auth
         .refresh_token
@@ -553,19 +573,10 @@ mod tests {
     use anyhow::anyhow;
     use base64::Engine;
 
-    use crate::usage_http::{MockEndpoint, MockHttpServer};
+    use crate::usage_http::{MockEndpoint, MockHttpServer, with_mock_http_test_lock};
     use crate::{codex::auth_json_fixture, model::EnvironmentKind};
 
     use super::*;
-
-    static HTTP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_http_test_lock<R>(run: impl FnOnce() -> R) -> R {
-        let _guard = HTTP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        run()
-    }
 
     #[test]
     fn reused_refresh_token_error_is_login_required() {
@@ -676,14 +687,32 @@ mod tests {
     }
 
     fn usage_snapshot_fixture() -> SnapshotBlob {
+        usage_snapshot_fixture_with_last_refresh(Some(OffsetDateTime::now_utc()))
+    }
+
+    fn stale_usage_snapshot_fixture() -> SnapshotBlob {
+        usage_snapshot_fixture_with_last_refresh(None)
+    }
+
+    fn usage_snapshot_fixture_with_last_refresh(
+        last_refresh: Option<OffsetDateTime>,
+    ) -> SnapshotBlob {
+        let mut auth: serde_json::Value = serde_json::from_str(&auth_json_fixture(
+            "user@example.com",
+            "sub-user",
+            Some("plus"),
+        ))
+        .expect("auth fixture");
+        if let Some(last_refresh) = last_refresh {
+            auth["last_refresh"] = serde_json::Value::String(format_last_refresh(last_refresh));
+        }
         SnapshotBlob {
             schema_version: crate::model::SNAPSHOT_SCHEMA_VERSION,
             files: vec![
                 crate::model::SnapshotFile {
                     name: "auth.json".to_owned(),
-                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(
-                        auth_json_fixture("user@example.com", "sub-user", Some("plus")),
-                    ),
+                    bytes_base64: base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::to_vec(&auth).expect("auth json")),
                 },
                 crate::model::SnapshotFile {
                     name: "cap_sid".to_owned(),
@@ -695,11 +724,61 @@ mod tests {
 
     #[test]
     fn fetch_usage_http_mock_scenarios() {
-        with_http_test_lock(|| {
+        with_mock_http_test_lock(|| {
+            fetch_usage_proactively_refreshes_stale_snapshot_scenario();
             fetch_usage_refreshes_after_authorization_failure_scenario();
             fetch_usage_does_not_refresh_when_disabled_scenario();
             fetch_usage_surfaces_refresh_invalid_grant_as_login_required_scenario();
         });
+    }
+
+    fn fetch_usage_proactively_refreshes_stale_snapshot_scenario() {
+        let server = MockHttpServer::bind();
+        server.enqueue(
+            MockEndpoint::Refresh,
+            200,
+            r#"{
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "id_token": "id-new"
+            }"#,
+        );
+        server.enqueue(
+            MockEndpoint::Usage,
+            200,
+            r#"{
+                "email": "user@example.com",
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": { "used_percent": 15, "reset_at": 1700000000 },
+                    "secondary_window": { "used_percent": 5, "reset_at": 1700100000 }
+                }
+            }"#,
+        );
+
+        let target = UsageTarget {
+            environment: EnvironmentKind::Macos,
+            identity: DisplayIdentity {
+                email: "user@example.com".to_owned(),
+                subject: Some("sub-user".to_owned()),
+                name: None,
+                plan_label: Some("Plus".to_owned()),
+            },
+            snapshot: stale_usage_snapshot_fixture(),
+            source: UsageSource::SavedAccessToken,
+            allow_refresh: true,
+        };
+
+        let (output, updated_snapshot) =
+            with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
+                fetch_usage(target).expect("fetch usage with proactive refresh")
+            });
+
+        assert_eq!(output.usage.source, UsageSource::SavedRefreshToken);
+        let updated_auth = snapshot_auth(&updated_snapshot).expect("updated auth");
+        assert_eq!(updated_auth.access_token, "access-new");
+        assert_eq!(updated_auth.refresh_token.as_deref(), Some("refresh-new"));
+        assert!(updated_auth.last_refresh.is_some());
     }
 
     fn fetch_usage_refreshes_after_authorization_failure_scenario() {

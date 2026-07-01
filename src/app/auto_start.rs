@@ -21,22 +21,20 @@ use crate::model::{
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
-use crate::settings::{
-    DEFAULT_AUTO_SWITCH_POLL_SECONDS, DEFAULT_USAGE_WINDOW_POLL_SECONDS, load_settings,
-    save_settings,
-};
+use crate::settings::{DEFAULT_USAGE_WINDOW_POLL_SECONDS, load_settings, save_settings};
 
 use super::App;
 
 pub const NEAR_LIMIT_POLL_SECONDS: u64 = 30;
 pub const URGENT_POLL_SECONDS: u64 = 15;
+#[cfg(not(test))]
 const AUTO_SWITCH_CODEX_WAIT_SECONDS: u64 = 120;
 
 #[allow(dead_code)]
 fn auto_switch_codex_wait_timeout() -> StdDuration {
     #[cfg(test)]
     {
-        return StdDuration::ZERO;
+        StdDuration::ZERO
     }
     #[cfg(not(test))]
     {
@@ -53,7 +51,10 @@ where
 {
     pub fn auto_start_usage_windows_status(&self) -> Result<AutoStartUsageWindowsStatusOutput> {
         let settings = load_settings(&self.env.app_data_dir)?;
-        Ok(auto_start_status_output(settings.auto_start_usage_windows))
+        Ok(auto_start_status_output(
+            settings.auto_start_usage_windows,
+            compute_poll_interval(&self.env),
+        ))
     }
 
     pub fn set_auto_start_usage_windows(
@@ -63,7 +64,10 @@ where
         let mut settings = load_settings(&self.env.app_data_dir)?;
         settings.auto_start_usage_windows = enabled;
         save_settings(&self.env.app_data_dir, &settings)?;
-        Ok(auto_start_status_output(enabled))
+        Ok(auto_start_status_output(
+            enabled,
+            compute_poll_interval(&self.env),
+        ))
     }
 
     pub fn auto_switch_on_limit_status(&self) -> Result<AutoSwitchOnLimitStatusOutput> {
@@ -197,6 +201,9 @@ where
             if !urgent {
                 return Ok(None);
             }
+            if switch_reason == "login expired" {
+                crate::process::quit_running_codex_app();
+            }
             if !crate::process::wait_for_codex_processes_to_exit_timeout(
                 auto_switch_codex_wait_timeout(),
             ) {
@@ -205,6 +212,7 @@ where
         }
 
         self.activate_with_running_policy(target_id, false)?;
+        crate::process::launch_codex_app();
 
         let email = target_account.email.clone();
         let plan = target_account.plan_label.as_deref().unwrap_or("Free");
@@ -362,7 +370,7 @@ fn switch_target_is_improvement(
     let Some(target) = target else {
         return false;
     };
-    if target.is_out_of_quota(now) || target.has_stale_quota_cache(now) {
+    if target.is_fully_exhausted(now) || target.has_stale_quota_cache(now) {
         return false;
     }
     match reason {
@@ -395,9 +403,7 @@ fn current_switch_reason(
             return Some("login expired");
         }
     }
-    let Some(usage) = account.cached_usage.as_ref() else {
-        return None;
-    };
+    let usage = account.cached_usage.as_ref()?;
     if usage.is_out_of_quota(now) {
         return Some("quota exhausted");
     }
@@ -489,10 +495,10 @@ fn run_auto_start_usage_windows_for_env(env: AppEnv) -> Result<()> {
     Ok(())
 }
 
-fn auto_start_status_output(enabled: bool) -> AutoStartUsageWindowsStatusOutput {
+fn auto_start_status_output(enabled: bool, poll_seconds: u64) -> AutoStartUsageWindowsStatusOutput {
     AutoStartUsageWindowsStatusOutput {
         enabled,
-        poll_seconds: DEFAULT_AUTO_SWITCH_POLL_SECONDS,
+        poll_seconds,
     }
 }
 
@@ -555,8 +561,12 @@ fn install_macos_menubar_binary(home_dir: &Path, exe: &Path) -> Result<PathBuf> 
         .zip(fs::read(&installed).ok())
         .is_none_or(|(source, existing)| source != existing);
     if needs_copy {
-        fs::copy(exe, &installed)
-            .with_context(|| format!("failed to install menubar binary to {}", installed.display()))?;
+        fs::copy(exe, &installed).with_context(|| {
+            format!(
+                "failed to install menubar binary to {}",
+                installed.display()
+            )
+        })?;
         let mut permissions = fs::metadata(&installed)?.permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&installed, permissions)?;
@@ -1249,61 +1259,48 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn test_update_launch_at_startup_path_if_enabled() -> Result<()> {
-        use crate::model::EnvironmentKind;
+    fn launch_at_startup_files_are_written_without_loading_launch_agent() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let env = AppEnv {
-            kind: EnvironmentKind::Macos,
-            home_dir: temp.path().to_path_buf(),
-            codex_root: temp.path().join(".codex"),
-            app_data_dir: temp.path().join("app"),
-        };
-        std::fs::create_dir_all(&env.app_data_dir)?;
+        let home_dir = temp.path();
+        let exe = std::env::current_exe()?;
 
-        let repo = SnapshotRepository::new(
-            &env.app_data_dir,
-            crate::secrets::test_support::MemorySecretStore::default(),
+        let installed = install_macos_menubar_binary(home_dir, &exe)?;
+        let launcher_path = write_macos_launcher_script(home_dir, &exe)?;
+        let plist_path = write_macos_launch_agent_plist(home_dir, &installed)?;
+
+        assert_eq!(
+            launcher_path,
+            home_dir
+                .join(".local")
+                .join("bin")
+                .join("codex-account-switcher-launcher.sh")
         );
-        let app = App::new(env.clone(), repo);
-
-        // Initially disabled, should not create the plist
-        app.update_launch_at_startup_path_if_enabled()?;
-        let plist_path = env
-            .home_dir
-            .join("Library")
-            .join("LaunchAgents")
-            .join("com.anlvdt.codex-account-switcher.plist");
-        assert!(!plist_path.exists());
-
-        // Enable it
-        app.set_launch_at_startup(true)?;
-        assert!(plist_path.exists());
-        let launcher_path = env
-            .home_dir
-            .join(".local")
-            .join("bin")
-            .join("codex-account-switcher-launcher.sh");
-        assert!(launcher_path.exists());
+        assert_eq!(
+            installed,
+            home_dir
+                .join(".local")
+                .join("bin")
+                .join("codex-account-switcher-menubar")
+        );
+        assert_eq!(
+            plist_path,
+            home_dir
+                .join("Library")
+                .join("LaunchAgents")
+                .join("com.anlvdt.codex-account-switcher.plist")
+        );
         let launcher = fs::read_to_string(&launcher_path)?;
         assert!(launcher.contains("codex-account-switcher-menubar"));
-        let installed = env
-            .home_dir
-            .join(".local")
-            .join("bin")
-            .join("codex-account-switcher-menubar");
-        assert!(installed.exists());
         let plist = fs::read_to_string(&plist_path)?;
         assert!(plist.contains("codex-account-switcher-menubar"));
         assert!(!plist.contains("codex-account-switcher-launcher.sh"));
-
-        // Remove file to test update recreation
-        std::fs::remove_file(&plist_path)?;
-        std::fs::remove_file(&launcher_path)?;
-        assert!(!plist_path.exists());
-
-        app.update_launch_at_startup_path_if_enabled()?;
-        assert!(plist_path.exists());
-        assert!(launcher_path.exists());
+        assert!(
+            home_dir
+                .join(".local")
+                .join("bin")
+                .join("codex-account-switcher-menubar")
+                .exists()
+        );
 
         Ok(())
     }

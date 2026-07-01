@@ -359,6 +359,22 @@ impl AccountUsageView {
             })
     }
 
+    /// True when every active quota window is depleted. An account with an exhausted
+    /// 5-hour window can still be switchable when weekly quota remains.
+    pub fn is_fully_exhausted(&self, now: OffsetDateTime) -> bool {
+        let active_windows: Vec<_> = [self.five_hour.as_ref(), self.weekly.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|window| window.reset_at > now)
+            .collect();
+        if !active_windows.is_empty() {
+            return active_windows
+                .iter()
+                .all(|window| window.remaining_percent == 0);
+        }
+        self.is_out_of_quota(now)
+    }
+
     /// Whether auto-switch should leave this account (exhausted or proactively near limit).
     pub fn should_switch_account(&self, now: OffsetDateTime, near_limit_threshold: u8) -> bool {
         self.is_out_of_quota(now) || self.is_near_limit(now, near_limit_threshold)
@@ -429,6 +445,33 @@ mod usage_tests {
         let reset = now + time::Duration::hours(1);
         let usage = usage_view(Some(window(0, reset)), None, None);
         assert!(usage.is_out_of_quota(now));
+    }
+
+    #[test]
+    fn is_not_fully_exhausted_when_weekly_quota_remains() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let five_hour_reset = now + time::Duration::hours(1);
+        let weekly_reset = now + time::Duration::days(7);
+        let usage = usage_view(
+            Some(window(0, five_hour_reset)),
+            Some(window(84, weekly_reset)),
+            None,
+        );
+        assert!(usage.is_out_of_quota(now));
+        assert!(!usage.is_fully_exhausted(now));
+    }
+
+    #[test]
+    fn is_fully_exhausted_when_all_active_windows_are_depleted() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let five_hour_reset = now + time::Duration::hours(1);
+        let weekly_reset = now + time::Duration::days(7);
+        let usage = usage_view(
+            Some(window(0, five_hour_reset)),
+            Some(window(0, weekly_reset)),
+            None,
+        );
+        assert!(usage.is_fully_exhausted(now));
     }
 
     #[test]

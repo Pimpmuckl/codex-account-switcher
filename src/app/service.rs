@@ -15,7 +15,9 @@ use crate::model::{
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::SecretStore;
-use crate::usage::{fetch_usage, usage_error_message, usage_target_from_snapshot};
+use crate::usage::{
+    fetch_usage, usage_error_message, usage_error_requires_login, usage_target_from_snapshot,
+};
 
 use super::{
     App, account_view, match_saved_account, saved_identity, should_verify_activation_stability,
@@ -126,7 +128,7 @@ where
             .get_or_init(|| Mutex::new(()))
             .lock()
             .map_err(|_| anyhow::anyhow!("account switch lock poisoned"))?;
-        let warnings = crate::process::detect_running_codex_processes();
+        let warnings = crate::process::detect_switch_blocking_codex_processes();
         self.refresh_current_saved_account_before_activation();
         let (snapshot, snapshot_identity, restore_identity) =
             self.load_activation_target(account_id)?;
@@ -189,7 +191,7 @@ where
     }
 
     pub fn activation_preflight_warnings(&self) -> Vec<RunningCodexProcess> {
-        crate::process::detect_running_codex_processes()
+        crate::process::detect_switch_blocking_codex_processes()
     }
 
     pub fn refresh_saved_usage_cache(&self) -> Result<()> {
@@ -222,6 +224,7 @@ where
         match account_id {
             Some(account_id) => {
                 let (snapshot, _, _) = self.load_activation_target(account_id)?;
+                let original_snapshot = snapshot.clone();
                 let target = usage_target_from_snapshot(
                     self.env.kind.clone(),
                     snapshot,
@@ -239,6 +242,16 @@ where
                         return Err(error);
                     }
                 };
+                if refreshed_snapshot != original_snapshot {
+                    self.restore_refreshed_live_auth_if_still_current(
+                        &original_snapshot,
+                        &refreshed_snapshot,
+                        &output.account,
+                    )
+                    .context(
+                        "refreshed saved auth but failed to update matching live auth files",
+                    )?;
+                }
                 self.repository.replace_snapshot(
                     &self.env.kind,
                     account_id,
@@ -248,46 +261,79 @@ where
                 )?;
                 Ok(output)
             }
-            None => {
-                let live = codex::read_live_auth_bundle(&self.env).with_context(|| {
-                    format!(
-                        "no live Codex auth bundle found at {}",
-                        self.env.codex_root.display()
-                    )
-                })?;
-                let live_identity = live.identity.clone();
-                let live_snapshot = live.snapshot.clone();
-                let target = usage_target_from_snapshot(
-                    self.env.kind.clone(),
-                    live.snapshot,
-                    UsageSource::LiveAccessToken,
-                    true,
-                )?;
-                let (output, refreshed_snapshot) = match fetch_usage(target) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        self.record_usage_error_for_identity(&live_identity, &error);
-                        return Err(error);
-                    }
-                };
-                if refreshed_snapshot != live_snapshot
-                    && live_bundle_still_matches_snapshot(&self.env, &live_snapshot)
-                {
-                    codex::restore_snapshot(&self.env, &refreshed_snapshot, &output.account, false)
-                        .context("refreshed live auth but failed to update local auth files")?;
-                }
-                if let Some(account_id) = self.saved_account_id_for_identity(&live_identity) {
-                    self.repository.replace_snapshot(
-                        &self.env.kind,
-                        account_id,
-                        &output.account,
-                        &refreshed_snapshot,
-                        Some(output.usage.clone()),
-                    )?;
-                }
-                Ok(output)
-            }
+            None => self.usage_live(true),
         }
+    }
+
+    fn usage_live(&self, retry_if_live_changed: bool) -> Result<UsageOutput> {
+        let live = codex::read_live_auth_bundle(&self.env).with_context(|| {
+            format!(
+                "no live Codex auth bundle found at {}",
+                self.env.codex_root.display()
+            )
+        })?;
+        let live_identity = live.identity.clone();
+        let live_snapshot = live.snapshot.clone();
+        let target = usage_target_from_snapshot(
+            self.env.kind.clone(),
+            live.snapshot,
+            UsageSource::LiveAccessToken,
+            true,
+        )?;
+        let (output, refreshed_snapshot) = match fetch_usage(target) {
+            Ok(result) => result,
+            Err(error) => {
+                if retry_if_live_changed
+                    && usage_error_requires_login(&format!("{error:#}"))
+                    && self.live_snapshot_changed_since(&live_snapshot)
+                {
+                    return self.usage_live(false);
+                }
+                self.record_usage_error_for_identity(&live_identity, &error);
+                return Err(error);
+            }
+        };
+        if refreshed_snapshot != live_snapshot {
+            self.restore_refreshed_live_auth_if_still_current(
+                &live_snapshot,
+                &refreshed_snapshot,
+                &output.account,
+            )
+            .context("refreshed live auth but failed to update local auth files")?;
+        }
+        if let Some(account_id) = self.saved_account_id_for_identity(&live_identity) {
+            self.repository.replace_snapshot(
+                &self.env.kind,
+                account_id,
+                &output.account,
+                &refreshed_snapshot,
+                Some(output.usage.clone()),
+            )?;
+        }
+        Ok(output)
+    }
+
+    fn restore_refreshed_live_auth_if_still_current(
+        &self,
+        previous_snapshot: &SnapshotBlob,
+        refreshed_snapshot: &SnapshotBlob,
+        identity: &DisplayIdentity,
+    ) -> Result<()> {
+        let lock = codex::acquire_auth_write_lock(&self.env)?;
+        if codex::live_bundle_matches_snapshot(&self.env, previous_snapshot)? {
+            codex::restore_snapshot_with_lock(
+                &lock,
+                &self.env,
+                refreshed_snapshot,
+                identity,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn live_snapshot_changed_since(&self, snapshot: &SnapshotBlob) -> bool {
+        !live_bundle_still_matches_snapshot(&self.env, snapshot)
     }
 
     fn saved_account_id_for_identity(&self, identity: &DisplayIdentity) -> Option<Uuid> {
@@ -409,10 +455,10 @@ where
     }
 
     pub fn login_and_save(&self) -> Result<SaveOutput> {
-        let status = std::process::Command::new("codex")
+        let status = std::process::Command::new(crate::process::codex_cli_path())
             .arg("login")
             .status()
-            .context("failed to run `codex login`; make sure `codex` is on PATH")?;
+            .context("failed to run `codex login`; make sure Codex is installed")?;
         if !status.success() {
             anyhow::bail!("`codex login` failed with {status}");
         }
@@ -460,16 +506,24 @@ where
         if command.is_empty() {
             anyhow::bail!("no command specified to execute");
         }
+        let auth_lock = codex::acquire_auth_write_lock(&self.env)?;
         let original_bundle = codex::try_read_live_auth_bundle(&self.env)?;
         let _guard = ActiveSnapshotGuard {
             env: &self.env,
             original_bundle,
             active_now: true,
+            auth_lock,
         };
         let (snapshot, _snapshot_identity, restore_identity) =
             self.load_activation_target(account_id)?;
-        codex::restore_snapshot(&self.env, &snapshot, &restore_identity, false)
-            .context("failed to temporarily restore target account snapshot")?;
+        codex::restore_snapshot_with_lock(
+            &_guard.auth_lock,
+            &self.env,
+            &snapshot,
+            &restore_identity,
+            false,
+        )
+        .context("failed to temporarily restore target account snapshot")?;
 
         let mut child = std::process::Command::new(&command[0])
             .args(&command[1..])
@@ -484,13 +538,15 @@ struct ActiveSnapshotGuard<'a> {
     env: &'a AppEnv,
     original_bundle: Option<crate::codex::LiveAuthBundle>,
     active_now: bool,
+    auth_lock: crate::codex::AuthWriteLock,
 }
 
 impl<'a> Drop for ActiveSnapshotGuard<'a> {
     fn drop(&mut self) {
         if self.active_now {
             if let Some(original) = &self.original_bundle {
-                let _ = crate::codex::restore_snapshot(
+                let _ = crate::codex::restore_snapshot_with_lock(
+                    &self.auth_lock,
                     self.env,
                     &original.snapshot,
                     &original.identity,
@@ -531,6 +587,17 @@ mod tests {
         AccountUsageView, DisplayIdentity, EnvironmentKind, UsageSource, UsageWindowView,
     };
     use crate::secrets::test_support::MemorySecretStore;
+    use crate::usage::with_test_http_endpoints;
+    use crate::usage_http::{MockEndpoint, MockHttpServer, with_mock_http_test_lock};
+
+    fn fixture_id_token(email: &str, subject: &str, plan: Option<&str>) -> String {
+        let auth: serde_json::Value =
+            serde_json::from_str(&auth_json_fixture(email, subject, plan)).expect("auth fixture");
+        auth["tokens"]["id_token"]
+            .as_str()
+            .expect("id token")
+            .to_owned()
+    }
 
     #[test]
     fn list_marks_active_account() {
@@ -733,6 +800,81 @@ mod tests {
             output.accounts[0].usage_error.as_deref(),
             Some("Usage unavailable: failed to query Codex usage")
         );
+    }
+
+    #[test]
+    fn saved_usage_refresh_updates_matching_live_auth() {
+        let temp = tempdir().expect("tempdir");
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+        std::fs::create_dir_all(&env.codex_root).expect("codex root");
+        std::fs::write(
+            env.codex_root.join("auth.json"),
+            auth_json_fixture("active@example.com", "sub-1", Some("pro")),
+        )
+        .expect("auth");
+        std::fs::write(env.codex_root.join("cap_sid"), "sid-active").expect("cap");
+        let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
+        let app = App::new(env.clone(), repo);
+        let saved = app.save_current().expect("save current");
+
+        let server = MockHttpServer::bind();
+        server.enqueue(
+            MockEndpoint::Refresh,
+            200,
+            serde_json::json!({
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "id_token": fixture_id_token("active@example.com", "sub-1", Some("pro")),
+            })
+            .to_string(),
+        );
+        server.enqueue(
+            MockEndpoint::Usage,
+            200,
+            r#"{
+                "email": "active@example.com",
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": { "used_percent": 20, "reset_at": 1700000000 },
+                    "secondary_window": { "used_percent": 30, "reset_at": 1700100000 }
+                }
+            }"#,
+        );
+
+        with_mock_http_test_lock(|| {
+            with_test_http_endpoints(&server.usage_url(), &server.refresh_url(), || {
+                app.usage(Some(saved.account.id))
+                    .expect("saved usage refresh");
+            });
+        });
+
+        let live_auth =
+            std::fs::read_to_string(env.codex_root.join("auth.json")).expect("live auth");
+        assert!(live_auth.contains("access-new"));
+        assert!(live_auth.contains("refresh-new"));
+
+        let (_, saved_snapshot) = app
+            .repository
+            .load_snapshot(&env.kind, saved.account.id)
+            .expect("saved snapshot");
+        let saved_auth = saved_snapshot
+            .files
+            .iter()
+            .find(|file| file.name == "auth.json")
+            .expect("saved auth");
+        let saved_auth_json = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(&saved_auth.bytes_base64)
+                .expect("decode saved auth"),
+        )
+        .expect("saved auth utf8");
+        assert!(saved_auth_json.contains("access-new"));
+        assert!(saved_auth_json.contains("refresh-new"));
     }
 
     #[test]
