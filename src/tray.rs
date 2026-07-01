@@ -272,7 +272,7 @@ where
                     let force = was_running && policy == SwitchWhenRunning::SwitchNow;
                     let output = app.activate_with_running_policy(account_id, force)?;
                     crate::process::launch_codex_app();
-                    let email = output.account.email;
+                    let account_name = account_display_name(&output.account);
                     let plan = format_plan_label_simple(output.account.plan_label.as_deref());
                     let detail = if was_running && policy == SwitchWhenRunning::WaitAndSwitch {
                         " Codex restarted after tasks finished."
@@ -281,7 +281,7 @@ where
                     };
                     Ok(Some((
                         "Codex Switcher".to_owned(),
-                        format!("Switched to account {email} ({plan}).{detail}"),
+                        format!("Switched to {account_name} ({plan}).{detail}"),
                     )))
                 });
             }
@@ -291,22 +291,27 @@ where
                 spawn_tray_background(proxy, move || {
                     let app = tray_app_for_env(&env);
                     crate::process::quit_running_codex_app();
-                    app.activate_with_running_policy(account_id, false)?;
+                    let output = app.start_login_for_saved_account(account_id)?;
                     crate::process::launch_codex_app();
+                    let account_name = account_display_name(&output.account);
                     Ok(Some((
                         "Codex Switcher".to_owned(),
-                        "Log in to Codex with this account, then choose Save Current Account."
-                            .to_owned(),
+                        format!(
+                            "Login screen opened for {account_name}. After login, choose Save Current Workspace."
+                        ),
                     )))
                 });
             }
             Some(TrayCommand::SaveCurrent) => {
                 let msg = match self.app.save_current() {
                     Ok(output) => {
-                        format!("Saved account {} successfully.", output.account.email)
+                        format!(
+                            "Saved workspace {} successfully.",
+                            account_display_name(&output.account)
+                        )
                     }
                     Err(error) => {
-                        format!("Failed to save account: {error:#}")
+                        format!("Failed to save workspace: {error:#}")
                     }
                 };
                 tray_notify("Codex Switcher", &msg);
@@ -323,7 +328,7 @@ where
                             crate::process::launch_codex_app();
                             Ok(Some((
                                 "Codex Switcher".to_owned(),
-                                "Log in to Codex with the new account, then choose Finish Adding Account."
+                                "Step 1: log in to Codex with the new account or workspace. Step 2: return here and choose Finish Adding Workspace."
                                     .to_owned(),
                             )))
                         });
@@ -350,11 +355,14 @@ where
                             if let Err(error) = codex::restore_add_account_backup(app.env()) {
                                 format!(
                                     "Saved {} but failed to restore original login: {error:#}",
-                                    output.account.email
+                                    account_display_name(&output.account)
                                 )
                             } else {
                                 crate::process::launch_codex_app();
-                                format!("Added account {} successfully.", output.account.email)
+                                format!(
+                                    "Added workspace {} successfully.",
+                                    account_display_name(&output.account)
+                                )
                             }
                         }
                         Err(error) => format!("Failed to finish adding account: {error:#}"),
@@ -399,20 +407,17 @@ where
                     }
                     let msg = match app.pick_best_account(true, true) {
                         Ok(output) => {
+                            let account_name = account_display_name(&output.account);
                             if output.switched {
                                 if was_running && policy == SwitchWhenRunning::WaitAndSwitch {
                                     format!(
-                                        "Switched to best quota account {} after Codex finished.",
-                                        output.account.email
+                                        "Switched to best available quota: {account_name} after Codex finished."
                                     )
                                 } else {
-                                    format!(
-                                        "Switched to best quota account {}.",
-                                        output.account.email
-                                    )
+                                    format!("Switched to best available quota: {account_name}.")
                                 }
                             } else {
-                                format!("Already on best quota account {}.", output.account.email)
+                                format!("Already on best available quota: {account_name}.")
                             }
                         }
                         Err(error) => format!("Pick best quota failed: {error:#}"),
@@ -423,13 +428,13 @@ where
                     Ok(Some(("Codex Switcher".to_owned(), msg)))
                 });
             }
-            Some(TrayCommand::Delete(account_id, email)) => {
+            Some(TrayCommand::Delete(account_id, account_name)) => {
                 let confirmed = {
                     #[cfg(target_os = "macos")]
                     {
                         let script = format!(
                             "tell application \"System Events\" to display dialog \"Are you sure you want to delete {}?\" buttons {{\"Cancel\", \"Delete\"}} default button \"Cancel\" with icon caution",
-                            email.replace('"', "\\\"")
+                            account_name.replace('"', "\\\"")
                         );
                         let output = std::process::Command::new("osascript")
                             .args(["-e", &script])
@@ -445,7 +450,7 @@ where
                     {
                         let script = format!(
                             "Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show('Are you sure you want to delete {}?', 'Confirm Delete', 'YesNo') -eq 'Yes'",
-                            email
+                            account_name
                         );
                         let output = std::process::Command::new("powershell")
                             .args(["-Command", &script])
@@ -466,7 +471,7 @@ where
                 if confirmed {
                     match self.app.delete(account_id) {
                         Ok(_) => {
-                            let msg = format!("Deleted account {} successfully.", email);
+                            let msg = format!("Deleted workspace {} successfully.", account_name);
                             #[cfg(target_os = "macos")]
                             {
                                 let _ = std::process::Command::new("osascript")
@@ -655,7 +660,7 @@ where
             &list.accounts,
         );
         let active_account_id = active_account.map(|account| account.id);
-        let saved_accounts = tray_saved_accounts(&list.accounts, active_account_id);
+        let saved_accounts = tray_saved_accounts(&list.accounts);
 
         menu.append(&MenuItem::new("Active Account", false, None))?;
         if let Some(current) = &status.current_account {
@@ -709,19 +714,19 @@ where
             self.append_command(
                 &menu,
                 "save-current",
-                "  Save Current Account",
+                "  Save Current Workspace",
                 TrayCommand::SaveCurrent,
             )?;
             self.append_command(
                 &menu,
                 "add-account",
-                "  Add New Account…",
+                "  Add Account / Workspace…",
                 TrayCommand::StartAddAccount,
             )?;
             self.append_command(
                 &menu,
                 "pick-best-quota",
-                "  Switch to Best Quota",
+                "  Switch to Best Available Quota…",
                 TrayCommand::PickBestQuota,
             )?;
         } else {
@@ -735,19 +740,19 @@ where
         } else {
             for account in &saved_accounts {
                 let id = format!("activate:{}", account.id);
-                // Line 1: Full Email (clickable)
-                let item = MenuItem::with_id(
-                    MenuId::new(&id),
-                    format!(
-                        "  {}  —  {}",
-                        account_display_name(account),
-                        account_status_label_simple(account)
-                    ),
-                    true,
-                    None,
+                let is_active = Some(account.id) == active_account_id || account.is_active;
+                let label = format!(
+                    "  {}  —  {}",
+                    account_display_name(account),
+                    account_status_label_simple(account)
                 );
-                menu.append(&item)?;
-                self.commands.insert(id, TrayCommand::Activate(account.id));
+                if is_active {
+                    menu.append(&MenuItem::new(label, false, None))?;
+                } else {
+                    let item = MenuItem::with_id(MenuId::new(&id), label, true, None);
+                    menu.append(&item)?;
+                    self.commands.insert(id, TrayCommand::Activate(account.id));
+                }
 
                 // Line 2: Details (non-clickable unless needs login)
                 let plan = format_plan_label_simple(account.plan_label.as_deref());
@@ -778,45 +783,46 @@ where
             let delete_submenu = Submenu::new("  Delete Account", true);
             for account in &saved_accounts {
                 let delete_id = format!("delete:{}", account.id);
+                let account_name = account_display_name(account);
                 delete_submenu.append(&MenuItem::with_id(
                     MenuId::new(&delete_id),
-                    account_display_name(account),
+                    account_name.clone(),
                     true,
                     None,
                 ))?;
-                self.commands.insert(
-                    delete_id,
-                    TrayCommand::Delete(account.id, account.email.clone()),
-                );
+                self.commands
+                    .insert(delete_id, TrayCommand::Delete(account.id, account_name));
             }
             menu.append(&delete_submenu)?;
         }
 
         menu.append(&PredefinedMenuItem::separator())?;
+        let automation_submenu = Submenu::new("Automation", true);
         let auto_start_enabled = self.app.auto_start_usage_windows_status()?.enabled;
-        self.append_check_command(
-            &menu,
+        self.append_check_submenu_command(
+            &automation_submenu,
             "toggle-auto-start-usage-windows",
             AUTO_REFRESH_QUOTA_ON_RESET_LABEL,
             auto_start_enabled,
             TrayCommand::SetAutoStartUsageWindows(!auto_start_enabled),
         )?;
         let auto_switch_enabled = self.app.auto_switch_on_limit_status()?.enabled;
-        self.append_check_command(
-            &menu,
+        self.append_check_submenu_command(
+            &automation_submenu,
             "toggle-auto-switch-on-limit",
-            "Auto-switch on limit",
+            "Auto-switch when exhausted",
             auto_switch_enabled,
             TrayCommand::SetAutoSwitchOnLimit(!auto_switch_enabled),
         )?;
         let launch_at_startup_enabled = self.app.launch_at_startup_status()?.enabled;
-        self.append_check_command(
-            &menu,
+        self.append_check_submenu_command(
+            &automation_submenu,
             "toggle-launch-at-startup",
             "Launch at Login",
             launch_at_startup_enabled,
             TrayCommand::SetLaunchAtStartup(!launch_at_startup_enabled),
         )?;
+        menu.append(&automation_submenu)?;
         self.append_command(&menu, "show-tui", "Show TUI", TrayCommand::ShowTui)?;
         self.append_command(&menu, "refresh", "Refresh", TrayCommand::Refresh)?;
         self.append_command(&menu, "quit", "Quit", TrayCommand::Quit)?;
@@ -827,13 +833,15 @@ where
         let menu = Menu::new();
         self.commands.clear();
 
-        menu.append(&MenuItem::new("Adding New Account", false, None))?;
-        menu.append(&MenuItem::new("  Waiting for Codex login…", false, None))?;
+        menu.append(&MenuItem::new("Adding Account / Workspace", false, None))?;
+        menu.append(&MenuItem::new("  1. Log in with Codex", false, None))?;
+        menu.append(&MenuItem::new("  2. Return to this menu", false, None))?;
+        menu.append(&MenuItem::new("  3. Finish adding workspace", false, None))?;
         menu.append(&PredefinedMenuItem::separator())?;
         self.append_command(
             &menu,
             "finish-add-account",
-            "  Finish Adding Account",
+            "  Finish Adding Workspace",
             TrayCommand::FinishAddAccount,
         )?;
         self.append_command(
@@ -860,9 +868,9 @@ where
         Ok(())
     }
 
-    fn append_check_command(
+    fn append_check_submenu_command(
         &mut self,
-        menu: &Menu,
+        menu: &Submenu,
         id: &str,
         label: &str,
         checked: bool,
@@ -898,14 +906,8 @@ where
     }
 }
 
-fn tray_saved_accounts(
-    accounts: &[AccountView],
-    active_account_id: Option<Uuid>,
-) -> Vec<&AccountView> {
-    accounts
-        .iter()
-        .filter(|account| Some(account.id) != active_account_id)
-        .collect()
+fn tray_saved_accounts(accounts: &[AccountView]) -> Vec<&AccountView> {
+    accounts.iter().collect()
 }
 
 fn find_active_tray_account<'a>(
@@ -996,27 +998,28 @@ fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
 }
 
 fn account_status_label_simple(account: &AccountView) -> String {
+    let prefix = if account.is_active { "Active / " } else { "" };
     if account
         .usage_error
         .as_deref()
         .is_some_and(usage_error_requires_login)
     {
-        return "Login required".to_owned();
+        return format!("{prefix}Login required");
     }
     if let Some(usage) = &account.usage {
         let now = OffsetDateTime::now_utc();
         if usage.is_out_of_quota(now) {
-            return "Quota depleted".to_owned();
+            return format!("{prefix}Quota depleted");
         }
         if usage.is_near_limit(now, 10) {
-            return "Low quota".to_owned();
+            return format!("{prefix}Low quota");
         }
-        return "Ready".to_owned();
+        return format!("{prefix}Ready");
     }
     if account.usage_error.is_some() {
-        "Usage stale".to_owned()
+        format!("{prefix}Usage stale")
     } else {
-        "No usage".to_owned()
+        format!("{prefix}No usage")
     }
 }
 
@@ -1487,11 +1490,40 @@ mod tests {
         };
         let accounts = vec![active, inactive];
 
-        let saved_accounts = tray_saved_accounts(&accounts, None);
+        let saved_accounts = tray_saved_accounts(&accounts);
 
         assert_eq!(saved_accounts.len(), 2);
         assert_eq!(saved_accounts[0].email, "active@example.com");
         assert_eq!(saved_accounts[1].email, "inactive@example.com");
+    }
+
+    #[test]
+    fn tray_status_label_marks_active_account() {
+        let account = AccountView {
+            id: Uuid::new_v4(),
+            email: "active@example.com".to_owned(),
+            subject: Some("sub".to_owned()),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
+            environment: EnvironmentKind::Windows,
+            is_active: true,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: None,
+                weekly: None,
+                credits: None,
+            }),
+            usage_error: None,
+            label: None,
+        };
+
+        assert_eq!(account_status_label_simple(&account), "Active / Ready");
     }
 
     #[test]

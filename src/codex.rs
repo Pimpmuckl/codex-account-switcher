@@ -231,6 +231,16 @@ pub fn validate_import_snapshot(snapshot: &SnapshotBlob) -> Result<()> {
     ensure_snapshot_complete(snapshot)
 }
 
+pub fn clear_live_auth_for_login(env: &AppEnv) -> Result<()> {
+    let _lock = acquire_auth_write_lock(env)?;
+    fs::create_dir_all(&env.codex_root)
+        .with_context(|| format!("failed to create {}", env.codex_root.display()))?;
+    for file_name in AUTH_FILES {
+        remove_live_file_if_exists(&env.codex_root.join(file_name))?;
+    }
+    Ok(())
+}
+
 fn stage_and_restore(codex_root: &Path, temp_dir: &Path, snapshot: &SnapshotBlob) -> Result<()> {
     for file in &snapshot.files {
         let decoded = STANDARD
@@ -796,6 +806,30 @@ mod tests {
         assert!(!add_account_session_active(&env));
         let restored = read_live_auth_bundle(&env)?;
         assert_eq!(restored.identity.email, "person@example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn clear_live_auth_for_login_removes_managed_auth_files() -> Result<()> {
+        let temp = tempdir()?;
+        let codex_root = temp.path().join(".codex");
+        fs::create_dir_all(&codex_root)?;
+        fs::write(
+            codex_root.join("auth.json"),
+            auth_json_fixture("person@example.com", "sub-1", Some("pro")),
+        )?;
+        fs::write(codex_root.join("cap_sid"), "sid-1")?;
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: codex_root.clone(),
+            app_data_dir: temp.path().join("data"),
+        };
+
+        clear_live_auth_for_login(&env)?;
+
+        assert!(!codex_root.join("auth.json").exists());
+        assert!(!codex_root.join("cap_sid").exists());
         Ok(())
     }
 }

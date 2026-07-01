@@ -114,6 +114,13 @@ where
         self.activate_with_running_policy(account_id, false)
     }
 
+    pub fn start_login_for_saved_account(&self, account_id: Uuid) -> Result<ActivateOutput> {
+        let output = self.activate_with_running_policy(account_id, false)?;
+        codex::clear_live_auth_for_login(&self.env)
+            .context("failed to clear live Codex auth before login")?;
+        Ok(output)
+    }
+
     pub fn validate_activation_target(&self, account_id: Uuid) -> Result<()> {
         let _ = self.load_activation_target(account_id)?;
         Ok(())
@@ -1213,5 +1220,62 @@ mod tests {
         // Verify the original account is restored
         let live = crate::codex::read_live_auth_bundle(&env).expect("live bundle");
         assert_eq!(live.identity.email, "original@example.com");
+    }
+
+    #[test]
+    fn start_login_for_saved_account_clears_live_auth_after_targeting_account() {
+        let temp = tempdir().expect("tempdir");
+        let env = AppEnv {
+            kind: EnvironmentKind::Linux,
+            home_dir: temp.path().to_path_buf(),
+            codex_root: temp.path().join(".codex"),
+            app_data_dir: temp.path().join("app"),
+        };
+
+        let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
+        let saved = repo
+            .save_snapshot(
+                &env.kind,
+                &DisplayIdentity {
+                    email: "expired@example.com".to_owned(),
+                    subject: Some("sub-expired".to_owned()),
+                    name: Some("Expired".to_owned()),
+                    plan_label: Some("Pro".to_owned()),
+                    workspace_id: None,
+                    workspace_name: None,
+                },
+                &SnapshotBlob {
+                    schema_version: 1,
+                    files: vec![
+                        SnapshotFile {
+                            name: "auth.json".to_owned(),
+                            bytes_base64: base64::engine::general_purpose::STANDARD.encode(
+                                auth_json_fixture(
+                                    "expired@example.com",
+                                    "sub-expired",
+                                    Some("pro"),
+                                ),
+                            ),
+                        },
+                        SnapshotFile {
+                            name: "cap_sid".to_owned(),
+                            bytes_base64: base64::engine::general_purpose::STANDARD
+                                .encode("sid-expired"),
+                        },
+                    ],
+                },
+            )
+            .expect("save")
+            .0;
+
+        let app = App::new(env.clone(), repo);
+
+        let output = app
+            .start_login_for_saved_account(saved.id)
+            .expect("start login");
+
+        assert_eq!(output.account.email, "expired@example.com");
+        assert!(!env.codex_root.join("auth.json").exists());
+        assert!(!env.codex_root.join("cap_sid").exists());
     }
 }
