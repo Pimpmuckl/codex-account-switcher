@@ -409,10 +409,8 @@ fn account_usage_labels(account: &AccountView) -> (String, String) {
         .as_deref()
         .is_some_and(usage_error_requires_login)
     {
-        (
-            usage_error_label(account.usage_error.as_deref().unwrap_or_default()).to_owned(),
-            String::new(),
-        )
+        let label = usage_error_label(account.usage_error.as_deref().unwrap_or_default());
+        (format!("Weekly Remaining: {label}"), String::new())
     } else if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
@@ -620,9 +618,9 @@ mod tests {
 
         let label = tray_account_label(&account, tray_label_widths(&[&account]));
 
+        assert!(label.contains("Weekly Remaining: Login required"));
         assert!(label.contains("Login required"));
         assert!(!label.contains("Usage unavailable"));
-        assert!(!label.contains("Weekly Remaining"));
     }
 
     #[test]
@@ -669,17 +667,21 @@ mod tests {
         login_required.usage_error = Some("Login required: Codex auth expired.".to_owned());
 
         let widths = tray_label_widths(&[&normal, &passed, &login_required]);
-        let details = [&normal, &passed, &login_required]
-            .map(|account| tray_account_label(account, widths))
-            .map(|label| {
-                label
-                    .split_once(tray_detail_separator())
-                    .map(|(_, details)| visible_width(details))
-                    .unwrap()
-            });
+        let labels =
+            [&normal, &passed, &login_required].map(|account| tray_account_label(account, widths));
+        let details = labels.each_ref().map(|label| {
+            label
+                .split_once(tray_detail_separator())
+                .map(|(_, details)| details)
+                .unwrap()
+        });
+        let passed_status_column = details[1].find("passed").unwrap();
+        let login_status_column = details[2].find("Login required").unwrap();
+        let detail_widths = details.map(visible_width);
 
-        assert_eq!(details[0], details[1]);
-        assert_eq!(details[0], details[2]);
+        assert_eq!(passed_status_column, login_status_column);
+        assert_eq!(detail_widths[0], detail_widths[1]);
+        assert_eq!(detail_widths[0], detail_widths[2]);
     }
 
     #[test]
