@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.9 - 2026-07-08
+
+### Fixed
+
+- Render the persistent TUI from cached usage data instead of blocking startup on saved-account usage refreshes.
+- Refresh saved usage metadata in the background and skip auto-start checks for active cached weekly windows that cannot need a ping yet.
+- Guard background usage refresh writes so stale refresh results cannot overwrite a newer account switch.
+
 ## v0.1.8 - 2026-07-08
 
 ### Fixed
