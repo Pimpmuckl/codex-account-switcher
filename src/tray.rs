@@ -294,8 +294,8 @@ fn active_account_label(
 ) -> String {
     let plan = format_plan_label(account.plan_label.as_deref(), widths);
     let (remaining, reset) = saved_account.map(account_usage_labels).unwrap_or_default();
-    let remaining = format!("{:<width$}", remaining, width = widths.remaining);
-    let reset = format!("{:<width$}", reset, width = widths.reset);
+    let remaining = pad_tray_label(remaining, widths.remaining);
+    let reset = pad_tray_label(reset, widths.reset);
     let saved_marker = saved_account.is_none().then_some("[not saved]");
     tray_row_label(&account.email, [plan, remaining, reset], saved_marker)
 }
@@ -303,8 +303,8 @@ fn active_account_label(
 fn tray_account_label(account: &AccountView, widths: TrayLabelWidths) -> String {
     let plan = format_plan_label(account.plan_label.as_deref(), widths);
     let (remaining, reset) = account_usage_labels(account);
-    let remaining = format!("{:<width$}", remaining, width = widths.remaining);
-    let reset = format!("{:<width$}", reset, width = widths.reset);
+    let remaining = pad_tray_label(remaining, widths.remaining);
+    let reset = pad_tray_label(reset, widths.reset);
 
     tray_row_label(&account.email, [plan, remaining, reset], None)
 }
@@ -344,10 +344,11 @@ fn tray_row_label<const N: usize>(
     details: [String; N],
     marker: Option<&str>,
 ) -> String {
+    let has_details = details.iter().any(|part| tray_part_has_text(part)) || marker.is_some();
     let details = details
         .into_iter()
         .chain(marker.map(str::to_owned))
-        .filter(|part| !part.trim().is_empty())
+        .filter(|part| has_details && !part.is_empty())
         .collect::<Vec<_>>()
         .join("  ");
     if details.is_empty() {
@@ -366,11 +367,20 @@ fn tray_detail_separator() -> &'static str {
 }
 
 fn format_plan_label(plan: Option<&str>, widths: TrayLabelWidths) -> String {
-    format!(
-        "{:<width$}",
+    pad_tray_label(
         plan.map(|plan| format!("Plan: {plan}")).unwrap_or_default(),
-        width = widths.plan
+        widths.plan,
     )
+}
+
+fn pad_tray_label(text: String, width: usize) -> String {
+    let padding = width.saturating_sub(visible_width(&text));
+    format!("{text}{}", "\u{2007}".repeat(padding))
+}
+
+fn tray_part_has_text(text: &str) -> bool {
+    text.chars()
+        .any(|character| character != '\u{2007}' && !character.is_whitespace())
 }
 
 fn tray_label_widths(accounts: &[&AccountView]) -> TrayLabelWidths {
@@ -613,6 +623,63 @@ mod tests {
         assert!(label.contains("Login required"));
         assert!(!label.contains("Usage unavailable"));
         assert!(!label.contains("Weekly Remaining"));
+    }
+
+    #[test]
+    fn tray_account_label_keeps_status_rows_same_detail_width() {
+        let reset_at = OffsetDateTime::UNIX_EPOCH
+            .replace_date(Date::from_calendar_date(2099, Month::May, 12).unwrap())
+            .replace_time(Time::from_hms(13, 56, 0).unwrap());
+        let mut normal = AccountView {
+            id: Uuid::new_v4(),
+            email: "normal@example.com".to_owned(),
+            account_key: "normal".to_owned(),
+            name: None,
+            plan_label: Some("Pro".to_owned()),
+            is_active: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: None,
+            usage_error: None,
+        };
+        normal.usage = Some(AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: None,
+            weekly: Some(UsageWindowView {
+                used_percent: 50,
+                remaining_percent: 50,
+                reset_at,
+            }),
+            credits: None,
+        });
+        let mut passed = normal.clone();
+        passed.email = "passed@example.com".to_owned();
+        passed
+            .usage
+            .as_mut()
+            .unwrap()
+            .weekly
+            .as_mut()
+            .unwrap()
+            .reset_at = OffsetDateTime::UNIX_EPOCH;
+        let mut login_required = normal.clone();
+        login_required.email = "login@example.com".to_owned();
+        login_required.usage_error = Some("Login required: Codex auth expired.".to_owned());
+
+        let widths = tray_label_widths(&[&normal, &passed, &login_required]);
+        let details = [&normal, &passed, &login_required]
+            .map(|account| tray_account_label(account, widths))
+            .map(|label| {
+                label
+                    .split_once(tray_detail_separator())
+                    .map(|(_, details)| visible_width(details))
+                    .unwrap()
+            });
+
+        assert_eq!(details[0], details[1]);
+        assert_eq!(details[0], details[2]);
     }
 
     #[test]
