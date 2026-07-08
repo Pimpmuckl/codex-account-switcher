@@ -505,6 +505,13 @@ where
         })
     }
 
+    pub fn set_account_archived(&self, account_id: Uuid, archived: bool) -> Result<()> {
+        let _ = self
+            .repository
+            .set_account_archived(&self.env.kind, account_id, archived)?;
+        Ok(())
+    }
+
     pub fn exec_with_temporary_account(
         &self,
         account_id: Uuid,

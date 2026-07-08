@@ -143,6 +143,8 @@ pub struct SavedAccountMetadata {
     pub cached_usage_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(default)]
+    pub is_archived: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -173,6 +175,8 @@ pub struct AccountView {
     pub usage_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(default)]
+    pub is_archived: bool,
 }
 
 impl AccountView {

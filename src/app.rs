@@ -67,6 +67,7 @@ fn account_view(
         usage,
         usage_error,
         label: account.label,
+        is_archived: account.is_archived,
     }
 }
 

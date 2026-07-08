@@ -18,6 +18,10 @@ fn default_auto_switch_poll_seconds() -> u64 {
     DEFAULT_AUTO_SWITCH_POLL_SECONDS
 }
 
+fn default_show_quota_in_menu_bar() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppSettings {
     #[serde(default)]
@@ -32,6 +36,9 @@ pub struct AppSettings {
     /// How often to poll usage when auto-switch is enabled.
     #[serde(default = "default_auto_switch_poll_seconds")]
     pub auto_switch_poll_seconds: u64,
+    /// Show quota percentage/status directly in the menu bar / tray icon.
+    #[serde(default = "default_show_quota_in_menu_bar")]
+    pub show_quota_in_menu_bar: bool,
 }
 
 impl Default for AppSettings {
@@ -42,6 +49,7 @@ impl Default for AppSettings {
             launch_at_startup: false,
             near_limit_threshold_percent: DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT,
             auto_switch_poll_seconds: DEFAULT_AUTO_SWITCH_POLL_SECONDS,
+            show_quota_in_menu_bar: true,
         }
     }
 }
@@ -94,6 +102,7 @@ mod tests {
             settings.auto_switch_poll_seconds,
             DEFAULT_AUTO_SWITCH_POLL_SECONDS
         );
+        assert!(settings.show_quota_in_menu_bar);
     }
 
     #[test]
@@ -105,6 +114,7 @@ mod tests {
                 auto_start_usage_windows: true,
                 auto_switch_on_limit: true,
                 launch_at_startup: true,
+                show_quota_in_menu_bar: false,
                 ..AppSettings::default()
             },
         )
@@ -115,6 +125,7 @@ mod tests {
         assert!(settings.auto_start_usage_windows);
         assert!(settings.auto_switch_on_limit);
         assert!(settings.launch_at_startup);
+        assert!(!settings.show_quota_in_menu_bar);
     }
 
     #[test]
@@ -136,5 +147,6 @@ mod tests {
             settings.auto_switch_poll_seconds,
             DEFAULT_AUTO_SWITCH_POLL_SECONDS
         );
+        assert!(settings.show_quota_in_menu_bar);
     }
 }

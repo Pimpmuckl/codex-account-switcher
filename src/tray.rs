@@ -29,6 +29,22 @@ use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
 use crate::usage::usage_error_requires_login;
 
+trait AppendableMenu {
+    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), tray_icon::menu::Error>;
+}
+
+impl AppendableMenu for Menu {
+    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), tray_icon::menu::Error> {
+        self.append(item)
+    }
+}
+
+impl AppendableMenu for Submenu {
+    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), tray_icon::menu::Error> {
+        self.append(item)
+    }
+}
+
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
@@ -49,6 +65,7 @@ enum TrayCommand {
     CancelAddAccount,
     PickBestQuota,
     Delete(Uuid, String),
+    SetArchived(Uuid, bool),
     SetAutoStartUsageWindows(bool),
     SetAutoSwitchOnLimit(bool),
     SetLaunchAtStartup(bool),
@@ -492,6 +509,18 @@ where
                     let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
                 }
             }
+            Some(TrayCommand::SetArchived(account_id, archived)) => {
+                match self.app.set_account_archived(account_id, archived) {
+                    Ok(_) => {
+                        let verb = if archived { "Archived" } else { "Unarchived" };
+                        tray_notify("Codex Switcher", &format!("{verb} account successfully."));
+                    }
+                    Err(error) => {
+                        tray_notify("Codex Switcher", &format!("Failed to archive/unarchive: {error:#}"));
+                    }
+                }
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
+            }
             Some(TrayCommand::SetAutoStartUsageWindows(enabled)) => {
                 if let Err(error) = self.app.set_auto_start_usage_windows(enabled) {
                     eprintln!("failed to update auto-start usage windows from tray: {error:#}");
@@ -767,22 +796,39 @@ where
             let mut active_group = Vec::new();
             let mut depleted_group = Vec::new();
             let mut login_group = Vec::new();
+            let mut archived_group = Vec::new();
 
             for account in &saved_accounts {
-                let needs_login = account
-                    .usage_error
-                    .as_deref()
-                    .is_some_and(usage_error_requires_login);
-                if needs_login {
-                    login_group.push(*account);
-                } else if let Some(usage) = &account.usage
-                    && usage.is_out_of_quota(OffsetDateTime::now_utc())
-                {
-                    depleted_group.push(*account);
+                if account.is_archived {
+                    archived_group.push(*account);
                 } else {
-                    active_group.push(*account);
+                    let needs_login = account
+                        .usage_error
+                        .as_deref()
+                        .is_some_and(usage_error_requires_login);
+                    if needs_login {
+                        login_group.push(*account);
+                    } else if let Some(usage) = &account.usage
+                        && usage.is_out_of_quota(OffsetDateTime::now_utc())
+                    {
+                        depleted_group.push(*account);
+                    } else {
+                        active_group.push(*account);
+                    }
                 }
             }
+
+            // Sort depleted group by nearest reset time
+            depleted_group.sort_by(|a, b| {
+                let ta = get_nearest_reset_time(a);
+                let tb = get_nearest_reset_time(b);
+                match (ta, tb) {
+                    (Some(t1), Some(t2)) => t1.cmp(&t2),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
 
             let mut first_group = true;
 
@@ -818,23 +864,42 @@ where
                 }
             }
 
-            if !login_group.is_empty() {
+            if !login_group.is_empty() || !archived_group.is_empty() {
                 if !first_group {
                     menu.append(&PredefinedMenuItem::separator())?;
                 }
-                menu.append(&MenuItem::new(
-                    "⚠️ Login Required (Cần login lại)",
-                    true,
-                    None,
-                ))?;
-                for account in login_group {
-                    append_tray_account_item(
-                        &menu,
-                        account,
-                        active_account_id,
-                        &mut self.commands,
-                    )?;
+                let hidden_submenu = Submenu::new("📂 Show Hidden Accounts (Hiển thị tài khoản ẩn)", true);
+                let mut first_hidden_group = true;
+
+                if !login_group.is_empty() {
+                    hidden_submenu.append(&MenuItem::new("⚠️ Login Required (Cần login lại)", true, None))?;
+                    first_hidden_group = false;
+                    for account in login_group {
+                        append_tray_account_item(
+                            &hidden_submenu,
+                            account,
+                            active_account_id,
+                            &mut self.commands,
+                        )?;
+                    }
                 }
+
+                if !archived_group.is_empty() {
+                    if !first_hidden_group {
+                        hidden_submenu.append(&PredefinedMenuItem::separator())?;
+                    }
+                    hidden_submenu.append(&MenuItem::new("📁 Archived (Đã lưu trữ)", true, None))?;
+                    for account in archived_group {
+                        append_tray_account_item(
+                            &hidden_submenu,
+                            account,
+                            active_account_id,
+                            &mut self.commands,
+                        )?;
+                    }
+                }
+
+                menu.append(&hidden_submenu)?;
             }
         }
         menu.append(&PredefinedMenuItem::separator())?;
@@ -873,6 +938,50 @@ where
                     .insert(delete_id, TrayCommand::Delete(account.id, account_name));
             }
             menu.append(&delete_submenu)?;
+
+            // Archive Account Submenu
+            let archive_submenu = Submenu::new("Archive Account (Lưu trữ)", true);
+            let mut has_archivable = false;
+            for account in &saved_accounts {
+                if !account.is_archived {
+                    has_archivable = true;
+                    let archive_id = format!("archive:{}", account.id);
+                    let account_name = account_display_name(account);
+                    archive_submenu.append(&MenuItem::with_id(
+                        MenuId::new(&archive_id),
+                        account_name.clone(),
+                        true,
+                        None,
+                    ))?;
+                    self.commands
+                        .insert(archive_id, TrayCommand::SetArchived(account.id, true));
+                }
+            }
+            if has_archivable {
+                menu.append(&archive_submenu)?;
+            }
+
+            // Unarchive Account Submenu
+            let unarchive_submenu = Submenu::new("Unarchive Account (Hủy lưu trữ)", true);
+            let mut has_unarchivable = false;
+            for account in &saved_accounts {
+                if account.is_archived {
+                    has_unarchivable = true;
+                    let unarchive_id = format!("unarchive:{}", account.id);
+                    let account_name = account_display_name(account);
+                    unarchive_submenu.append(&MenuItem::with_id(
+                        MenuId::new(&unarchive_id),
+                        account_name.clone(),
+                        true,
+                        None,
+                    ))?;
+                    self.commands
+                        .insert(unarchive_id, TrayCommand::SetArchived(account.id, false));
+                }
+            }
+            if has_unarchivable {
+                menu.append(&unarchive_submenu)?;
+            }
         }
         menu.append(&PredefinedMenuItem::separator())?;
 
@@ -994,12 +1103,37 @@ where
     }
 }
 
+fn get_nearest_reset_time(account: &AccountView) -> Option<OffsetDateTime> {
+    let usage = account.usage.as_ref()?;
+    let now = OffsetDateTime::now_utc();
+    let mut nearest: Option<OffsetDateTime> = None;
+    if let Some(five_hour) = &usage.five_hour
+        && five_hour.remaining_percent == 0
+        && five_hour.reset_at > now
+    {
+        nearest = Some(five_hour.reset_at);
+    }
+    if let Some(weekly) = &usage.weekly
+        && weekly.remaining_percent == 0
+        && weekly.reset_at > now
+    {
+        if let Some(n) = nearest {
+            if weekly.reset_at < n {
+                nearest = Some(weekly.reset_at);
+            }
+        } else {
+            nearest = Some(weekly.reset_at);
+        }
+    }
+    nearest
+}
+
 fn tray_saved_accounts(accounts: &[AccountView]) -> Vec<&AccountView> {
     accounts.iter().collect()
 }
 
 fn append_tray_account_item(
-    menu: &Menu,
+    menu: &dyn AppendableMenu,
     account: &AccountView,
     active_account_id: Option<Uuid>,
     commands: &mut HashMap<String, TrayCommand>,
@@ -1008,10 +1142,10 @@ fn append_tray_account_item(
     let is_active = Some(account.id) == active_account_id || account.is_active;
     let label = format!("  {}", account_display_name(account));
     if is_active {
-        menu.append(&MenuItem::new(label, true, None))?;
+        menu.append_item(&MenuItem::new(label, true, None))?;
     } else {
         let item = MenuItem::with_id(MenuId::new(&id), label, true, None);
-        menu.append(&item)?;
+        menu.append_item(&item)?;
         commands.insert(id, TrayCommand::Activate(account.id));
     }
 
@@ -1029,11 +1163,11 @@ fn append_tray_account_item(
             true,
             None,
         );
-        menu.append(&item)?;
+        menu.append_item(&item)?;
         commands.insert(login_id, TrayCommand::Login(account.id));
     } else {
         let details = format_account_details_line(&plan, account.usage.as_ref());
-        menu.append(&MenuItem::new(format!("    {details}"), true, None))?;
+        menu.append_item(&MenuItem::new(format!("    {details}"), true, None))?;
     }
     Ok(())
 }
@@ -1621,6 +1755,7 @@ mod tests {
             }),
             usage_error: None,
             label: None,
+            is_archived: false,
         };
 
         assert_eq!(account_status_label_simple(&account), "Low quota");
@@ -1644,6 +1779,7 @@ mod tests {
             usage: None,
             usage_error: None,
             label: None,
+            is_archived: false,
         };
         let inactive = AccountView {
             id: Uuid::new_v4(),
@@ -1684,6 +1820,7 @@ mod tests {
             }),
             usage_error: None,
             label: None,
+            is_archived: false,
         };
 
         assert_eq!(account_status_label_simple(&account), "Active / Ready");
@@ -1707,6 +1844,7 @@ mod tests {
             usage: None,
             usage_error: None,
             label: None,
+            is_archived: false,
         };
         let matching_identity = DisplayIdentity {
             email: "active@example.com".to_owned(),
@@ -1757,6 +1895,7 @@ mod tests {
             usage: None,
             usage_error: None,
             label: None,
+            is_archived: false,
         };
 
         // No usage → dash

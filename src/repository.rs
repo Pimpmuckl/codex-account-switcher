@@ -108,6 +108,7 @@ where
                 cached_usage: None,
                 cached_usage_error: None,
                 label: None,
+                is_archived: false,
             };
             index.accounts.push(metadata.clone());
             (metadata, true)
@@ -243,6 +244,25 @@ where
             .find(|account| account.id == account_id && &account.environment == environment)
             .ok_or_else(|| anyhow!("saved account {account_id} not found"))?;
         account.label = normalized_label;
+        account.updated_at = OffsetDateTime::now_utc();
+        let metadata = account.clone();
+        self.index_store.save_index(&index)?;
+        Ok(metadata)
+    }
+
+    pub fn set_account_archived(
+        &self,
+        environment: &EnvironmentKind,
+        account_id: Uuid,
+        archived: bool,
+    ) -> Result<SavedAccountMetadata> {
+        let mut index = self.index_store.load_index()?;
+        let account = index
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == account_id && &account.environment == environment)
+            .ok_or_else(|| anyhow!("saved account {account_id} not found"))?;
+        account.is_archived = archived;
         account.updated_at = OffsetDateTime::now_utc();
         let metadata = account.clone();
         self.index_store.save_index(&index)?;
@@ -967,5 +987,41 @@ mod tests {
         assert_eq!(loaded.schema_version, snapshot.schema_version);
         assert_eq!(loaded.files[0].bytes_base64, "legacy-auth");
         assert_eq!(loaded.files[1].bytes_base64, "legacy-cap");
+    }
+
+    #[test]
+    fn archive_status_is_persisted_and_updated() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+        let env = EnvironmentKind::Windows;
+        let snapshot = SnapshotBlob {
+            schema_version: 1,
+            files: vec![],
+        };
+        let (saved, _) = repo
+            .save_snapshot(&env, &identity("person@example.com", "sub-1"), &snapshot)
+            .expect("save");
+
+        // Default should be false
+        assert!(!saved.is_archived);
+
+        // Update to true
+        let updated = repo
+            .set_account_archived(&env, saved.id, true)
+            .expect("set archived");
+        assert!(updated.is_archived);
+
+        // Verify read back
+        let read = repo
+            .get_account(&env, saved.id)
+            .expect("get")
+            .expect("account");
+        assert!(read.is_archived);
+
+        // Update back to false
+        let updated_false = repo
+            .set_account_archived(&env, saved.id, false)
+            .expect("set unarchived");
+        assert!(!updated_false.is_archived);
     }
 }

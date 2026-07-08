@@ -11,7 +11,8 @@ use crate::import_export::{read_export_file, write_export_file};
 use crate::model::{
     AUTO_REFRESH_QUOTA_ON_RESET_LABEL, AccountUsageView, AccountView,
     AutoStartUsageWindowsRunOutput, AutoStartUsageWindowsStatusOutput, BatchRefreshOutput,
-    ImportOutput, PickBestOutput, QUOTA_PAST_RESET_LABEL, RunningCodexProcess, UsageOutput,
+    ImportOutput, PickBestOutput, QUOTA_PAST_RESET_LABEL, RunningCodexProcess,
+    ShowQuotaInMenuBarStatusOutput, UsageOutput,
 };
 use crate::process::format_process_table;
 use crate::repository::SnapshotRepository;
@@ -101,6 +102,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Archive {
+        account_id: Uuid,
+        #[arg(long)]
+        unarchive: bool,
+        #[arg(long)]
+        json: bool,
+    },
     AutoStartUsageWindows {
         #[arg(long, conflicts_with = "disable")]
         enable: bool,
@@ -118,6 +126,22 @@ enum Command {
         disable: bool,
         #[arg(long)]
         run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    ShowQuotaInMenuBar {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    LaunchAtStartup {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
         #[arg(long)]
         json: bool,
     },
@@ -355,6 +379,22 @@ pub fn run() -> Result<()> {
             } else {
                 println!("Deleted saved snapshot {}", output.deleted_account_id);
             }
+            Ok(
+                (),
+            )
+        }
+        Some(Command::Archive {
+            account_id,
+            unarchive,
+            json,
+        }) => {
+            app.set_account_archived(account_id, !unarchive)?;
+            if json {
+                print_json(&serde_json::json!({ "status": "success" }))?;
+            } else {
+                let verb = if unarchive { "Unarchived" } else { "Archived" };
+                println!("{verb} account successfully.");
+            }
             Ok(())
         }
         Some(Command::AutoStartUsageWindows {
@@ -411,6 +451,51 @@ pub fn run() -> Result<()> {
             } else {
                 println!(
                     "Auto-switch on limit: {}",
+                    if status.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+            }
+            Ok(())
+        }
+        Some(Command::ShowQuotaInMenuBar {
+            enable,
+            disable,
+            json,
+        }) => {
+            let status = if enable {
+                app.set_show_quota_in_menu_bar(true)?
+            } else if disable {
+                app.set_show_quota_in_menu_bar(false)?
+            } else {
+                app.show_quota_in_menu_bar_status()?
+            };
+            if json {
+                print_json(&status)?;
+            } else {
+                print_show_quota_in_menu_bar_status(&status);
+            }
+            Ok(())
+        }
+        Some(Command::LaunchAtStartup {
+            enable,
+            disable,
+            json,
+        }) => {
+            let status = if enable {
+                app.set_launch_at_startup(true)?
+            } else if disable {
+                app.set_launch_at_startup(false)?
+            } else {
+                app.launch_at_startup_status()?
+            };
+            if json {
+                print_json(&status)?;
+            } else {
+                println!(
+                    "Launch at startup: {}",
                     if status.enabled {
                         "enabled"
                     } else {
@@ -613,6 +698,17 @@ fn print_auto_start_usage_windows_status(output: &AutoStartUsageWindowsStatusOut
     println!("Poll interval: {}s", output.poll_seconds);
 }
 
+fn print_show_quota_in_menu_bar_status(output: &ShowQuotaInMenuBarStatusOutput) {
+    println!(
+        "Show quota in menu bar: {}",
+        if output.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+}
+
 fn print_auto_start_usage_windows_run(output: &AutoStartUsageWindowsRunOutput) {
     println!(
         "{}: {}",
@@ -755,6 +851,7 @@ mod tests {
             }),
             usage_error: None,
             label: Some("work".to_owned()),
+            is_archived: false,
         }
     }
 

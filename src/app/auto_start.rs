@@ -17,7 +17,7 @@ use crate::env::AppEnv;
 use crate::model::{
     AUTH_FILES, AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
     AutoStartUsageWindowsStatusOutput, AutoSwitchOnLimitStatusOutput, DisplayIdentity,
-    LaunchAtStartupStatusOutput, SnapshotBlob,
+    LaunchAtStartupStatusOutput, ShowQuotaInMenuBarStatusOutput, SnapshotBlob,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
@@ -89,6 +89,23 @@ where
         Ok(LaunchAtStartupStatusOutput {
             enabled: settings.launch_at_startup,
         })
+    }
+
+    pub fn show_quota_in_menu_bar_status(&self) -> Result<ShowQuotaInMenuBarStatusOutput> {
+        let settings = load_settings(&self.env.app_data_dir)?;
+        Ok(ShowQuotaInMenuBarStatusOutput {
+            enabled: settings.show_quota_in_menu_bar,
+        })
+    }
+
+    pub fn set_show_quota_in_menu_bar(
+        &self,
+        enabled: bool,
+    ) -> Result<ShowQuotaInMenuBarStatusOutput> {
+        let mut settings = load_settings(&self.env.app_data_dir)?;
+        settings.show_quota_in_menu_bar = enabled;
+        save_settings(&self.env.app_data_dir, &settings)?;
+        Ok(ShowQuotaInMenuBarStatusOutput { enabled })
     }
 
     pub fn set_launch_at_startup(&self, enabled: bool) -> Result<LaunchAtStartupStatusOutput> {
@@ -1043,6 +1060,7 @@ mod tests {
             }),
             cached_usage_error: None,
             label: None,
+            is_archived: false,
         };
 
         assert_eq!(current_switch_reason(&account, now), None);

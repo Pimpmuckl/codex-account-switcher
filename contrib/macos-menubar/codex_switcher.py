@@ -100,6 +100,31 @@ def _get_bottleneck_window(usage):
     return candidates[0]  # (remaining_percent, window_dict, key)
 
 
+def _get_nearest_reset_time(acc):
+    usage = acc.get("usage")
+    if not usage:
+        return None
+    import time as _time
+    now = _time.time()
+    nearest = None
+    for key in ("five_hour", "weekly"):
+        w = usage.get(key)
+        if w and w.get("remaining_percent") == 0:
+            reset_at = w.get("reset_at")
+            if reset_at and len(reset_at) >= 5:
+                try:
+                    dt = datetime.datetime(reset_at[0], 1, 1) + datetime.timedelta(
+                        days=reset_at[1], hours=reset_at[2], minutes=reset_at[3], seconds=reset_at[4]
+                    )
+                    ts = dt.timestamp()
+                    if ts > now:
+                        if nearest is None or ts < nearest:
+                            nearest = ts
+                except Exception:
+                    pass
+    return nearest
+
+
 def _format_account_details(plan_label, acc):
     """Build compact details line: Plan  •  [████░░░░] 52%  •  ↻ 12/05"""
     parts = []
@@ -359,19 +384,29 @@ exit 1
             active_group = []
             depleted_group = []
             login_group = []
+            archived_group = []
 
             for acc in other_accounts:
-                tag = _status_tag(acc)
-                if tag == "Login":
-                    login_group.append(acc)
-                elif tag == "Depleted":
-                    depleted_group.append(acc)
+                if acc.get("is_archived", False):
+                    archived_group.append(acc)
                 else:
-                    active_group.append(acc)
+                    tag = _status_tag(acc)
+                    if tag == "Login":
+                        login_group.append(acc)
+                    elif tag == "Depleted":
+                        depleted_group.append(acc)
+                    else:
+                        active_group.append(acc)
+
+            # Sort depleted group by nearest reset time
+            if depleted_group:
+                depleted_group.sort(key=lambda acc: _get_nearest_reset_time(acc) or float('inf'))
 
             first_group = True
 
-            def add_acc(acc):
+            def add_acc(acc, target_menu=None):
+                if target_menu is None:
+                    target_menu = self.menu
                 aid = acc["id"]
                 email = acc["email"]
                 short_email = email.removesuffix("@gmail.com") if email.endswith("@gmail.com") else email
@@ -379,14 +414,14 @@ exit 1
                 item = rumps.MenuItem(
                     label, callback=self._mk(self._switch, aid, email)
                 )
-                self.menu.add(item)
+                target_menu.add(item)
 
                 # Details line
                 acc_plan = acc.get("plan_label", "")
                 details = _format_account_details(acc_plan, acc)
                 if details:
                     sub_item = rumps.MenuItem(f"      {details}", callback=lambda _: None)
-                    self.menu.add(sub_item)
+                    target_menu.add(sub_item)
 
             if active_group:
                 if not first_group:
@@ -406,14 +441,29 @@ exit 1
                 for acc in depleted_group:
                     add_acc(acc)
 
-            if login_group:
+            if login_group or archived_group:
                 if not first_group:
                     self.menu.add(None)
                 first_group = False
-                header = rumps.MenuItem("⚠️ Login Required (Cần login lại)", callback=lambda _: None)
-                self.menu.add(header)
-                for acc in login_group:
-                    add_acc(acc)
+                hidden_submenu = rumps.MenuItem("📂 Show Hidden Accounts (Hiển thị tài khoản ẩn)")
+                first_hidden_group = True
+
+                if login_group:
+                    header = rumps.MenuItem("⚠️ Login Required (Cần login lại)", callback=lambda _: None)
+                    hidden_submenu.add(header)
+                    first_hidden_group = False
+                    for acc in login_group:
+                        add_acc(acc, target_menu=hidden_submenu)
+
+                if archived_group:
+                    if not first_hidden_group:
+                        hidden_submenu.add(None)
+                    header = rumps.MenuItem("📁 Archived (Đã lưu trữ)", callback=lambda _: None)
+                    hidden_submenu.add(header)
+                    for acc in archived_group:
+                        add_acc(acc, target_menu=hidden_submenu)
+
+                self.menu.add(hidden_submenu)
         else:
             empty = rumps.MenuItem("  (no saved accounts)", callback=lambda _: None)
             self.menu.add(empty)
@@ -439,6 +489,32 @@ exit 1
                     callback=self._mk(self._delete, acc["id"], acc["email"]),
                 ))
             self.menu.add(del_sub)
+
+            # Archive submenu
+            archive_sub = rumps.MenuItem("📁 Archive Account")
+            has_archivable = False
+            for acc in accounts:
+                if not acc.get("is_archived", False):
+                    has_archivable = True
+                    archive_sub.add(rumps.MenuItem(
+                        acc["email"],
+                        callback=self._mk(self._archive, acc["id"], acc["email"]),
+                    ))
+            if has_archivable:
+                self.menu.add(archive_sub)
+
+            # Unarchive submenu
+            unarchive_sub = rumps.MenuItem("📂 Unarchive Account")
+            has_unarchivable = False
+            for acc in accounts:
+                if acc.get("is_archived", False):
+                    has_unarchivable = True
+                    unarchive_sub.add(rumps.MenuItem(
+                        acc["email"],
+                        callback=self._mk(self._unarchive, acc["id"], acc["email"]),
+                    ))
+            if has_unarchivable:
+                self.menu.add(unarchive_sub)
 
         self.menu.add(None)
 
@@ -610,6 +686,22 @@ exit 1
         ok, msg = cli_run("delete", account_id)
         if ok:
             notify("Codex Switcher", "🗑 Deleted", email)
+        else:
+            notify("Codex Switcher", "❌ Error", msg[:100])
+        self._refresh_menu()
+
+    def _archive(self, account_id, email):
+        ok, msg = cli_run("archive", account_id)
+        if ok:
+            notify("Codex Switcher", "📁 Archived", email)
+        else:
+            notify("Codex Switcher", "❌ Error", msg[:100])
+        self._refresh_menu()
+
+    def _unarchive(self, account_id, email):
+        ok, msg = cli_run("archive", account_id, "--unarchive")
+        if ok:
+            notify("Codex Switcher", "📂 Unarchived", email)
         else:
             notify("Codex Switcher", "❌ Error", msg[:100])
         self._refresh_menu()

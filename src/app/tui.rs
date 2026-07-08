@@ -1539,6 +1539,7 @@ mod tests {
                 usage: None,
                 usage_error: None,
                 label: None,
+                is_archived: false,
             }],
         }
     }
@@ -1948,6 +1949,7 @@ mod tests {
             }),
             usage_error: None,
             label: None,
+            is_archived: false,
         };
 
         // 2. Depleted account: 0% quota remaining
