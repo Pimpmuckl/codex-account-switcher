@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 mod codec;
 mod index_store;
@@ -13,6 +14,8 @@ use crate::secrets::SecretStore;
 use crate::usage::usage_error_requires_login;
 use codec::{decode_snapshot, encode_snapshot};
 use index_store::MetadataIndexStore;
+
+static REPOSITORY_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct SnapshotRepository<S> {
     index_store: MetadataIndexStore,
@@ -31,14 +34,24 @@ where
     }
 
     pub fn list_accounts(&self) -> Result<Vec<SavedAccountMetadata>> {
+        let _guard = repository_write_lock()?;
+        self.list_accounts_unlocked()
+    }
+
+    fn list_accounts_unlocked(&self) -> Result<Vec<SavedAccountMetadata>> {
         let mut accounts = self.load_index()?.accounts;
         accounts.sort_by_key(|account| std::cmp::Reverse(account.updated_at));
         Ok(accounts)
     }
 
     pub fn get_account(&self, account_id: Uuid) -> Result<Option<SavedAccountMetadata>> {
+        let _guard = repository_write_lock()?;
+        self.get_account_unlocked(account_id)
+    }
+
+    fn get_account_unlocked(&self, account_id: Uuid) -> Result<Option<SavedAccountMetadata>> {
         Ok(self
-            .list_accounts()?
+            .list_accounts_unlocked()?
             .into_iter()
             .find(|account| account.id == account_id))
     }
@@ -48,6 +61,7 @@ where
         identity: &DisplayIdentity,
         snapshot: &SnapshotBlob,
     ) -> Result<(SavedAccountMetadata, bool)> {
+        let _guard = repository_write_lock()?;
         let mut index = self.load_index()?;
         let now = OffsetDateTime::now_utc();
         let encoded_snapshot = encode_snapshot(snapshot)?;
@@ -97,8 +111,16 @@ where
     }
 
     pub fn load_snapshot(&self, account_id: Uuid) -> Result<(SavedAccountMetadata, SnapshotBlob)> {
+        let _guard = repository_write_lock()?;
+        self.load_snapshot_unlocked(account_id)
+    }
+
+    fn load_snapshot_unlocked(
+        &self,
+        account_id: Uuid,
+    ) -> Result<(SavedAccountMetadata, SnapshotBlob)> {
         let metadata = self
-            .get_account(account_id)?
+            .get_account_unlocked(account_id)?
             .ok_or_else(|| anyhow!("saved account {account_id} not found"))?;
         let encoded_snapshot = self
             .secret_store
@@ -114,6 +136,34 @@ where
     }
 
     pub fn replace_snapshot(
+        &self,
+        account_id: Uuid,
+        identity: &DisplayIdentity,
+        snapshot: &SnapshotBlob,
+        usage: Option<AccountUsageView>,
+    ) -> Result<SavedAccountMetadata> {
+        let _guard = repository_write_lock()?;
+        self.replace_snapshot_unlocked(account_id, identity, snapshot, usage)
+    }
+
+    pub fn replace_snapshot_if_current(
+        &self,
+        account_id: Uuid,
+        expected_snapshot: &SnapshotBlob,
+        identity: &DisplayIdentity,
+        snapshot: &SnapshotBlob,
+        usage: Option<AccountUsageView>,
+    ) -> Result<bool> {
+        let _guard = repository_write_lock()?;
+        let (_, current_snapshot) = self.load_snapshot_unlocked(account_id)?;
+        if current_snapshot != *expected_snapshot {
+            return Ok(false);
+        }
+        self.replace_snapshot_unlocked(account_id, identity, snapshot, usage)?;
+        Ok(true)
+    }
+
+    fn replace_snapshot_unlocked(
         &self,
         account_id: Uuid,
         identity: &DisplayIdentity,
@@ -146,6 +196,30 @@ where
         account_id: Uuid,
         usage_error: String,
     ) -> Result<SavedAccountMetadata> {
+        let _guard = repository_write_lock()?;
+        self.record_usage_error_unlocked(account_id, usage_error)
+    }
+
+    pub fn record_usage_error_if_current(
+        &self,
+        account_id: Uuid,
+        expected_snapshot: &SnapshotBlob,
+        usage_error: String,
+    ) -> Result<bool> {
+        let _guard = repository_write_lock()?;
+        let (_, current_snapshot) = self.load_snapshot_unlocked(account_id)?;
+        if current_snapshot != *expected_snapshot {
+            return Ok(false);
+        }
+        self.record_usage_error_unlocked(account_id, usage_error)?;
+        Ok(true)
+    }
+
+    fn record_usage_error_unlocked(
+        &self,
+        account_id: Uuid,
+        usage_error: String,
+    ) -> Result<SavedAccountMetadata> {
         let mut index = self.load_index()?;
         let position = index
             .accounts
@@ -168,6 +242,7 @@ where
     }
 
     pub fn delete_snapshot(&self, account_id: Uuid) -> Result<()> {
+        let _guard = repository_write_lock()?;
         let mut index = self.load_index()?;
         let Some(position) = index
             .accounts
@@ -201,6 +276,7 @@ where
         account_id: Uuid,
         identity: &DisplayIdentity,
     ) -> Result<SavedAccountMetadata> {
+        let _guard = repository_write_lock()?;
         let mut index = self.load_index()?;
         let now = OffsetDateTime::now_utc();
         let Some(account_position) = index
@@ -283,6 +359,12 @@ where
         let snapshot = decode_snapshot(&encoded_snapshot).ok()?;
         codex::identity_from_snapshot(&snapshot).ok()
     }
+}
+
+fn repository_write_lock() -> Result<MutexGuard<'static, ()>> {
+    REPOSITORY_WRITE_LOCK
+        .lock()
+        .map_err(|_| anyhow!("snapshot repository write lock poisoned"))
 }
 
 #[cfg(test)]
@@ -903,6 +985,56 @@ mod tests {
                 .cached_usage_error
                 .is_none()
         );
+    }
+
+    #[test]
+    fn conditional_snapshot_writes_skip_when_snapshot_changed() {
+        let temp = tempdir().expect("tempdir");
+        let repo = SnapshotRepository::new(temp.path(), MemorySecretStore::default());
+        let first_identity = identity("first@example.com", "sub-1");
+        let first_snapshot = snapshot_with_auth("first@example.com", "subject-1", "sub-1");
+        let second_identity = identity("second@example.com", "sub-2");
+        let second_snapshot = snapshot_with_auth("second@example.com", "subject-2", "sub-2");
+        let saved = repo
+            .save_snapshot(&first_identity, &first_snapshot)
+            .expect("save")
+            .0;
+
+        assert!(
+            repo.replace_snapshot_if_current(
+                saved.id,
+                &first_snapshot,
+                &second_identity,
+                &second_snapshot,
+                None,
+            )
+            .expect("conditional replace")
+        );
+        assert!(
+            !repo
+                .replace_snapshot_if_current(
+                    saved.id,
+                    &first_snapshot,
+                    &first_identity,
+                    &first_snapshot,
+                    None,
+                )
+                .expect("stale conditional replace")
+        );
+        assert!(
+            !repo
+                .record_usage_error_if_current(
+                    saved.id,
+                    &first_snapshot,
+                    "Usage unavailable".to_owned(),
+                )
+                .expect("stale conditional error")
+        );
+
+        let (loaded, loaded_snapshot) = repo.load_snapshot(saved.id).expect("load");
+        assert_eq!(loaded.email, "second@example.com");
+        assert_eq!(loaded_snapshot, second_snapshot);
+        assert!(loaded.cached_usage_error.is_none());
     }
 
     #[test]

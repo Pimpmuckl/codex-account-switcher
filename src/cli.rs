@@ -218,6 +218,9 @@ where
     S: crate::secrets::SecretStore,
 {
     crate::app::spawn_auto_start_usage_windows_worker(app.env().clone());
+    if !app.auto_start_usage_windows_status()?.enabled {
+        spawn_saved_usage_cache_refresh(app.env().clone());
+    }
     #[cfg(windows)]
     {
         loop {
@@ -239,6 +242,28 @@ where
             InteractiveExit::Quit => Ok(()),
         }
     }
+}
+
+fn spawn_saved_usage_cache_refresh(env: env::AppEnv) {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    STARTED.get_or_init(move || {
+        let _ = std::thread::Builder::new()
+            .name("saved-usage-cache-refresh".to_owned())
+            .spawn(move || {
+                if let Err(error) = run_saved_usage_cache_refresh(env) {
+                    eprintln!("saved usage refresh failed: {error:#}");
+                }
+            });
+    });
+}
+
+fn run_saved_usage_cache_refresh(env: env::AppEnv) -> Result<()> {
+    let repository = SnapshotRepository::new(
+        &env.app_data_dir,
+        LocalSecretStore::new(&env.app_data_dir.join("snapshots")),
+    );
+    let app = App::new(env, repository);
+    app.refresh_saved_usage_cache()
 }
 
 fn print_json<T>(value: &T) -> Result<()>

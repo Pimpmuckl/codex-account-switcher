@@ -83,6 +83,9 @@ where
         let now = OffsetDateTime::now_utc();
         let mut due_accounts = Vec::new();
         for account in &accounts {
+            if !auto_start_check_needs_usage_refresh(account, now) {
+                continue;
+            }
             let cached_weekly = cached_weekly_window(account);
             let cached_due = cached_weekly.is_some_and(|weekly| weekly.reset_at <= now);
             let previous_reset_at = cached_weekly.map(|weekly| weekly.reset_at);
@@ -263,6 +266,23 @@ fn cached_weekly_window(account: &SavedAccountMetadata) -> Option<&UsageWindowVi
         return None;
     }
     account.cached_usage.as_ref()?.weekly.as_ref()
+}
+
+fn auto_start_check_needs_usage_refresh(
+    account: &SavedAccountMetadata,
+    now: OffsetDateTime,
+) -> bool {
+    if let Some(error) = account.cached_usage_error.as_deref() {
+        return !usage_error_requires_login(error);
+    }
+    match account
+        .cached_usage
+        .as_ref()
+        .and_then(|usage| usage.weekly.as_ref())
+    {
+        Some(weekly) => weekly.reset_at <= now || weekly.remaining_percent == 100,
+        None => true,
+    }
 }
 
 fn auto_start_check_usage_cache(
@@ -599,11 +619,18 @@ mod tests {
     }
 
     fn weekly_usage(reset_at: OffsetDateTime) -> AccountUsageView {
+        weekly_usage_with_remaining(reset_at, 100)
+    }
+
+    fn weekly_usage_with_remaining(
+        reset_at: OffsetDateTime,
+        remaining_percent: u8,
+    ) -> AccountUsageView {
         AccountUsageView {
             source: UsageSource::SavedAccessToken,
             fetched_at: OffsetDateTime::UNIX_EPOCH,
             five_hour: None,
-            weekly: Some(weekly_window(reset_at, 100)),
+            weekly: Some(weekly_window(reset_at, remaining_percent)),
             credits: None,
         }
     }
@@ -691,6 +718,45 @@ mod tests {
         );
 
         assert!(cached_weekly_window(&account).is_none());
+    }
+
+    #[test]
+    fn auto_start_usage_refresh_prefilter_keeps_only_possible_ping_candidates() {
+        let now = OffsetDateTime::now_utc();
+
+        assert!(!auto_start_check_needs_usage_refresh(
+            &saved_account(
+                Some(weekly_usage_with_remaining(now + Duration::days(1), 99)),
+                None
+            ),
+            now
+        ));
+        assert!(auto_start_check_needs_usage_refresh(
+            &saved_account(Some(weekly_usage(now - Duration::minutes(1))), None),
+            now
+        ));
+        assert!(auto_start_check_needs_usage_refresh(
+            &saved_account(Some(weekly_usage(now + Duration::days(7))), None),
+            now
+        ));
+        assert!(auto_start_check_needs_usage_refresh(
+            &saved_account(None, Some("Usage unavailable: timeout".to_owned())),
+            now
+        ));
+        assert!(auto_start_check_needs_usage_refresh(
+            &saved_account(
+                Some(weekly_usage_with_remaining(now + Duration::days(1), 99)),
+                Some("Usage unavailable: timeout".to_owned())
+            ),
+            now
+        ));
+        assert!(!auto_start_check_needs_usage_refresh(
+            &saved_account(
+                Some(weekly_usage(now - Duration::minutes(1))),
+                Some("Login required: Codex auth expired.".to_owned())
+            ),
+            now
+        ));
     }
 
     #[test]

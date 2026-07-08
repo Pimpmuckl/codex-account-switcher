@@ -41,7 +41,7 @@ codex-account-switcher auto-start-usage-windows [--enable|--disable] [--run] [--
 - `usage` fetches current usage for the live account or for a saved account by id.
 - `activate` restores a saved snapshot. Reliable swaps require all Codex processes to be closed first; `--force` lets the command attempt activation anyway, but it still fails if the restored files do not stay stable.
 - `delete` removes the saved snapshot from the switcher store only.
-- `auto-start-usage-windows` is opt-in from the CLI, TUI, or tray checkmark. When enabled, the interactive app refreshes saved weekly windows every 5 minutes and starts due windows with a minimal `codex exec` ping when Codex is on `PATH`.
+- `auto-start-usage-windows` is opt-in from the CLI, TUI, or tray checkmark. When enabled, the interactive app checks saved weekly windows every 5 minutes and starts due or freshly reset windows with a minimal `codex exec` ping when Codex is on `PATH`.
 
 Saved snapshot data lives in the app-data directory for the current environment:
 
