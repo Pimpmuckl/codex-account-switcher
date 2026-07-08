@@ -36,6 +36,7 @@ enum UserEvent {
     BackgroundTaskDone {
         notification: Option<(String, String)>,
     },
+    UpdateMenu,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +52,7 @@ enum TrayCommand {
     SetAutoStartUsageWindows(bool),
     SetAutoSwitchOnLimit(bool),
     SetLaunchAtStartup(bool),
+    SetShowQuotaInMenuBar(bool),
     ShowTui,
     Refresh,
     Quit,
@@ -173,7 +175,9 @@ where
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::AutoStartUsageWindowsChecked | UserEvent::BackgroundTaskDone { .. } => {
+            UserEvent::AutoStartUsageWindowsChecked
+            | UserEvent::UpdateMenu
+            | UserEvent::BackgroundTaskDone { .. } => {
                 if let UserEvent::BackgroundTaskDone {
                     notification: Some((title, body)),
                 } = &event
@@ -204,12 +208,14 @@ where
         {
             Ok((status, list)) => {
                 let tooltip = self.get_tooltip_text(&status, &list);
+                let title = self.get_menu_bar_title(&status, &list);
                 match self.rebuild_menu_with_status_and_list(&status, &list) {
                     Ok(menu) => {
                         let (icon, template) = load_tray_icon();
                         let mut builder = TrayIconBuilder::new()
                             .with_tooltip(tooltip)
                             .with_icon(icon)
+                            .with_title(title)
                             .with_menu(Box::new(menu));
                         #[cfg(target_os = "macos")]
                         {
@@ -315,9 +321,7 @@ where
                     }
                 };
                 tray_notify("Codex Switcher", &msg);
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
             Some(TrayCommand::StartAddAccount) => {
                 match self.app.begin_add_account_session() {
@@ -340,9 +344,7 @@ where
                         );
                     }
                 }
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
             Some(TrayCommand::FinishAddAccount) => {
                 let proxy = self.event_proxy.clone();
@@ -487,9 +489,7 @@ where
                             eprintln!("failed to delete account: {error:#}");
                         }
                     }
-                    if let Err(error) = self.update_tray_menu() {
-                        eprintln!("failed to refresh tray menu: {error:#}");
-                    }
+                    let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
                 }
             }
             Some(TrayCommand::SetAutoStartUsageWindows(enabled)) => {
@@ -511,9 +511,7 @@ where
                             let _ = proxy.send_event(UserEvent::AutoStartUsageWindowsChecked);
                         });
                 }
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
             Some(TrayCommand::SetAutoSwitchOnLimit(enabled)) => {
                 if let Err(error) = self.app.set_auto_switch_on_limit(enabled) {
@@ -532,17 +530,19 @@ where
                             let _ = proxy.send_event(UserEvent::AutoStartUsageWindowsChecked);
                         });
                 }
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
             Some(TrayCommand::SetLaunchAtStartup(enabled)) => {
                 if let Err(error) = self.app.set_launch_at_startup(enabled) {
                     eprintln!("failed to update launch at startup from tray: {error:#}");
                 }
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
+            }
+            Some(TrayCommand::SetShowQuotaInMenuBar(enabled)) => {
+                if let Err(error) = self.app.set_show_quota_in_menu_bar(enabled) {
+                    eprintln!("failed to update show quota in menu bar from tray: {error:#}");
                 }
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
             Some(TrayCommand::ShowTui) => {
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -582,9 +582,7 @@ where
                 event_loop.exit();
             }
             Some(TrayCommand::Refresh) => {
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
             Some(TrayCommand::Quit) => {
                 self.exit = TrayExit::Quit;
@@ -598,12 +596,65 @@ where
         let status = self.app.status()?;
         let list = self.app.list()?;
         let tooltip = self.get_tooltip_text(&status, &list);
+        let title = self.get_menu_bar_title(&status, &list);
         let menu = self.rebuild_menu_with_status_and_list(&status, &list)?;
         if let Some(tray_icon) = &self.tray_icon {
             let _ = tray_icon.set_tooltip(Some(&tooltip));
+            tray_icon.set_title(Some(title));
             tray_icon.set_menu(Some(Box::new(menu)));
         }
         Ok(())
+    }
+
+    fn get_menu_bar_title(
+        &self,
+        status: &crate::model::StatusOutput,
+        list: &crate::model::ListOutput,
+    ) -> String {
+        let Ok(settings) = self.app.show_quota_in_menu_bar_status() else {
+            return String::new();
+        };
+        if !settings.enabled {
+            return String::new();
+        }
+        let Some(current) = &status.current_account else {
+            return String::new();
+        };
+        let active_account = find_active_tray_account(
+            Some(current),
+            status.current_account_saved_id,
+            &list.accounts,
+        );
+        let Some(account) = active_account else {
+            return String::new();
+        };
+
+        if account
+            .usage_error
+            .as_deref()
+            .is_some_and(usage_error_requires_login)
+        {
+            return " Login".to_owned();
+        }
+
+        if let Some(usage) = &account.usage {
+            let now = OffsetDateTime::now_utc();
+            if usage.is_out_of_quota(now) {
+                return " 0%".to_owned();
+            }
+            let bottleneck = [usage.five_hour.as_ref(), usage.weekly.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter(|w| w.reset_at > now)
+                .min_by_key(|w| w.remaining_percent);
+            if let Some(window) = bottleneck {
+                return format!(" {}%", window.remaining_percent);
+            } else if usage.has_stale_quota_cache(now) {
+                return " Stale".to_owned();
+            }
+        }
+
+        String::new()
     }
 
     fn get_tooltip_text(
@@ -662,21 +713,19 @@ where
         let active_account_id = active_account.map(|account| account.id);
         let saved_accounts = tray_saved_accounts(&list.accounts);
 
-        menu.append(&MenuItem::new("Active Account", false, None))?;
+        // ── Active account ──────────────────────────────────────
         if let Some(current) = &status.current_account {
-            // Line 1: Full Email
+            let not_saved = active_account.is_none();
+            let name = identity_display_name(current);
+            let suffix = if not_saved { "  [not saved]" } else { "" };
             menu.append(&MenuItem::new(
-                format!("  {}", identity_display_name(current)),
+                format!("\u{2713} {name}{suffix}"),
                 false,
                 None,
             ))?;
 
-            // Line 2: Details
+            // Details: plan + quota bar + reset
             let plan = format_plan_label_simple(current.plan_label.as_deref());
-            let (remaining, reset) = active_account
-                .map(account_usage_labels_simple)
-                .unwrap_or_default();
-
             let needs_login = active_account
                 .and_then(|a| a.usage_error.as_deref())
                 .is_some_and(usage_error_requires_login);
@@ -693,94 +742,124 @@ where
                     self.commands
                         .insert(login_id, TrayCommand::Login(act_acc.id));
                 } else {
-                    let details = format_details_line(
-                        plan,
-                        remaining,
-                        reset,
-                        active_account.is_none().then_some("[not saved]"),
-                    );
-                    menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
+                    menu.append(&MenuItem::new(
+                        format!("    {plan}  •  Login required"),
+                        false,
+                        None,
+                    ))?;
                 }
             } else {
-                let details = format_details_line(
-                    plan,
-                    remaining,
-                    reset,
-                    active_account.is_none().then_some("[not saved]"),
+                let details = format_account_details_line(
+                    &plan,
+                    active_account.and_then(|a| a.usage.as_ref()),
                 );
                 menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
             }
-
-            self.append_command(
-                &menu,
-                "save-current",
-                "  Save Current Workspace",
-                TrayCommand::SaveCurrent,
-            )?;
-            self.append_command(
-                &menu,
-                "add-account",
-                "  Add Account / Workspace…",
-                TrayCommand::StartAddAccount,
-            )?;
-            self.append_command(
-                &menu,
-                "pick-best-quota",
-                "  Switch to Best Available Quota…",
-                TrayCommand::PickBestQuota,
-            )?;
         } else {
-            menu.append(&MenuItem::new("  not logged in", false, None))?;
+            menu.append(&MenuItem::new("Not logged in", false, None))?;
         }
         menu.append(&PredefinedMenuItem::separator())?;
 
-        menu.append(&MenuItem::new("Saved Accounts", false, None))?;
+        // ── Saved accounts (switch targets) ─────────────────────
         if saved_accounts.is_empty() {
             menu.append(&MenuItem::new("  No saved accounts", false, None))?;
         } else {
+            let mut active_group = Vec::new();
+            let mut depleted_group = Vec::new();
+            let mut login_group = Vec::new();
+
             for account in &saved_accounts {
-                let id = format!("activate:{}", account.id);
-                let is_active = Some(account.id) == active_account_id || account.is_active;
-                let label = format!(
-                    "  {}  —  {}",
-                    account_display_name(account),
-                    account_status_label_simple(account)
-                );
-                if is_active {
-                    menu.append(&MenuItem::new(label, false, None))?;
-                } else {
-                    let item = MenuItem::with_id(MenuId::new(&id), label, true, None);
-                    menu.append(&item)?;
-                    self.commands.insert(id, TrayCommand::Activate(account.id));
-                }
-
-                // Line 2: Details (non-clickable unless needs login)
-                let plan = format_plan_label_simple(account.plan_label.as_deref());
-                let (remaining, reset) = account_usage_labels_simple(account);
-
                 let needs_login = account
                     .usage_error
                     .as_deref()
                     .is_some_and(usage_error_requires_login);
                 if needs_login {
-                    let login_id = format!("login:{}", account.id);
-                    let item = MenuItem::with_id(
-                        MenuId::new(&login_id),
-                        format!("    {plan}  •  Click to Login"),
-                        true,
-                        None,
-                    );
-                    menu.append(&item)?;
-                    self.commands
-                        .insert(login_id, TrayCommand::Login(account.id));
+                    login_group.push(*account);
+                } else if let Some(usage) = &account.usage
+                    && usage.is_out_of_quota(OffsetDateTime::now_utc())
+                {
+                    depleted_group.push(*account);
                 } else {
-                    let details = format_details_line(plan, remaining, reset, None);
-                    menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
+                    active_group.push(*account);
                 }
             }
 
-            menu.append(&PredefinedMenuItem::separator())?;
-            let delete_submenu = Submenu::new("  Delete Account", true);
+            let mut first_group = true;
+
+            if !active_group.is_empty() {
+                if !first_group {
+                    menu.append(&PredefinedMenuItem::separator())?;
+                }
+                first_group = false;
+                menu.append(&MenuItem::new("  Active (Còn token)", false, None))?;
+                for account in active_group {
+                    append_tray_account_item(
+                        &menu,
+                        account,
+                        active_account_id,
+                        &mut self.commands,
+                    )?;
+                }
+            }
+
+            if !depleted_group.is_empty() {
+                if !first_group {
+                    menu.append(&PredefinedMenuItem::separator())?;
+                }
+                first_group = false;
+                menu.append(&MenuItem::new("  Depleted (Hết token)", false, None))?;
+                for account in depleted_group {
+                    append_tray_account_item(
+                        &menu,
+                        account,
+                        active_account_id,
+                        &mut self.commands,
+                    )?;
+                }
+            }
+
+            if !login_group.is_empty() {
+                if !first_group {
+                    menu.append(&PredefinedMenuItem::separator())?;
+                }
+                menu.append(&MenuItem::new(
+                    "  Login Required (Cần login lại)",
+                    false,
+                    None,
+                ))?;
+                for account in login_group {
+                    append_tray_account_item(
+                        &menu,
+                        account,
+                        active_account_id,
+                        &mut self.commands,
+                    )?;
+                }
+            }
+        }
+        menu.append(&PredefinedMenuItem::separator())?;
+
+        // ── Actions ─────────────────────────────────────────────
+        self.append_command(
+            &menu,
+            "pick-best-quota",
+            "Best Quota",
+            TrayCommand::PickBestQuota,
+        )?;
+        self.append_command(
+            &menu,
+            "save-current",
+            "Save Current",
+            TrayCommand::SaveCurrent,
+        )?;
+        self.append_command(
+            &menu,
+            "add-account",
+            "Add Account…",
+            TrayCommand::StartAddAccount,
+        )?;
+        if !saved_accounts.is_empty() {
+            let delete_submenu = Submenu::new("Delete Account", true);
             for account in &saved_accounts {
                 let delete_id = format!("delete:{}", account.id);
                 let account_name = account_display_name(account);
@@ -795,8 +874,9 @@ where
             }
             menu.append(&delete_submenu)?;
         }
-
         menu.append(&PredefinedMenuItem::separator())?;
+
+        // ── Settings & system ───────────────────────────────────
         let automation_submenu = Submenu::new("Automation", true);
         let auto_start_enabled = self.app.auto_start_usage_windows_status()?.enabled;
         self.append_check_submenu_command(
@@ -822,9 +902,17 @@ where
             launch_at_startup_enabled,
             TrayCommand::SetLaunchAtStartup(!launch_at_startup_enabled),
         )?;
+        let show_quota_enabled = self.app.show_quota_in_menu_bar_status()?.enabled;
+        self.append_check_submenu_command(
+            &automation_submenu,
+            "toggle-show-quota-in-menu-bar",
+            "Show Quota in Menu Bar",
+            show_quota_enabled,
+            TrayCommand::SetShowQuotaInMenuBar(!show_quota_enabled),
+        )?;
         menu.append(&automation_submenu)?;
-        self.append_command(&menu, "show-tui", "Show TUI", TrayCommand::ShowTui)?;
         self.append_command(&menu, "refresh", "Refresh", TrayCommand::Refresh)?;
+        self.append_command(&menu, "show-tui", "Show TUI", TrayCommand::ShowTui)?;
         self.append_command(&menu, "quit", "Quit", TrayCommand::Quit)?;
         Ok(menu)
     }
@@ -910,6 +998,47 @@ fn tray_saved_accounts(accounts: &[AccountView]) -> Vec<&AccountView> {
     accounts.iter().collect()
 }
 
+fn append_tray_account_item(
+    menu: &Menu,
+    account: &AccountView,
+    active_account_id: Option<Uuid>,
+    commands: &mut HashMap<String, TrayCommand>,
+) -> Result<()> {
+    let id = format!("activate:{}", account.id);
+    let is_active = Some(account.id) == active_account_id || account.is_active;
+    let status_tag = account_status_tag(account);
+    let label = format!("  {} — {}", account_display_name(account), status_tag);
+    if is_active {
+        menu.append(&MenuItem::new(label, false, None))?;
+    } else {
+        let item = MenuItem::with_id(MenuId::new(&id), label, true, None);
+        menu.append(&item)?;
+        commands.insert(id, TrayCommand::Activate(account.id));
+    }
+
+    // Details line
+    let plan = format_plan_label_simple(account.plan_label.as_deref());
+    let needs_login = account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login);
+    if needs_login {
+        let login_id = format!("login:{}", account.id);
+        let item = MenuItem::with_id(
+            MenuId::new(&login_id),
+            format!("    {plan}  •  Click to Login"),
+            true,
+            None,
+        );
+        menu.append(&item)?;
+        commands.insert(login_id, TrayCommand::Login(account.id));
+    } else {
+        let details = format_account_details_line(&plan, account.usage.as_ref());
+        menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
+    }
+    Ok(())
+}
+
 fn find_active_tray_account<'a>(
     current_account: Option<&DisplayIdentity>,
     current_saved_id: Option<Uuid>,
@@ -946,10 +1075,19 @@ fn identity_display_name(identity: &DisplayIdentity) -> String {
     display_name_with_workspace(&identity.email, identity.workspace_label())
 }
 
+/// Shorten email for compact display: strip common suffixes.
+fn compact_email(email: &str) -> &str {
+    email
+        .strip_suffix("@gmail.com")
+        .or_else(|| email.strip_suffix("@googlemail.com"))
+        .unwrap_or(email)
+}
+
 fn display_name_with_workspace(email: &str, workspace: Option<&str>) -> String {
+    let short = compact_email(email);
     workspace
-        .map(|workspace| format!("{email} ({workspace})"))
-        .unwrap_or_else(|| email.to_owned())
+        .map(|workspace| format!("{short} ({workspace})"))
+        .unwrap_or_else(|| short.to_owned())
 }
 
 fn format_plan_label_simple(plan: Option<&str>) -> String {
@@ -960,6 +1098,45 @@ fn format_plan_label_simple(plan: Option<&str>) -> String {
         other => other.to_owned(),
     })
     .unwrap_or_else(|| "Free".to_owned())
+}
+
+/// Build a compact quota bar: `[█████░] 83%`
+fn format_quota_bar(percent: u8) -> String {
+    const BAR_WIDTH: usize = 6;
+    let filled = (percent as usize * BAR_WIDTH + 50) / 100; // round
+    let empty = BAR_WIDTH.saturating_sub(filled);
+    format!(
+        "[{}{}] {percent}%",
+        "\u{2588}".repeat(filled),
+        "\u{2591}".repeat(empty),
+    )
+}
+
+/// Build the compact details line for an account: `Plan  •  [████░░░░] 52%  •  ↻ 12/05`
+fn format_account_details_line(
+    plan: &str,
+    usage: Option<&crate::model::AccountUsageView>,
+) -> String {
+    let mut parts = vec![plan.to_owned()];
+    if let Some(usage) = usage {
+        let now = OffsetDateTime::now_utc();
+        // Pick bottleneck: lowest remaining% across active windows
+        let bottleneck = [usage.five_hour.as_ref(), usage.weekly.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|w| w.reset_at > now)
+            .min_by_key(|w| w.remaining_percent);
+        if let Some(window) = bottleneck {
+            parts.push(format_quota_bar(window.remaining_percent));
+            parts.push(format!(
+                "\u{21bb} {}",
+                crate::time_display::format_short_local_reset_at(window.reset_at)
+            ));
+        } else if usage.has_stale_quota_cache(now) {
+            parts.push(QUOTA_PAST_RESET_LABEL.to_owned());
+        }
+    }
+    parts.join(" • ")
 }
 
 fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
@@ -997,6 +1174,33 @@ fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
     }
 }
 
+/// Compact status tag for saved account list: Ready / Low / Depleted / Login / Stale
+fn account_status_tag(account: &AccountView) -> String {
+    if account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
+    {
+        return "Login".to_owned();
+    }
+    if let Some(usage) = &account.usage {
+        let now = OffsetDateTime::now_utc();
+        if usage.is_out_of_quota(now) {
+            return "Depleted".to_owned();
+        }
+        if usage.is_near_limit(now, 10) {
+            return "Low".to_owned();
+        }
+        return "Ready".to_owned();
+    }
+    if account.usage_error.is_some() {
+        "Stale".to_owned()
+    } else {
+        "—".to_owned()
+    }
+}
+
+/// Verbose status label (used in tooltip and legacy paths).
 fn account_status_label_simple(account: &AccountView) -> String {
     let prefix = if account.is_active { "Active / " } else { "" };
     if account
@@ -1021,25 +1225,6 @@ fn account_status_label_simple(account: &AccountView) -> String {
     } else {
         format!("{prefix}No usage")
     }
-}
-
-fn format_details_line(
-    plan: String,
-    remaining: String,
-    reset: String,
-    marker: Option<&str>,
-) -> String {
-    let mut parts = vec![plan];
-    if !remaining.is_empty() {
-        parts.push(remaining);
-    }
-    if !reset.is_empty() {
-        parts.push(reset);
-    }
-    if let Some(m) = marker {
-        parts.push(m.to_owned());
-    }
-    parts.join("  •  ")
 }
 
 fn format_remaining_percent(percent: u8) -> String {
@@ -1402,28 +1587,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_details_line() {
-        assert_eq!(
-            format_details_line(
-                "Plus".to_owned(),
-                "17% remaining".to_owned(),
-                "Reset: 12/05 00:52".to_owned(),
-                None
-            ),
-            "Plus  •  17% remaining  •  Reset: 12/05 00:52"
-        );
-        assert_eq!(
-            format_details_line(
-                "Free".to_owned(),
-                String::new(),
-                String::new(),
-                Some("[not saved]")
-            ),
-            "Free  •  [not saved]"
-        );
-    }
-
-    #[test]
     fn remaining_percent_uses_fixed_width_visual_slot() {
         assert_eq!(format_remaining_percent(2), "\u{2007}\u{2007}2");
         assert_eq!(format_remaining_percent(89), "\u{2007}89");
@@ -1565,5 +1728,72 @@ mod tests {
 
         assert!(find_active_tray_account(Some(&matching_identity), None, &accounts).is_some());
         assert!(find_active_tray_account(Some(&mismatched_identity), None, &accounts).is_none());
+    }
+
+    #[test]
+    fn quota_bar_renders_correct_fill() {
+        assert_eq!(format_quota_bar(100), "[██████] 100%");
+        assert_eq!(format_quota_bar(0), "[░░░░░░] 0%");
+        assert_eq!(format_quota_bar(50), "[███░░░] 50%");
+        assert_eq!(format_quota_bar(83), "[█████░] 83%");
+        assert_eq!(format_quota_bar(17), "[█░░░░░] 17%");
+    }
+
+    #[test]
+    fn status_tag_is_compact() {
+        let base = AccountView {
+            id: Uuid::new_v4(),
+            email: "a@b.com".to_owned(),
+            subject: None,
+            name: None,
+            plan_label: None,
+            workspace_id: None,
+            workspace_name: None,
+            environment: EnvironmentKind::Windows,
+            is_active: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: None,
+            usage_error: None,
+            label: None,
+        };
+
+        // No usage → dash
+        assert_eq!(account_status_tag(&base), "\u{2014}");
+
+        // With healthy usage → Ready
+        let ready = AccountView {
+            usage: Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: None,
+                weekly: Some(UsageWindowView {
+                    used_percent: 20,
+                    remaining_percent: 80,
+                    reset_at: OffsetDateTime::now_utc() + time::Duration::days(3),
+                }),
+                credits: None,
+            }),
+            ..base.clone()
+        };
+        assert_eq!(account_status_tag(&ready), "Ready");
+
+        // Low quota → Low
+        let low = AccountView {
+            usage: Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: Some(UsageWindowView {
+                    used_percent: 95,
+                    remaining_percent: 5,
+                    reset_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                }),
+                weekly: None,
+                credits: None,
+            }),
+            ..base.clone()
+        };
+        assert_eq!(account_status_tag(&low), "Low");
     }
 }

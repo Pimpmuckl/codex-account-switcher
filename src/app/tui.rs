@@ -45,6 +45,8 @@ where
                 && self.auto_switch_on_limit_status()?.enabled;
             let launch_at_startup_enabled = matches!(mode, InteractiveMode::Persistent)
                 && self.launch_at_startup_status()?.enabled;
+            let show_quota_in_menu_bar_enabled = matches!(mode, InteractiveMode::Persistent)
+                && self.show_quota_in_menu_bar_status()?.enabled;
 
             let menu = build_menu(
                 mode,
@@ -54,6 +56,7 @@ where
                 auto_start_usage_windows_enabled,
                 auto_switch_on_limit_enabled,
                 launch_at_startup_enabled,
+                show_quota_in_menu_bar_enabled,
             );
             let selection = match mode {
                 InteractiveMode::Persistent => {
@@ -353,6 +356,23 @@ where
                         }
                     }
                 }
+                InteractiveAction::SetShowQuotaInMenuBar(enabled) => {
+                    match self.set_show_quota_in_menu_bar(enabled) {
+                        Ok(output) => feedback.push(format!(
+                            "Show quota in menu bar {}.",
+                            if output.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        )),
+                        Err(error) => {
+                            feedback =
+                                error_feedback("Updating show quota in menu bar failed.", error);
+                            continue;
+                        }
+                    }
+                }
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
                 InteractiveAction::SendToTray => return Ok(InteractiveExit::SendToTray),
                 InteractiveAction::Quit => break,
@@ -362,7 +382,7 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InteractiveAction {
     SaveCurrent,
     Activate(Uuid),
@@ -375,6 +395,7 @@ pub(crate) enum InteractiveAction {
     SetAutoStartUsageWindows(bool),
     SetAutoSwitchOnLimit(bool),
     SetLaunchAtStartup(bool),
+    SetShowQuotaInMenuBar(bool),
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     SendToTray,
     Quit,
@@ -403,6 +424,9 @@ pub(crate) struct InteractiveMenu {
     pub(crate) process_warning_count: usize,
     pub(crate) current_status_label: Option<String>,
     pub(crate) current_status_tone: MenuLabelTone,
+    pub(crate) active_count: usize,
+    pub(crate) depleted_count: usize,
+    pub(crate) login_count: usize,
     pub(crate) accounts: Vec<InteractiveItem>,
     pub(crate) actions: Vec<InteractiveItem>,
 }
@@ -660,6 +684,7 @@ fn account_display_name(account: &AccountView) -> String {
     format!("{}{}{}", account.email, label, workspace)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_menu(
     mode: InteractiveMode,
     status: &StatusOutput,
@@ -668,6 +693,7 @@ pub(crate) fn build_menu(
     auto_start_usage_windows_enabled: bool,
     auto_switch_on_limit_enabled: bool,
     launch_at_startup_enabled: bool,
+    show_quota_in_menu_bar_enabled: bool,
 ) -> InteractiveMenu {
     let active_account = current_saved
         .and_then(|saved_id| list.accounts.iter().find(|account| account.id == saved_id));
@@ -681,14 +707,17 @@ pub(crate) fn build_menu(
     }
     let widths = account_label_widths(&label_accounts);
 
-    let mut accounts = Vec::new();
+    let mut active_accounts = Vec::new();
+    let mut depleted_accounts = Vec::new();
+    let mut login_accounts = Vec::new();
+
     for account in list.accounts.iter().filter(|account| {
         !matches!(
             mode,
             InteractiveMode::Persistent | InteractiveMode::ActivateOnce
         ) || !account.is_active
     }) {
-        accounts.push(InteractiveItem {
+        let item = InteractiveItem {
             label: render_account_label(account, widths),
             action: match mode {
                 InteractiveMode::Persistent | InteractiveMode::ActivateOnce => {
@@ -697,8 +726,30 @@ pub(crate) fn build_menu(
                 InteractiveMode::DeleteOnce => InteractiveAction::Delete(account.id),
             },
             tone: account_menu_tone(account),
-        });
+        };
+
+        let needs_login = account
+            .usage_error
+            .as_deref()
+            .is_some_and(usage_error_requires_login);
+        if needs_login {
+            login_accounts.push(item);
+        } else if let Some(usage) = &account.usage
+            && usage.is_out_of_quota(OffsetDateTime::now_utc())
+        {
+            depleted_accounts.push(item);
+        } else {
+            active_accounts.push(item);
+        }
     }
+
+    let active_count = active_accounts.len();
+    let depleted_count = depleted_accounts.len();
+    let login_count = login_accounts.len();
+
+    let mut accounts = active_accounts;
+    accounts.extend(depleted_accounts);
+    accounts.extend(login_accounts);
 
     let mut actions = Vec::new();
     let current_status_tone = active_account
@@ -800,6 +851,15 @@ pub(crate) fn build_menu(
             tone: MenuLabelTone::Normal,
         });
         actions.push(InteractiveItem {
+            label: if show_quota_in_menu_bar_enabled {
+                "Disable show quota in menu bar".to_owned()
+            } else {
+                "Enable show quota in menu bar".to_owned()
+            },
+            action: InteractiveAction::SetShowQuotaInMenuBar(!show_quota_in_menu_bar_enabled),
+            tone: MenuLabelTone::Normal,
+        });
+        actions.push(InteractiveItem {
             label: "Show status".to_owned(),
             action: InteractiveAction::ShowStatus,
             tone: MenuLabelTone::Normal,
@@ -833,6 +893,9 @@ pub(crate) fn build_menu(
         process_warning_count: status.process_warnings.len(),
         current_status_label,
         current_status_tone,
+        active_count,
+        depleted_count,
+        login_count,
         accounts,
         actions,
     }
@@ -951,10 +1014,41 @@ fn render_persistent_menu(
         term.write_line(&style("  (no saved accounts)").dim().to_string())?;
         lines += 1;
     } else {
-        for index in 0..menu.accounts.len() {
-            row_lines.push(lines);
-            term.write_line(&render_menu_row(menu, selection, index))?;
+        let mut index = 0;
+        if menu.active_count > 0 {
+            term.write_line(&style("  Active (Còn token)").magenta().bold().to_string())?;
             lines += 1;
+            for _ in 0..menu.active_count {
+                row_lines.push(lines);
+                term.write_line(&render_menu_row(menu, selection, index))?;
+                lines += 1;
+                index += 1;
+            }
+        }
+        if menu.depleted_count > 0 {
+            term.write_line(&style("  Depleted (Hết token)").magenta().bold().to_string())?;
+            lines += 1;
+            for _ in 0..menu.depleted_count {
+                row_lines.push(lines);
+                term.write_line(&render_menu_row(menu, selection, index))?;
+                lines += 1;
+                index += 1;
+            }
+        }
+        if menu.login_count > 0 {
+            term.write_line(
+                &style("  Login Required (Cần login lại)")
+                    .magenta()
+                    .bold()
+                    .to_string(),
+            )?;
+            lines += 1;
+            for _ in 0..menu.login_count {
+                row_lines.push(lines);
+                term.write_line(&render_menu_row(menu, selection, index))?;
+                lines += 1;
+                index += 1;
+            }
         }
     }
     term.write_line(&render_section_heading("Actions"))?;
@@ -1575,6 +1669,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert_eq!(menu.prompt, "");
         assert_eq!(menu.accounts.len(), 0);
@@ -1590,6 +1685,7 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, true),
             Some(id),
+            false,
             false,
             false,
             false,
@@ -1609,6 +1705,7 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, false),
             Some(id),
+            false,
             false,
             false,
             false,
@@ -1632,6 +1729,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let disabled_toggle = disabled_menu
             .actions
@@ -1649,6 +1747,7 @@ mod tests {
             &sample_list(id, false),
             Some(id),
             true,
+            false,
             false,
             false,
         );
@@ -1689,6 +1788,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert_eq!(jump_section(&menu, 0), 1);
         assert_eq!(jump_section(&menu, 1), 0);
@@ -1702,6 +1802,7 @@ mod tests {
             &sample_status(Some(id)),
             &sample_list(id, true),
             Some(id),
+            false,
             false,
             false,
             false,
@@ -1744,6 +1845,7 @@ mod tests {
             &status,
             &sample_list(id, false),
             None,
+            false,
             false,
             false,
             false,
@@ -1806,8 +1908,102 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert_eq!(menu.accounts.len(), 1);
         assert!(menu.actions.iter().any(|item| item.label == "Show status"));
+    }
+
+    #[test]
+    fn build_menu_groups_accounts_correctly() {
+        let status = sample_status(None);
+        let id_active = Uuid::new_v4();
+        let id_depleted = Uuid::new_v4();
+        let id_login = Uuid::new_v4();
+
+        // 1. Active account: normal usage, no error
+        let acc_active = AccountView {
+            id: id_active,
+            email: "active@example.com".to_owned(),
+            subject: Some("sub-1".to_owned()),
+            name: Some("Active".to_owned()),
+            plan_label: Some("Pro".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
+            environment: EnvironmentKind::Windows,
+            is_active: false,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            last_activated_at: None,
+            usage: Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                five_hour: None,
+                weekly: Some(UsageWindowView {
+                    used_percent: 50,
+                    remaining_percent: 50,
+                    reset_at: OffsetDateTime::now_utc() + time::Duration::days(1),
+                }),
+                credits: None,
+            }),
+            usage_error: None,
+            label: None,
+        };
+
+        // 2. Depleted account: 0% quota remaining
+        let mut acc_depleted = acc_active.clone();
+        acc_depleted.id = id_depleted;
+        acc_depleted.email = "depleted@example.com".to_owned();
+        acc_depleted.usage = Some(AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+            five_hour: None,
+            weekly: Some(UsageWindowView {
+                used_percent: 100,
+                remaining_percent: 0,
+                reset_at: OffsetDateTime::now_utc() + time::Duration::days(1),
+            }),
+            credits: None,
+        });
+
+        // 3. Login required account
+        let mut acc_login = acc_active.clone();
+        acc_login.id = id_login;
+        acc_login.email = "login@example.com".to_owned();
+        acc_login.usage_error = Some("Login required: Codex auth expired.".to_owned());
+
+        let list = ListOutput {
+            environment: EnvironmentKind::Windows,
+            accounts: vec![acc_active, acc_depleted, acc_login],
+        };
+
+        let menu = build_menu(
+            InteractiveMode::Persistent,
+            &status,
+            &list,
+            None,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(menu.active_count, 1);
+        assert_eq!(menu.depleted_count, 1);
+        assert_eq!(menu.login_count, 1);
+
+        // Verify order in menu.accounts: Active first, then Depleted, then Login Required
+        assert_eq!(
+            menu.accounts[0].action,
+            InteractiveAction::Activate(id_active)
+        );
+        assert_eq!(
+            menu.accounts[1].action,
+            InteractiveAction::Activate(id_depleted)
+        );
+        assert_eq!(
+            menu.accounts[2].action,
+            InteractiveAction::Activate(id_login)
+        );
     }
 }
