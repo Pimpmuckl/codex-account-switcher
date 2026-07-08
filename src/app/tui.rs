@@ -881,8 +881,8 @@ mod tests {
     use crate::codex::auth_json_fixture;
     use crate::env::AppEnv;
     use crate::model::{
-        AccountUsageView, DisplayIdentity, EnvironmentKind, SnapshotBlob, UsageSource,
-        UsageWindowView,
+        AccountUsageView, AutoStartUsageWindowAccountResult, DisplayIdentity, EnvironmentKind,
+        SnapshotBlob, UsageSource, UsageWindowView,
     };
     use crate::repository::SnapshotRepository;
     use crate::secrets::test_support::MemorySecretStore;
@@ -1102,6 +1102,27 @@ mod tests {
             enabled_toggle.action,
             InteractiveAction::SetAutoStartUsageWindows(false)
         ));
+    }
+
+    #[test]
+    fn auto_start_usage_window_feedback_shows_pinged_status() {
+        let output = AutoStartUsageWindowsRunOutput {
+            enabled: true,
+            checked_accounts: 1,
+            pinged_accounts: vec![AutoStartUsageWindowAccountResult {
+                account_id: Uuid::new_v4(),
+                email: "person@example.com".to_owned(),
+                status: "pinged".to_owned(),
+                detail: None,
+            }],
+            skipped: Vec::new(),
+        };
+
+        assert!(
+            auto_start_usage_window_feedback(&output)
+                .iter()
+                .any(|line| line == "person@example.com: pinged")
+        );
     }
 
     #[test]

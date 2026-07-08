@@ -1,5 +1,9 @@
 use std::fs;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::Sender;
 #[cfg(windows)]
@@ -29,6 +33,8 @@ use crate::usage::{
 use super::App;
 
 pub const AUTO_START_USAGE_WINDOW_POLL_SECONDS: u64 = 300;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const PING_INSTRUCTIONS: &str = "Reply only with ACK.";
 const PING_PROMPT: &str = "ACK";
@@ -157,7 +163,7 @@ where
         let usage = self.usage(Some(account_id))?;
         let now = OffsetDateTime::now_utc();
         let status = match usage.usage.weekly {
-            Some(weekly) if weekly.reset_at > now => "started",
+            Some(weekly) if weekly.reset_at > now => "pinged",
             Some(_) => "unchanged",
             None => "usage_missing",
         };
@@ -373,7 +379,7 @@ fn run_codex_usage_ping_in_temp_home(
     fs::write(&instruction_file, PING_INSTRUCTIONS)
         .with_context(|| format!("failed to write {}", instruction_file.display()))?;
 
-    let mut command = Command::new("codex");
+    let mut command = codex_command();
     command
         .env("CODEX_HOME", &temp_env.codex_root)
         .env("HOME", &temp_env.home_dir)
@@ -507,6 +513,61 @@ fn strip_codex_thread_env(command: &mut Command) {
     }
 }
 
+fn codex_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new(
+            windows_codex_exe()
+                .unwrap_or_else(|| PathBuf::from("codex.cmd"))
+                .as_os_str(),
+        );
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("codex")
+    }
+}
+
+#[cfg(windows)]
+fn windows_codex_exe() -> Option<PathBuf> {
+    windows_codex_exe_in_paths(std::env::split_paths(&std::env::var_os("PATH")?))
+}
+
+#[cfg(windows)]
+fn windows_codex_exe_in_paths(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let package = if cfg!(target_arch = "aarch64") {
+        "codex-win32-arm64"
+    } else {
+        "codex-win32-x64"
+    };
+    let target = if cfg!(target_arch = "aarch64") {
+        "aarch64-pc-windows-msvc"
+    } else {
+        "x86_64-pc-windows-msvc"
+    };
+    paths.into_iter().find_map(|dir| {
+        let direct = dir.join("codex.exe");
+        if direct.is_file() {
+            Some(direct)
+        } else {
+            let npm = dir
+                .join("node_modules")
+                .join("@openai")
+                .join("codex")
+                .join("node_modules")
+                .join("@openai")
+                .join(package)
+                .join("vendor")
+                .join(target)
+                .join("bin")
+                .join("codex.exe");
+            npm.is_file().then_some(npm)
+        }
+    })
+}
+
 fn toml_string_literal(value: &str) -> String {
     let mut literal = String::from("\"");
     for character in value.chars() {
@@ -608,6 +669,18 @@ mod tests {
             Some(previous_reset_at),
             now
         ));
+        assert!(auto_start_check_needs_ping(
+            false,
+            Some(&full_moved_weekly),
+            Some(previous_reset_at),
+            now
+        ));
+        assert!(!auto_start_check_needs_ping(
+            false,
+            Some(&full_moved_weekly),
+            Some(moved_reset_at),
+            now
+        ));
     }
 
     #[test]
@@ -682,6 +755,31 @@ mod tests {
             toml_string_literal(r#"C:\Temp\codex "ping"\instructions.md"#),
             r#""C:\\Temp\\codex \"ping\"\\instructions.md""#
         );
+    }
+
+    #[test]
+    fn codex_command_uses_platform_launcher() {
+        let command = codex_command();
+        let program = command.get_program().to_string_lossy();
+        if cfg!(windows) {
+            assert!(program.ends_with("codex.exe") || program == "codex.cmd");
+        } else {
+            assert_eq!(program, "codex");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_codex_exe_finds_direct_path_exe() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let exe = temp.path().join("codex.exe");
+        fs::write(&exe, "")?;
+
+        assert_eq!(
+            windows_codex_exe_in_paths([temp.path().to_owned()]),
+            Some(exe)
+        );
+        Ok(())
     }
 
     #[test]
