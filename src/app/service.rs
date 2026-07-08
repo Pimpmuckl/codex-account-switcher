@@ -150,11 +150,41 @@ where
         crate::process::detect_running_codex_processes()
     }
 
-    pub fn refresh_saved_usage_cache(&self) -> Result<()> {
+    pub(crate) fn refresh_saved_usage_cache(&self) -> Result<()> {
         let accounts = self.repository.list_accounts()?;
         for account in accounts {
-            let _ = self.usage(Some(account.id));
+            let _ = self.refresh_saved_usage_cache_account(account.id);
         }
+        Ok(())
+    }
+
+    fn refresh_saved_usage_cache_account(&self, account_id: Uuid) -> Result<()> {
+        let (snapshot, _, _) = self.load_activation_target(account_id)?;
+        let target = usage_target_from_snapshot(
+            self.env.kind.clone(),
+            snapshot.clone(),
+            UsageSource::SavedAccessToken,
+            true,
+        )?;
+        let result = fetch_usage(target);
+        let (output, refreshed_snapshot) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.repository.record_usage_error_if_current(
+                    account_id,
+                    &snapshot,
+                    usage_error_message(&error),
+                );
+                return Err(error);
+            }
+        };
+        self.repository.replace_snapshot_if_current(
+            account_id,
+            &snapshot,
+            &output.account,
+            &refreshed_snapshot,
+            Some(output.usage),
+        )?;
         Ok(())
     }
 
