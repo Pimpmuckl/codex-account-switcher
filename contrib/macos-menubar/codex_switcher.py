@@ -340,19 +340,16 @@ exit 1
         if current_email:
             not_saved = " [not saved]" if not current_saved_id else ""
             active_label = f"\u2713  {current_email}{not_saved}"
-            active_item = rumps.MenuItem(active_label)
-            active_item.set_callback(None)
+            active_item = rumps.MenuItem(active_label, callback=lambda _: None)
             self.menu.add(active_item)
 
             # Details: plan + quota bar + reset
             details = _format_account_details(plan, active_acc)
             if details:
-                sub_item = rumps.MenuItem(f"      {details}")
-                sub_item.set_callback(None)
+                sub_item = rumps.MenuItem(f"      {details}", callback=lambda _: None)
                 self.menu.add(sub_item)
         else:
-            ni = rumps.MenuItem("Not logged in")
-            ni.set_callback(None)
+            ni = rumps.MenuItem("Not logged in", callback=lambda _: None)
             self.menu.add(ni)
 
         self.menu.add(None)
@@ -378,8 +375,7 @@ exit 1
                 aid = acc["id"]
                 email = acc["email"]
                 short_email = email.removesuffix("@gmail.com") if email.endswith("@gmail.com") else email
-                tag = _status_tag(acc)
-                label = f"  {short_email} — {tag}"
+                label = f"  {short_email}"
                 item = rumps.MenuItem(
                     label, callback=self._mk(self._switch, aid, email)
                 )
@@ -389,8 +385,7 @@ exit 1
                 acc_plan = acc.get("plan_label", "")
                 details = _format_account_details(acc_plan, acc)
                 if details:
-                    sub_item = rumps.MenuItem(f"      {details}")
-                    sub_item.set_callback(None)
+                    sub_item = rumps.MenuItem(f"      {details}", callback=lambda _: None)
                     self.menu.add(sub_item)
 
             if active_group:
@@ -420,8 +415,7 @@ exit 1
                 for acc in login_group:
                     add_acc(acc)
         else:
-            empty = rumps.MenuItem("  (no saved accounts)")
-            empty.set_callback(None)
+            empty = rumps.MenuItem("  (no saved accounts)", callback=lambda _: None)
             self.menu.add(empty)
 
         self.menu.add(None)

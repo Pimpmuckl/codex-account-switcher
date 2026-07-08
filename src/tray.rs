@@ -720,7 +720,7 @@ where
             let suffix = if not_saved { "  [not saved]" } else { "" };
             menu.append(&MenuItem::new(
                 format!("\u{2713} {name}{suffix}"),
-                false,
+                true,
                 None,
             ))?;
 
@@ -744,7 +744,7 @@ where
                 } else {
                     menu.append(&MenuItem::new(
                         format!("    {plan}  •  Login required"),
-                        false,
+                        true,
                         None,
                     ))?;
                 }
@@ -753,16 +753,16 @@ where
                     &plan,
                     active_account.and_then(|a| a.usage.as_ref()),
                 );
-                menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
+                menu.append(&MenuItem::new(format!("    {details}"), true, None))?;
             }
         } else {
-            menu.append(&MenuItem::new("Not logged in", false, None))?;
+            menu.append(&MenuItem::new("Not logged in", true, None))?;
         }
         menu.append(&PredefinedMenuItem::separator())?;
 
         // ── Saved accounts (switch targets) ─────────────────────
         if saved_accounts.is_empty() {
-            menu.append(&MenuItem::new("  No saved accounts", false, None))?;
+            menu.append(&MenuItem::new("  No saved accounts", true, None))?;
         } else {
             let mut active_group = Vec::new();
             let mut depleted_group = Vec::new();
@@ -1006,10 +1006,9 @@ fn append_tray_account_item(
 ) -> Result<()> {
     let id = format!("activate:{}", account.id);
     let is_active = Some(account.id) == active_account_id || account.is_active;
-    let status_tag = account_status_tag(account);
-    let label = format!("  {} — {}", account_display_name(account), status_tag);
+    let label = format!("  {}", account_display_name(account));
     if is_active {
-        menu.append(&MenuItem::new(label, false, None))?;
+        menu.append(&MenuItem::new(label, true, None))?;
     } else {
         let item = MenuItem::with_id(MenuId::new(&id), label, true, None);
         menu.append(&item)?;
@@ -1034,7 +1033,7 @@ fn append_tray_account_item(
         commands.insert(login_id, TrayCommand::Login(account.id));
     } else {
         let details = format_account_details_line(&plan, account.usage.as_ref());
-        menu.append(&MenuItem::new(format!("    {details}"), false, None))?;
+        menu.append(&MenuItem::new(format!("    {details}"), true, None))?;
     }
     Ok(())
 }
@@ -1175,6 +1174,7 @@ fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
 }
 
 /// Compact status tag for saved account list: Ready / Low / Depleted / Login / Stale
+#[allow(dead_code)]
 fn account_status_tag(account: &AccountView) -> String {
     if account
         .usage_error

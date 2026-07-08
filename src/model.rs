@@ -78,7 +78,11 @@ impl DisplayIdentity {
     pub fn workspace_label(&self) -> Option<&str> {
         self.workspace_name
             .as_deref()
-            .or(self.workspace_id.as_deref())
+            .or_else(|| {
+                self.workspace_id
+                    .as_deref()
+                    .filter(|id| Uuid::parse_str(id).is_err())
+            })
     }
 }
 
@@ -175,7 +179,11 @@ impl AccountView {
     pub fn workspace_label(&self) -> Option<&str> {
         self.workspace_name
             .as_deref()
-            .or(self.workspace_id.as_deref())
+            .or_else(|| {
+                self.workspace_id
+                    .as_deref()
+                    .filter(|id| Uuid::parse_str(id).is_err())
+            })
     }
 }
 
@@ -215,6 +223,11 @@ pub struct AutoSwitchOnLimitStatusOutput {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LaunchAtStartupStatusOutput {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ShowQuotaInMenuBarStatusOutput {
     pub enabled: bool,
 }
 
