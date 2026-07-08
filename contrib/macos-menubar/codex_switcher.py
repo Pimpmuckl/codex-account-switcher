@@ -51,12 +51,98 @@ def format_reset_time(reset_at_arr, is_weekly=False):
         year, yday, hour, minute, second = reset_at_arr[0], reset_at_arr[1], reset_at_arr[2], reset_at_arr[3], reset_at_arr[4]
         dt = datetime.datetime(year, 1, 1) + datetime.timedelta(days=yday, hours=hour, minutes=minute, seconds=second)
         if is_weekly:
-            return dt.strftime("%d/%m/%Y")
+            # Show both date and clock time for weekly reset as well.
+            # Example: "Jul 7, 7:27 PM"
+            return dt.strftime("%b %-d, %-I:%M %p")
         else:
-            return dt.strftime("%H:%M")
+            return dt.strftime("%-I:%M %p")
     except Exception:
         return ""
 
+
+def format_quota_bar(percent):
+    """Build a compact quota bar: [██████░░] 75%"""
+    bar_width = 6
+    filled = round(percent * bar_width / 100)
+    empty = bar_width - filled
+    return f"[{'█' * filled}{'░' * empty}] {percent}%"
+
+
+def _get_bottleneck_window(usage):
+    """Return the window with lowest remaining_percent that hasn't reset yet."""
+    if not usage:
+        return None
+    import time as _time
+    now = _time.time()
+    candidates = []
+    for key in ("five_hour", "weekly"):
+        w = usage.get(key)
+        if not w:
+            continue
+        rem = w.get("remaining_percent")
+        if rem is None:
+            continue
+        # reset_at is array [year, day_of_year, hour, minute, second]
+        reset_at = w.get("reset_at")
+        if reset_at and len(reset_at) >= 5:
+            try:
+                dt = datetime.datetime(reset_at[0], 1, 1) + datetime.timedelta(
+                    days=reset_at[1], hours=reset_at[2], minutes=reset_at[3], seconds=reset_at[4]
+                )
+                if dt.timestamp() <= now:
+                    continue  # past reset
+            except Exception:
+                pass
+        candidates.append((rem, w, key))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0]  # (remaining_percent, window_dict, key)
+
+
+def _format_account_details(plan_label, acc):
+    """Build compact details line: Plan  •  [████░░░░] 52%  •  ↻ 12/05"""
+    parts = []
+    if plan_label:
+        parts.append(plan_label)
+
+    if acc:
+        err = acc.get("usage_error", "")
+        if err and "login required" in err.lower():
+            parts.append("Login required")
+            return " • ".join(parts)
+
+        usage = acc.get("usage")
+        bottleneck = _get_bottleneck_window(usage)
+        if bottleneck:
+            rem, window, key = bottleneck
+            parts.append(format_quota_bar(rem))
+            reset_str = format_reset_time(window.get("reset_at"), is_weekly=(key == "weekly"))
+            if reset_str:
+                parts.append(f"↻ {reset_str}")
+
+    return " • ".join(parts) if parts else ""
+
+
+def _status_tag(acc):
+    """Compact status tag: Ready / Low / Depleted / Login / Stale / —"""
+    err = acc.get("usage_error", "")
+    if err and "login required" in err.lower():
+        return "Login"
+    usage = acc.get("usage")
+    if usage:
+        bottleneck = _get_bottleneck_window(usage)
+        if bottleneck:
+            rem = bottleneck[0]
+            if rem == 0:
+                return "Depleted"
+            if rem <= 10:
+                return "Low"
+            return "Ready"
+        return "Ready"
+    if err:
+        return "Stale"
+    return "—"
 
 
 def notify(title, subtitle, message):
@@ -227,6 +313,7 @@ exit 1
 
         # Current account
         current_email = None
+        plan = ""
         if status and status.get("current_account"):
             current_email = status["current_account"].get("email", "?")
             plan = status["current_account"].get("plan_label", "")
@@ -237,121 +324,101 @@ exit 1
         else:
             self.title = "" if self.icon is not None else "⚡ Codex"
 
-        # Helpers for compact labels
-        def format_email(email):
-            if not email:
-                return ""
-            if email.endswith("@gmail.com"):
-                return email[:-10]
-            return email
-
-        def get_clean_usage_str(acc):
-            usage = acc.get("usage")
-            if not usage:
-                err = acc.get("usage_error", "")
-                if err and "login required" in err.lower():
-                    return " • login required"
-                return ""
-            parts = []
-            five_hour = usage.get("five_hour")
-            if five_hour:
-                fh_rem = five_hour.get("remaining_percent", "?")
-                fh_str = ""
-                if fh_rem != "?":
-                    if fh_rem < 100:
-                        fh_str = f"5h {fh_rem}%"
-                        if fh_rem <= 20:
-                            fh_reset = format_reset_time(five_hour.get("reset_at"), is_weekly=False)
-                            if fh_reset:
-                                fh_str += f"@{fh_reset}"
-                else:
-                    fh_str = "5h ?"
-                if fh_str:
-                    parts.append(fh_str)
-
-            weekly = usage.get("weekly")
-            if weekly:
-                w_rem = weekly.get("remaining_percent", "?")
-                w_str = ""
-                if w_rem != "?":
-                    if w_rem < 100:
-                        w_str = f"W {w_rem}%"
-                        if w_rem <= 20:
-                            w_reset = format_reset_time(weekly.get("reset_at"), is_weekly=True)
-                            if w_reset:
-                                w_str += f"@{w_reset}"
-                else:
-                    w_str = "W ?"
-                if w_str:
-                    parts.append(w_str)
-
-            if parts:
-                return " • " + " • ".join(parts)
-            return ""
-
-        # Active account display
         accounts = account_list.get("accounts", []) if account_list else []
-        active_usage_str = ""
         current_saved_id = status.get("current_account_saved_id") if status else None
 
-        # Extract active account's usage and exclude it from the inactive switcher list
+        # Find active account and build other_accounts list
+        active_acc = None
         other_accounts = []
         for acc in accounts:
             if acc["email"] == current_email or acc.get("is_active", False) or (current_saved_id and acc["id"] == current_saved_id):
-                active_usage_str = get_clean_usage_str(acc)
+                active_acc = acc
             else:
                 other_accounts.append(acc)
 
+        # ── Active account ──────────────────────────────────
         if current_email:
-            display_email = format_email(current_email)
-            plan_str = f" ({plan})" if plan else ""
-            active_label = f"✅  {display_email}{plan_str}"
-            if not current_saved_id:
-                active_label += " (not saved)"
+            not_saved = " [not saved]" if not current_saved_id else ""
+            active_label = f"\u2713  {current_email}{not_saved}"
             active_item = rumps.MenuItem(active_label)
             active_item.set_callback(None)
             self.menu.add(active_item)
-            
-            # Sub-label for active usage if exists
-            if active_usage_str:
-                sub_label = "      " + active_usage_str.replace(" • ", "", 1).strip()
-                sub_item = rumps.MenuItem(sub_label)
+
+            # Details: plan + quota bar + reset
+            details = _format_account_details(plan, active_acc)
+            if details:
+                sub_item = rumps.MenuItem(f"      {details}")
                 sub_item.set_callback(None)
                 self.menu.add(sub_item)
         else:
-            ni = rumps.MenuItem("  ⚠️  Not logged in")
+            ni = rumps.MenuItem("Not logged in")
             ni.set_callback(None)
             self.menu.add(ni)
 
         self.menu.add(None)
 
-        # Saved accounts header
-        saved_header = rumps.MenuItem("Switch to:")
-        saved_header.set_callback(None)
-        self.menu.add(saved_header)
-
+        # ── Saved accounts (switch targets) ─────────────────
         if other_accounts:
+            active_group = []
+            depleted_group = []
+            login_group = []
+
             for acc in other_accounts:
+                tag = _status_tag(acc)
+                if tag == "Login":
+                    login_group.append(acc)
+                elif tag == "Depleted":
+                    depleted_group.append(acc)
+                else:
+                    active_group.append(acc)
+
+            first_group = True
+
+            def add_acc(acc):
                 aid = acc["id"]
                 email = acc["email"]
-                plan_lbl = acc.get("plan_label", "")
-                
-                display_email = format_email(email)
-                plan_str = f" ({plan_lbl})" if plan_lbl else ""
-                
-                label = f"  ○  {display_email}{plan_str}"
+                short_email = email.removesuffix("@gmail.com") if email.endswith("@gmail.com") else email
+                tag = _status_tag(acc)
+                label = f"  {short_email} — {tag}"
                 item = rumps.MenuItem(
                     label, callback=self._mk(self._switch, aid, email)
                 )
                 self.menu.add(item)
-                
-                # Sub-label for inactive usage if exists
-                usage_str = get_clean_usage_str(acc)
-                if usage_str:
-                    sub_label = "      " + usage_str.replace(" • ", "", 1).strip()
-                    sub_item = rumps.MenuItem(sub_label)
+
+                # Details line
+                acc_plan = acc.get("plan_label", "")
+                details = _format_account_details(acc_plan, acc)
+                if details:
+                    sub_item = rumps.MenuItem(f"      {details}")
                     sub_item.set_callback(None)
                     self.menu.add(sub_item)
+
+            if active_group:
+                if not first_group:
+                    self.menu.add(None)
+                first_group = False
+                header = rumps.MenuItem("🟢 Active (Còn token)", callback=lambda _: None)
+                self.menu.add(header)
+                for acc in active_group:
+                    add_acc(acc)
+
+            if depleted_group:
+                if not first_group:
+                    self.menu.add(None)
+                first_group = False
+                header = rumps.MenuItem("🔴 Depleted (Hết token)", callback=lambda _: None)
+                self.menu.add(header)
+                for acc in depleted_group:
+                    add_acc(acc)
+
+            if login_group:
+                if not first_group:
+                    self.menu.add(None)
+                first_group = False
+                header = rumps.MenuItem("⚠️ Login Required (Cần login lại)", callback=lambda _: None)
+                self.menu.add(header)
+                for acc in login_group:
+                    add_acc(acc)
         else:
             empty = rumps.MenuItem("  (no saved accounts)")
             empty.set_callback(None)
@@ -359,16 +426,19 @@ exit 1
 
         self.menu.add(None)
 
-        # Actions
+        # ── Actions ─────────────────────────────────────────
         self.menu.add(rumps.MenuItem(
-            "💾  Save Current Account", callback=self._on_save
+            "⚡ Best Quota", callback=self._on_pick_best
         ))
         self.menu.add(rumps.MenuItem(
-            "🔑  Add New Account…", callback=self._on_add
+            "💾 Save Current", callback=self._on_save
+        ))
+        self.menu.add(rumps.MenuItem(
+            "➕ Add Account…", callback=self._on_add
         ))
 
         if accounts:
-            del_sub = rumps.MenuItem("🗑  Delete Account")
+            del_sub = rumps.MenuItem("🗑 Delete Account")
             for acc in accounts:
                 del_sub.add(rumps.MenuItem(
                     acc["email"],
@@ -377,7 +447,9 @@ exit 1
             self.menu.add(del_sub)
 
         self.menu.add(None)
-        self.menu.add(rumps.MenuItem("🔄  Refresh", callback=self._on_refresh))
+
+        # ── System ──────────────────────────────────────────
+        self.menu.add(rumps.MenuItem("🔄 Refresh", callback=self._on_refresh))
         self.menu.add(rumps.MenuItem("Quit", callback=self._on_quit))
 
     def _mk(self, fn, *args):
@@ -406,6 +478,15 @@ exit 1
         ok, msg = cli_run("save")
         if ok:
             notify("Codex Switcher", "💾 Saved", msg)
+        else:
+            notify("Codex Switcher", "❌ Error", msg[:100])
+        self._refresh_menu()
+
+    def _on_pick_best(self, _):
+        notify("Codex Switcher", "⏳ Finding best quota…", "")
+        ok, msg = cli_run("pick-best", "--relaunch")
+        if ok:
+            notify("Codex Switcher", "⚡ Best Quota", msg[:100])
         else:
             notify("Codex Switcher", "❌ Error", msg[:100])
         self._refresh_menu()

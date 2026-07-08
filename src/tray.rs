@@ -791,7 +791,7 @@ where
                     menu.append(&PredefinedMenuItem::separator())?;
                 }
                 first_group = false;
-                menu.append(&MenuItem::new("  Active (Còn token)", false, None))?;
+                menu.append(&MenuItem::new("🟢 Active (Còn token)", true, None))?;
                 for account in active_group {
                     append_tray_account_item(
                         &menu,
@@ -807,7 +807,7 @@ where
                     menu.append(&PredefinedMenuItem::separator())?;
                 }
                 first_group = false;
-                menu.append(&MenuItem::new("  Depleted (Hết token)", false, None))?;
+                menu.append(&MenuItem::new("🔴 Depleted (Hết token)", true, None))?;
                 for account in depleted_group {
                     append_tray_account_item(
                         &menu,
@@ -823,8 +823,8 @@ where
                     menu.append(&PredefinedMenuItem::separator())?;
                 }
                 menu.append(&MenuItem::new(
-                    "  Login Required (Cần login lại)",
-                    false,
+                    "⚠️ Login Required (Cần login lại)",
+                    true,
                     None,
                 ))?;
                 for account in login_group {
