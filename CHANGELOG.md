@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.8 - 2026-07-08
+
+### Fixed
+
+- Run auto-start usage-window pings through a hidden native Codex launcher on Windows so tray mode does not flash a console window.
+- Preserve direct `codex.exe` installs on `PATH` while bypassing npm `.cmd` shims when a bundled native executable is available.
+- Report successful auto-start pings as `pinged` in CLI and TUI feedback.
+- Keep moved-forward `100%` weekly reset timestamps eligible for auto-start pinging.
+
 ## v0.1.7 - 2026-06-29
 
 ### Fixed
