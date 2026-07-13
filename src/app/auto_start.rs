@@ -92,6 +92,9 @@ where
             let (snapshot, _, _) = match self.load_activation_target(account.id) {
                 Ok(target) => target,
                 Err(error) => {
+                    let _ = self
+                        .repository
+                        .record_usage_error(account.id, usage_error_message(&error));
                     output
                         .skipped
                         .push(format!("{}: usage unavailable: {error:#}", account.email));
