@@ -83,7 +83,7 @@ where
         let now = OffsetDateTime::now_utc();
         let mut due_accounts = Vec::new();
         for account in &accounts {
-            if !auto_start_check_needs_usage_refresh(account, now) {
+            if !auto_start_check_needs_usage_refresh(account) {
                 continue;
             }
             let cached_weekly = cached_weekly_window(account);
@@ -268,21 +268,11 @@ fn cached_weekly_window(account: &SavedAccountMetadata) -> Option<&UsageWindowVi
     account.cached_usage.as_ref()?.weekly.as_ref()
 }
 
-fn auto_start_check_needs_usage_refresh(
-    account: &SavedAccountMetadata,
-    now: OffsetDateTime,
-) -> bool {
-    if let Some(error) = account.cached_usage_error.as_deref() {
-        return !usage_error_requires_login(error);
-    }
-    match account
-        .cached_usage
-        .as_ref()
-        .and_then(|usage| usage.weekly.as_ref())
-    {
-        Some(weekly) => weekly.reset_at <= now || weekly.remaining_percent == 100,
-        None => true,
-    }
+fn auto_start_check_needs_usage_refresh(account: &SavedAccountMetadata) -> bool {
+    !account
+        .cached_usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
 }
 
 fn auto_start_check_usage_cache(
@@ -721,42 +711,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_start_usage_refresh_prefilter_keeps_only_possible_ping_candidates() {
+    fn auto_start_usage_refresh_polls_every_account_with_usable_auth() {
         let now = OffsetDateTime::now_utc();
 
-        assert!(!auto_start_check_needs_usage_refresh(
-            &saved_account(
-                Some(weekly_usage_with_remaining(now + Duration::days(1), 99)),
-                None
-            ),
-            now
-        ));
-        assert!(auto_start_check_needs_usage_refresh(
-            &saved_account(Some(weekly_usage(now - Duration::minutes(1))), None),
-            now
-        ));
-        assert!(auto_start_check_needs_usage_refresh(
-            &saved_account(Some(weekly_usage(now + Duration::days(7))), None),
-            now
-        ));
-        assert!(auto_start_check_needs_usage_refresh(
-            &saved_account(None, Some("Usage unavailable: timeout".to_owned())),
-            now
-        ));
-        assert!(auto_start_check_needs_usage_refresh(
-            &saved_account(
-                Some(weekly_usage_with_remaining(now + Duration::days(1), 99)),
-                Some("Usage unavailable: timeout".to_owned())
-            ),
-            now
-        ));
-        assert!(!auto_start_check_needs_usage_refresh(
-            &saved_account(
-                Some(weekly_usage(now - Duration::minutes(1))),
-                Some("Login required: Codex auth expired.".to_owned())
-            ),
-            now
-        ));
+        assert!(auto_start_check_needs_usage_refresh(&saved_account(
+            Some(weekly_usage_with_remaining(now + Duration::days(1), 99)),
+            None
+        )));
+        assert!(!auto_start_check_needs_usage_refresh(&saved_account(
+            Some(weekly_usage(now - Duration::minutes(1))),
+            Some("Login required: Codex auth expired.".to_owned())
+        )));
     }
 
     #[test]
