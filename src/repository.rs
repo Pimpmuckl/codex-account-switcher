@@ -163,24 +163,6 @@ where
         Ok(true)
     }
 
-    pub fn replace_snapshot_if_unchanged(
-        &self,
-        expected_account: &SavedAccountMetadata,
-        expected_snapshot: &SnapshotBlob,
-        identity: &DisplayIdentity,
-        snapshot: &SnapshotBlob,
-        usage: Option<AccountUsageView>,
-    ) -> Result<bool> {
-        let _guard = repository_write_lock()?;
-        let (current_account, current_snapshot) =
-            self.load_snapshot_unlocked(expected_account.id)?;
-        if current_account != *expected_account || current_snapshot != *expected_snapshot {
-            return Ok(false);
-        }
-        self.replace_snapshot_unlocked(expected_account.id, identity, snapshot, usage)?;
-        Ok(true)
-    }
-
     fn replace_snapshot_unlocked(
         &self,
         account_id: Uuid,
@@ -230,29 +212,6 @@ where
             return Ok(false);
         }
         self.record_usage_error_unlocked(account_id, usage_error)?;
-        Ok(true)
-    }
-
-    pub fn record_usage_error_if_unchanged(
-        &self,
-        expected_account: &SavedAccountMetadata,
-        expected_snapshot: Option<&SnapshotBlob>,
-        usage_error: String,
-    ) -> Result<bool> {
-        let _guard = repository_write_lock()?;
-        let current_account = self
-            .get_account_unlocked(expected_account.id)?
-            .ok_or_else(|| anyhow!("saved account {} not found", expected_account.id))?;
-        if current_account != *expected_account {
-            return Ok(false);
-        }
-        if let Some(expected_snapshot) = expected_snapshot {
-            let (_, current_snapshot) = self.load_snapshot_unlocked(expected_account.id)?;
-            if current_snapshot != *expected_snapshot {
-                return Ok(false);
-            }
-        }
-        self.record_usage_error_unlocked(expected_account.id, usage_error)?;
         Ok(true)
     }
 
@@ -1040,29 +999,6 @@ mod tests {
             .save_snapshot(&first_identity, &first_snapshot)
             .expect("save")
             .0;
-
-        repo.record_usage_error(saved.id, "Usage unavailable".to_owned())
-            .expect("record concurrent usage error");
-        assert!(
-            !repo
-                .replace_snapshot_if_unchanged(
-                    &saved,
-                    &first_snapshot,
-                    &second_identity,
-                    &second_snapshot,
-                    None,
-                )
-                .expect("conditional metadata replace")
-        );
-        assert!(
-            !repo
-                .record_usage_error_if_unchanged(
-                    &saved,
-                    Some(&first_snapshot),
-                    "Login required".to_owned(),
-                )
-                .expect("conditional metadata error")
-        );
 
         assert!(
             repo.replace_snapshot_if_current(

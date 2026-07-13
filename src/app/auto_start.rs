@@ -92,11 +92,6 @@ where
             let (snapshot, _, _) = match self.load_activation_target(account.id) {
                 Ok(target) => target,
                 Err(error) => {
-                    let _ = self.repository.record_usage_error_if_unchanged(
-                        account,
-                        None,
-                        usage_error_message(&error),
-                    );
                     output
                         .skipped
                         .push(format!("{}: usage unavailable: {error:#}", account.email));
@@ -111,8 +106,8 @@ where
                         previous_reset_at,
                         now,
                     );
-                    let replaced = self.repository.replace_snapshot_if_unchanged(
-                        account,
+                    let replaced = self.repository.replace_snapshot_if_current(
+                        account.id,
                         &snapshot,
                         &usage.account,
                         &refreshed_snapshot,
@@ -133,9 +128,9 @@ where
                     }
                 }
                 Err(error) => {
-                    let _ = self.repository.record_usage_error_if_unchanged(
-                        account,
-                        Some(&snapshot),
+                    let _ = self.repository.record_usage_error_if_current(
+                        account.id,
+                        &snapshot,
                         usage_error_message(&error),
                     );
                     output
