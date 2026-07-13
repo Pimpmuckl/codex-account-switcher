@@ -89,7 +89,16 @@ where
             let cached_weekly = cached_weekly_window(account);
             let cached_due = cached_weekly.is_some_and(|weekly| weekly.reset_at <= now);
             let previous_reset_at = cached_weekly.map(|weekly| weekly.reset_at);
-            match self.fetch_usage_for_auto_start_check(account.id) {
+            let (snapshot, _, _) = match self.load_activation_target(account.id) {
+                Ok(target) => target,
+                Err(error) => {
+                    output
+                        .skipped
+                        .push(format!("{}: usage unavailable: {error:#}", account.email));
+                    continue;
+                }
+            };
+            match self.fetch_usage_for_auto_start_check(snapshot.clone()) {
                 Ok((usage, refreshed_snapshot)) => {
                     let needs_ping = auto_start_check_needs_ping(
                         cached_due,
@@ -97,25 +106,33 @@ where
                         previous_reset_at,
                         now,
                     );
-                    if let Err(error) = self.repository.replace_snapshot(
+                    let replaced = self.repository.replace_snapshot_if_current(
                         account.id,
+                        &snapshot,
                         &usage.account,
                         &refreshed_snapshot,
                         auto_start_check_usage_cache(account, &usage.usage, needs_ping),
-                    ) {
-                        output
-                            .skipped
-                            .push(format!("{}: usage unavailable: {error:#}", account.email));
-                        continue;
+                    );
+                    match replaced {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            output
+                                .skipped
+                                .push(format!("{}: usage unavailable: {error:#}", account.email));
+                            continue;
+                        }
                     }
                     if needs_ping {
                         due_accounts.push((account.id, account.email.clone()));
                     }
                 }
                 Err(error) => {
-                    let _ = self
-                        .repository
-                        .record_usage_error(account.id, usage_error_message(&error));
+                    let _ = self.repository.record_usage_error_if_current(
+                        account.id,
+                        &snapshot,
+                        usage_error_message(&error),
+                    );
                     output
                         .skipped
                         .push(format!("{}: usage unavailable: {error:#}", account.email));
@@ -180,9 +197,8 @@ where
 
     fn fetch_usage_for_auto_start_check(
         &self,
-        account_id: Uuid,
+        snapshot: SnapshotBlob,
     ) -> Result<(UsageOutput, SnapshotBlob)> {
-        let (snapshot, _, _) = self.load_activation_target(account_id)?;
         let target = usage_target_from_snapshot(
             self.env.kind.clone(),
             snapshot,
