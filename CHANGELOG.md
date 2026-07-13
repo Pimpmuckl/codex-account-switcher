@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.10 - 2026-07-13
+
+### Fixed
+
+- Refresh partially consumed weekly usage windows during the five-minute auto-start check so externally reset limits are detected promptly.
+- Guard background usage results against overwriting a saved account whose auth snapshot changed during the request.
+
 ## v0.1.9 - 2026-07-08
 
 ### Fixed

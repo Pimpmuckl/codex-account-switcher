@@ -69,13 +69,13 @@ Tagged releases publish prebuilt archives plus installer scripts on GitHub Relea
 - Windows: Install prebuilt binaries via PowerShell script
 
 ```text
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.9/codex-account-switcher-installer.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.10/codex-account-switcher-installer.ps1 | iex"
 ```
 
 - macOS / Linux / WSL: Install prebuilt binaries via shell script
 
 ```text
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.9/codex-account-switcher-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Pimpmuckl/codex-account-switcher/releases/download/v0.1.10/codex-account-switcher-installer.sh | sh
 ```
 
 Default installer location:
@@ -98,7 +98,7 @@ Release automation lives in:
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 
-To cut a release, bump `Cargo.toml` to the target version and push a matching tag like `v0.1.9`.
+To cut a release, bump `Cargo.toml` to the target version and push a matching tag like `v0.1.10`.
 
 ## Validation
 
