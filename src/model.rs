@@ -79,7 +79,7 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SavedAccountMetadata {
     pub id: Uuid,
     #[serde(default, deserialize_with = "optional_string")]
@@ -206,7 +206,7 @@ pub struct DeleteOutput {
     pub deleted_account_id: Uuid,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountUsageView {
     pub source: UsageSource,
     pub fetched_at: OffsetDateTime,
@@ -215,21 +215,21 @@ pub struct AccountUsageView {
     pub credits: Option<CreditsView>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UsageWindowView {
     pub used_percent: u8,
     pub remaining_percent: u8,
     pub reset_at: OffsetDateTime,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreditsView {
     pub has_credits: bool,
     pub unlimited: bool,
     pub balance: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageSource {
     LiveAccessToken,
