@@ -83,13 +83,25 @@ where
         let now = OffsetDateTime::now_utc();
         let mut due_accounts = Vec::new();
         for account in &accounts {
-            if !auto_start_check_needs_usage_refresh(account, now) {
+            if !auto_start_check_needs_usage_refresh(account) {
                 continue;
             }
             let cached_weekly = cached_weekly_window(account);
             let cached_due = cached_weekly.is_some_and(|weekly| weekly.reset_at <= now);
             let previous_reset_at = cached_weekly.map(|weekly| weekly.reset_at);
-            match self.fetch_usage_for_auto_start_check(account.id) {
+            let (snapshot, _, _) = match self.load_activation_target(account.id) {
+                Ok(target) => target,
+                Err(error) => {
+                    let _ = self
+                        .repository
+                        .record_usage_error(account.id, usage_error_message(&error));
+                    output
+                        .skipped
+                        .push(format!("{}: usage unavailable: {error:#}", account.email));
+                    continue;
+                }
+            };
+            match self.fetch_usage_for_auto_start_check(snapshot.clone()) {
                 Ok((usage, refreshed_snapshot)) => {
                     let needs_ping = auto_start_check_needs_ping(
                         cached_due,
@@ -97,25 +109,33 @@ where
                         previous_reset_at,
                         now,
                     );
-                    if let Err(error) = self.repository.replace_snapshot(
+                    let replaced = self.repository.replace_snapshot_if_current(
                         account.id,
+                        &snapshot,
                         &usage.account,
                         &refreshed_snapshot,
                         auto_start_check_usage_cache(account, &usage.usage, needs_ping),
-                    ) {
-                        output
-                            .skipped
-                            .push(format!("{}: usage unavailable: {error:#}", account.email));
-                        continue;
+                    );
+                    match replaced {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            output
+                                .skipped
+                                .push(format!("{}: usage unavailable: {error:#}", account.email));
+                            continue;
+                        }
                     }
                     if needs_ping {
                         due_accounts.push((account.id, account.email.clone()));
                     }
                 }
                 Err(error) => {
-                    let _ = self
-                        .repository
-                        .record_usage_error(account.id, usage_error_message(&error));
+                    let _ = self.repository.record_usage_error_if_current(
+                        account.id,
+                        &snapshot,
+                        usage_error_message(&error),
+                    );
                     output
                         .skipped
                         .push(format!("{}: usage unavailable: {error:#}", account.email));
@@ -180,9 +200,8 @@ where
 
     fn fetch_usage_for_auto_start_check(
         &self,
-        account_id: Uuid,
+        snapshot: SnapshotBlob,
     ) -> Result<(UsageOutput, SnapshotBlob)> {
-        let (snapshot, _, _) = self.load_activation_target(account_id)?;
         let target = usage_target_from_snapshot(
             self.env.kind.clone(),
             snapshot,
@@ -268,21 +287,11 @@ fn cached_weekly_window(account: &SavedAccountMetadata) -> Option<&UsageWindowVi
     account.cached_usage.as_ref()?.weekly.as_ref()
 }
 
-fn auto_start_check_needs_usage_refresh(
-    account: &SavedAccountMetadata,
-    now: OffsetDateTime,
-) -> bool {
-    if let Some(error) = account.cached_usage_error.as_deref() {
-        return !usage_error_requires_login(error);
-    }
-    match account
-        .cached_usage
-        .as_ref()
-        .and_then(|usage| usage.weekly.as_ref())
-    {
-        Some(weekly) => weekly.reset_at <= now || weekly.remaining_percent == 100,
-        None => true,
-    }
+fn auto_start_check_needs_usage_refresh(account: &SavedAccountMetadata) -> bool {
+    !account
+        .cached_usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login)
 }
 
 fn auto_start_check_usage_cache(
@@ -721,42 +730,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_start_usage_refresh_prefilter_keeps_only_possible_ping_candidates() {
+    fn auto_start_usage_refresh_polls_every_account_with_usable_auth() {
         let now = OffsetDateTime::now_utc();
 
-        assert!(!auto_start_check_needs_usage_refresh(
-            &saved_account(
-                Some(weekly_usage_with_remaining(now + Duration::days(1), 99)),
-                None
-            ),
-            now
-        ));
-        assert!(auto_start_check_needs_usage_refresh(
-            &saved_account(Some(weekly_usage(now - Duration::minutes(1))), None),
-            now
-        ));
-        assert!(auto_start_check_needs_usage_refresh(
-            &saved_account(Some(weekly_usage(now + Duration::days(7))), None),
-            now
-        ));
-        assert!(auto_start_check_needs_usage_refresh(
-            &saved_account(None, Some("Usage unavailable: timeout".to_owned())),
-            now
-        ));
-        assert!(auto_start_check_needs_usage_refresh(
-            &saved_account(
-                Some(weekly_usage_with_remaining(now + Duration::days(1), 99)),
-                Some("Usage unavailable: timeout".to_owned())
-            ),
-            now
-        ));
-        assert!(!auto_start_check_needs_usage_refresh(
-            &saved_account(
-                Some(weekly_usage(now - Duration::minutes(1))),
-                Some("Login required: Codex auth expired.".to_owned())
-            ),
-            now
-        ));
+        assert!(auto_start_check_needs_usage_refresh(&saved_account(
+            Some(weekly_usage_with_remaining(now + Duration::days(1), 99)),
+            None
+        )));
+        assert!(!auto_start_check_needs_usage_refresh(&saved_account(
+            Some(weekly_usage(now - Duration::minutes(1))),
+            Some("Login required: Codex auth expired.".to_owned())
+        )));
     }
 
     #[test]
