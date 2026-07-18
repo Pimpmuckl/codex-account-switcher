@@ -1043,6 +1043,7 @@ mod tests {
             plan_label: Some("Pro".to_owned()),
             workspace_id: None,
             workspace_name: None,
+            target_app: None,
             secret_key: "snapshot:test".to_owned(),
             created_at: now,
             updated_at: now,

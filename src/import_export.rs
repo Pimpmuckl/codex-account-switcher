@@ -134,6 +134,7 @@ pub fn export_accounts<S: SecretStore>(
             plan_label: account.plan_label.clone(),
             workspace_id: account.workspace_id.clone(),
             workspace_name: account.workspace_name.clone(),
+            target_app: account.target_app.clone(),
             snapshot,
         });
     }
@@ -307,6 +308,7 @@ mod tests {
                 plan_label: Some("Plus".to_owned()),
                 workspace_id: None,
                 workspace_name: None,
+                target_app: None,
                 snapshot,
             }],
         };

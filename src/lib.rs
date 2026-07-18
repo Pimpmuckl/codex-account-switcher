@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod codex;
+pub mod cursor;
 pub mod env;
 pub mod file_store;
 pub mod identity;

@@ -7,12 +7,18 @@ const EXECUTABLE_WIDTH: usize = 12;
 const ROLE_WIDTH: usize = 14;
 
 #[cfg(target_os = "macos")]
+const MACOS_CHATGPT_CLI_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
+#[cfg(target_os = "macos")]
 const MACOS_CODEX_CLI_PATH: &str = "/Applications/Codex.app/Contents/Resources/codex";
 
 /// Resolve the Codex CLI binary. GUI-launched processes often lack shell aliases on PATH.
 pub fn codex_cli_path() -> std::path::PathBuf {
     #[cfg(target_os = "macos")]
     {
+        let chatgpt_path = std::path::PathBuf::from(MACOS_CHATGPT_CLI_PATH);
+        if chatgpt_path.is_file() {
+            return chatgpt_path;
+        }
         let path = std::path::PathBuf::from(MACOS_CODEX_CLI_PATH);
         if path.is_file() {
             return path;
@@ -74,6 +80,54 @@ pub fn detect_switch_blocking_codex_processes() -> Vec<RunningCodexProcess> {
         .collect()
 }
 
+pub fn detect_running_cursor_processes() -> Vec<RunningCodexProcess> {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always)
+            .without_tasks(),
+    );
+    let current_pid = std::process::id();
+    let mut processes = system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            if pid.as_u32() == current_pid {
+                return None;
+            }
+            let name = process.name().to_string_lossy().to_ascii_lowercase();
+            let command = process
+                .cmd()
+                .iter()
+                .map(|item| item.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if name.contains("cursor")
+                || command
+                    .iter()
+                    .any(|arg| arg.to_ascii_lowercase().contains("cursor"))
+            {
+                Some(RunningCodexProcess {
+                    pid: pid.as_u32(),
+                    executable: name,
+                    role: "editor".to_owned(),
+                    summary: Some(command.join(" ")),
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    processes.sort_by_key(|left| left.pid);
+    processes
+}
+
+pub fn detect_switch_blocking_cursor_processes() -> Vec<RunningCodexProcess> {
+    detect_running_cursor_processes()
+}
+
 pub fn format_process_table(processes: &[RunningCodexProcess]) -> Vec<String> {
     let mut lines = Vec::with_capacity(processes.len() + 1);
     lines.push(format!(
@@ -100,14 +154,19 @@ pub fn format_process_table(processes: &[RunningCodexProcess]) -> Vec<String> {
 }
 
 fn matches_codex_process(name: &str, command: &[String]) -> bool {
-    if matches!(name, "codex" | "codex.exe") {
+    if matches!(name, "codex" | "codex.exe" | "chatgpt" | "chatgpt.exe") {
         return true;
     }
     command
         .iter()
         .filter_map(|token| path_file_name(token))
         .map(|token| token.to_ascii_lowercase())
-        .any(|token| matches!(token.as_str(), "codex" | "codex.exe" | "codex.js"))
+        .any(|token| {
+            matches!(
+                token.as_str(),
+                "codex" | "codex.exe" | "codex.js" | "chatgpt" | "chatgpt.exe" | "chatgpt.js"
+            )
+        })
 }
 
 fn format_process(pid: Pid, name: &str, command: &[String]) -> RunningCodexProcess {
@@ -269,6 +328,8 @@ fn truncate_cell(value: &str, width: usize) -> String {
 }
 
 #[cfg(target_os = "macos")]
+const MACOS_CHATGPT_MAIN_PROCESS_PATTERN: &str = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+#[cfg(target_os = "macos")]
 const MACOS_CODEX_MAIN_PROCESS_PATTERN: &str = "/Applications/Codex.app/Contents/MacOS/Codex";
 
 /// Gracefully stop the Codex desktop app before swapping auth snapshots.
@@ -276,7 +337,13 @@ pub fn quit_running_codex_app() {
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("osascript")
+            .args(["-e", "quit app \"ChatGPT\""])
+            .output();
+        let _ = std::process::Command::new("osascript")
             .args(["-e", "quit app \"Codex\""])
+            .output();
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", MACOS_CHATGPT_MAIN_PROCESS_PATTERN])
             .output();
         let _ = std::process::Command::new("pkill")
             .args(["-f", MACOS_CODEX_MAIN_PROCESS_PATTERN])
@@ -285,6 +352,9 @@ pub fn quit_running_codex_app() {
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/f", "/im", "ChatGPT.exe"])
+            .output();
         let _ = std::process::Command::new("taskkill")
             .args(["/f", "/im", "Codex.exe"])
             .output();
@@ -408,16 +478,25 @@ switch ($result) {
     }
 }
 
-/// Relaunch the Codex desktop app after auth has been restored.
+/// Relaunch the Codex/ChatGPT desktop app after auth has been restored.
 pub fn launch_codex_app() {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open")
-            .args(["-a", "Codex"])
-            .spawn();
+        if std::path::Path::new("/Applications/ChatGPT.app").exists() {
+            let _ = std::process::Command::new("open")
+                .args(["-a", "ChatGPT"])
+                .spawn();
+        } else {
+            let _ = std::process::Command::new("open")
+                .args(["-a", "Codex"])
+                .spawn();
+        }
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", "ChatGPT"])
+            .spawn();
         let _ = std::process::Command::new("cmd")
             .args(["/c", "start", "", "Codex"])
             .spawn();

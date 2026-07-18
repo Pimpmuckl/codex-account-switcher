@@ -326,6 +326,7 @@ fn usage_http_get(
         let mut request = isolated_http_agent()
             .get(url)
             .header("Authorization", &format!("Bearer {access_token}"))
+            .header("Connection", "close")
             .header("User-Agent", "codex-account-switcher");
         if let Some(account_id) = account_id {
             request = request.header("ChatGPT-Account-Id", account_id);
@@ -371,6 +372,7 @@ fn usage_http_post_json(url: &str, payload_json: &str) -> Result<ureq::http::Res
         isolated_http_agent()
             .post(url)
             .header("Content-Type", "application/json")
+            .header("Connection", "close")
             .send(payload_json)
             .context("failed to refresh Codex auth tokens")
     } else {

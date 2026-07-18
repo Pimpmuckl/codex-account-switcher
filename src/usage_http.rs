@@ -108,6 +108,7 @@ fn serve(
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
                 handle_connection(stream, &usage_responses, &refresh_responses);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

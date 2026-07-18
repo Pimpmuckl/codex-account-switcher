@@ -68,6 +68,7 @@ fn account_view(
         usage_error,
         label: account.label,
         is_archived: account.is_archived,
+        target_app: account.target_app,
     }
 }
 
@@ -75,9 +76,18 @@ fn match_saved_account<'a>(
     accounts: &'a [SavedAccountMetadata],
     identity: &DisplayIdentity,
 ) -> Option<&'a SavedAccountMetadata> {
-    accounts
-        .iter()
-        .find(|account| saved_identity(account).matches(identity))
+    match_saved_account_with_app(accounts, identity, Some("codex"))
+}
+
+fn match_saved_account_with_app<'a>(
+    accounts: &'a [SavedAccountMetadata],
+    identity: &DisplayIdentity,
+    target_app: Option<&str>,
+) -> Option<&'a SavedAccountMetadata> {
+    accounts.iter().find(|account| {
+        account.target_app.as_deref().unwrap_or("codex") == target_app.unwrap_or("codex")
+            && saved_identity(account).matches(identity)
+    })
 }
 
 fn account_view_matches_identity(account: &AccountView, identity: &DisplayIdentity) -> bool {

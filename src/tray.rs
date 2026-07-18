@@ -30,17 +30,26 @@ use crate::secrets::{MigratingSecretStore, SecretStore};
 use crate::usage::usage_error_requires_login;
 
 trait AppendableMenu {
-    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), tray_icon::menu::Error>;
+    fn append_item(
+        &self,
+        item: &dyn tray_icon::menu::IsMenuItem,
+    ) -> Result<(), tray_icon::menu::Error>;
 }
 
 impl AppendableMenu for Menu {
-    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), tray_icon::menu::Error> {
+    fn append_item(
+        &self,
+        item: &dyn tray_icon::menu::IsMenuItem,
+    ) -> Result<(), tray_icon::menu::Error> {
         self.append(item)
     }
 }
 
 impl AppendableMenu for Submenu {
-    fn append_item(&self, item: &dyn tray_icon::menu::IsMenuItem) -> Result<(), tray_icon::menu::Error> {
+    fn append_item(
+        &self,
+        item: &dyn tray_icon::menu::IsMenuItem,
+    ) -> Result<(), tray_icon::menu::Error> {
         self.append(item)
     }
 }
@@ -60,6 +69,7 @@ enum TrayCommand {
     Activate(Uuid),
     Login(Uuid),
     SaveCurrent,
+    SaveCursorCurrent,
     StartAddAccount,
     FinishAddAccount,
     CancelAddAccount,
@@ -340,6 +350,21 @@ where
                 tray_notify("Codex Switcher", &msg);
                 let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
+            Some(TrayCommand::SaveCursorCurrent) => {
+                let msg = match self.app.save_cursor_current() {
+                    Ok(output) => {
+                        format!(
+                            "Saved Cursor workspace {} successfully.",
+                            account_display_name(&output.account)
+                        )
+                    }
+                    Err(error) => {
+                        format!("Failed to save Cursor workspace: {error:#}")
+                    }
+                };
+                tray_notify("Codex Switcher", &msg);
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
+            }
             Some(TrayCommand::StartAddAccount) => {
                 match self.app.begin_add_account_session() {
                     Ok(()) => {
@@ -516,7 +541,10 @@ where
                         tray_notify("Codex Switcher", &format!("{verb} account successfully."));
                     }
                     Err(error) => {
-                        tray_notify("Codex Switcher", &format!("Failed to archive/unarchive: {error:#}"));
+                        tray_notify(
+                            "Codex Switcher",
+                            &format!("Failed to archive/unarchive: {error:#}"),
+                        );
                     }
                 }
                 let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
@@ -734,175 +762,47 @@ where
         let menu = Menu::new();
         self.commands.clear();
 
-        let active_account = find_active_tray_account(
-            status.current_account.as_ref(),
-            status.current_account_saved_id,
-            &list.accounts,
-        );
-        let active_account_id = active_account.map(|account| account.id);
+        // Split accounts by target_app
+        let codex_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref().unwrap_or("codex") == "codex")
+            .cloned()
+            .collect();
+        let cursor_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref() == Some("cursor"))
+            .cloned()
+            .collect();
+
         let saved_accounts = tray_saved_accounts(&list.accounts);
 
-        // ── Active account ──────────────────────────────────────
-        if let Some(current) = &status.current_account {
-            let not_saved = active_account.is_none();
-            let name = identity_display_name(current);
-            let suffix = if not_saved { "  [not saved]" } else { "" };
-            menu.append(&MenuItem::new(
-                format!("\u{2713} {name}{suffix}"),
-                true,
-                None,
-            ))?;
+        // Fetch Cursor status
+        let cursor_status = self.app.cursor_status().ok();
 
-            // Details: plan + quota bar + reset
-            let plan = format_plan_label_simple(current.plan_label.as_deref());
-            let needs_login = active_account
-                .and_then(|a| a.usage_error.as_deref())
-                .is_some_and(usage_error_requires_login);
-            if needs_login {
-                if let Some(act_acc) = active_account {
-                    let login_id = "login_active".to_owned();
-                    let item = MenuItem::with_id(
-                        MenuId::new(&login_id),
-                        format!("    {plan}  •  Click to Login"),
-                        true,
-                        None,
-                    );
-                    menu.append(&item)?;
-                    self.commands
-                        .insert(login_id, TrayCommand::Login(act_acc.id));
-                } else {
-                    menu.append(&MenuItem::new(
-                        format!("    {plan}  •  Login required"),
-                        true,
-                        None,
-                    ))?;
-                }
-            } else {
-                let details = format_account_details_line(
-                    &plan,
-                    active_account.and_then(|a| a.usage.as_ref()),
-                );
-                menu.append(&MenuItem::new(format!("    {details}"), true, None))?;
-            }
-        } else {
-            menu.append(&MenuItem::new("Not logged in", true, None))?;
-        }
+        // ── Codex Section ───────────────────────────────────────
+        self.rebuild_app_section(
+            &menu,
+            "OpenAI Codex",
+            status.current_account.as_ref(),
+            status.current_account_saved_id,
+            &codex_accounts,
+        )?;
+
         menu.append(&PredefinedMenuItem::separator())?;
 
-        // ── Saved accounts (switch targets) ─────────────────────
-        if saved_accounts.is_empty() {
-            menu.append(&MenuItem::new("  No saved accounts", true, None))?;
-        } else {
-            let mut active_group = Vec::new();
-            let mut depleted_group = Vec::new();
-            let mut login_group = Vec::new();
-            let mut archived_group = Vec::new();
-
-            for account in &saved_accounts {
-                if account.is_archived {
-                    archived_group.push(*account);
-                } else {
-                    let needs_login = account
-                        .usage_error
-                        .as_deref()
-                        .is_some_and(usage_error_requires_login);
-                    if needs_login {
-                        login_group.push(*account);
-                    } else if let Some(usage) = &account.usage
-                        && usage.is_out_of_quota(OffsetDateTime::now_utc())
-                    {
-                        depleted_group.push(*account);
-                    } else {
-                        active_group.push(*account);
-                    }
-                }
-            }
-
-            // Sort depleted group by nearest reset time
-            depleted_group.sort_by(|a, b| {
-                let ta = get_nearest_reset_time(a);
-                let tb = get_nearest_reset_time(b);
-                match (ta, tb) {
-                    (Some(t1), Some(t2)) => t1.cmp(&t2),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                }
-            });
-
-            let mut first_group = true;
-
-            if !active_group.is_empty() {
-                if !first_group {
-                    menu.append(&PredefinedMenuItem::separator())?;
-                }
-                first_group = false;
-                menu.append(&MenuItem::new("🟢 Active (Còn token)", true, None))?;
-                for account in active_group {
-                    append_tray_account_item(
-                        &menu,
-                        account,
-                        active_account_id,
-                        &mut self.commands,
-                    )?;
-                }
-            }
-
-            if !depleted_group.is_empty() {
-                if !first_group {
-                    menu.append(&PredefinedMenuItem::separator())?;
-                }
-                first_group = false;
-                menu.append(&MenuItem::new("🔴 Depleted (Hết token)", true, None))?;
-                for account in depleted_group {
-                    append_tray_account_item(
-                        &menu,
-                        account,
-                        active_account_id,
-                        &mut self.commands,
-                    )?;
-                }
-            }
-
-            if !login_group.is_empty() || !archived_group.is_empty() {
-                if !first_group {
-                    menu.append(&PredefinedMenuItem::separator())?;
-                }
-                let hidden_submenu = Submenu::new("📂 Show Hidden Accounts (Hiển thị tài khoản ẩn)", true);
-                let mut first_hidden_group = true;
-
-                if !login_group.is_empty() {
-                    hidden_submenu.append(&MenuItem::new("⚠️ Login Required (Cần login lại)", true, None))?;
-                    first_hidden_group = false;
-                    for account in login_group {
-                        append_tray_account_item(
-                            &hidden_submenu,
-                            account,
-                            active_account_id,
-                            &mut self.commands,
-                        )?;
-                    }
-                }
-
-                if !archived_group.is_empty() {
-                    if !first_hidden_group {
-                        hidden_submenu.append(&PredefinedMenuItem::separator())?;
-                    }
-                    hidden_submenu.append(&MenuItem::new("📁 Archived (Đã lưu trữ)", true, None))?;
-                    for account in archived_group {
-                        append_tray_account_item(
-                            &hidden_submenu,
-                            account,
-                            active_account_id,
-                            &mut self.commands,
-                        )?;
-                    }
-                }
-
-                menu.append(&hidden_submenu)?;
-            }
+        // ── Cursor Section ──────────────────────────────────────
+        if let Some(cur_status) = &cursor_status {
+            self.rebuild_app_section(
+                &menu,
+                "Cursor IDE",
+                cur_status.current_account.as_ref(),
+                cur_status.current_account_saved_id,
+                &cursor_accounts,
+            )?;
+            menu.append(&PredefinedMenuItem::separator())?;
         }
-        menu.append(&PredefinedMenuItem::separator())?;
 
         // ── Actions ─────────────────────────────────────────────
         self.append_command(
@@ -914,8 +814,14 @@ where
         self.append_command(
             &menu,
             "save-current",
-            "Save Current",
+            "Save Codex Account",
             TrayCommand::SaveCurrent,
+        )?;
+        self.append_command(
+            &menu,
+            "save-cursor",
+            "Save Cursor Account",
+            TrayCommand::SaveCursorCurrent,
         )?;
         self.append_command(
             &menu,
@@ -1024,6 +930,165 @@ where
         self.append_command(&menu, "show-tui", "Show TUI", TrayCommand::ShowTui)?;
         self.append_command(&menu, "quit", "Quit", TrayCommand::Quit)?;
         Ok(menu)
+    }
+
+    fn rebuild_app_section(
+        &mut self,
+        menu: &dyn AppendableMenu,
+        app_label: &str,
+        current_account: Option<&crate::model::DisplayIdentity>,
+        current_saved_id: Option<Uuid>,
+        accounts: &[crate::model::AccountView],
+    ) -> Result<()> {
+        menu.append_item(&MenuItem::new(format!("--- {app_label} ---"), false, None))?;
+
+        let active_account = find_active_tray_account(current_account, current_saved_id, accounts);
+        let active_account_id = active_account.map(|account| account.id);
+
+        if let Some(current) = current_account {
+            let not_saved = active_account.is_none();
+            let name = identity_display_name(current);
+            let suffix = if not_saved { "  [not saved]" } else { "" };
+            menu.append_item(&MenuItem::new(
+                format!("\u{2713} {name}{suffix}"),
+                true,
+                None,
+            ))?;
+
+            let plan = format_plan_label_simple(current.plan_label.as_deref());
+            let needs_login = active_account
+                .and_then(|a| a.usage_error.as_deref())
+                .is_some_and(usage_error_requires_login);
+            if needs_login {
+                if let Some(act_acc) = active_account {
+                    let login_id = format!("login_active_{}", act_acc.id);
+                    let item = MenuItem::with_id(
+                        MenuId::new(&login_id),
+                        format!("    {plan}  •  Click to Login"),
+                        true,
+                        None,
+                    );
+                    menu.append_item(&item)?;
+                    self.commands
+                        .insert(login_id, TrayCommand::Login(act_acc.id));
+                } else {
+                    menu.append_item(&MenuItem::new(
+                        format!("    {plan}  •  Login required"),
+                        true,
+                        None,
+                    ))?;
+                }
+            } else {
+                let details = format_account_details_line(
+                    &plan,
+                    active_account.and_then(|a| a.usage.as_ref()),
+                );
+                menu.append_item(&MenuItem::new(format!("    {details}"), true, None))?;
+            }
+        } else {
+            menu.append_item(&MenuItem::new("Not logged in", true, None))?;
+        }
+
+        let saved_accounts = accounts;
+        if saved_accounts.is_empty() {
+            menu.append_item(&MenuItem::new("  No saved accounts", true, None))?;
+        } else {
+            let mut active_group = Vec::new();
+            let mut depleted_group = Vec::new();
+            let mut login_group = Vec::new();
+            let mut archived_group = Vec::new();
+
+            for account in saved_accounts {
+                if account.is_archived {
+                    archived_group.push(account);
+                } else {
+                    let needs_login = account
+                        .usage_error
+                        .as_deref()
+                        .is_some_and(usage_error_requires_login);
+                    if needs_login {
+                        login_group.push(account);
+                    } else if let Some(usage) = &account.usage
+                        && usage.is_out_of_quota(OffsetDateTime::now_utc())
+                    {
+                        depleted_group.push(account);
+                    } else {
+                        active_group.push(account);
+                    }
+                }
+            }
+
+            depleted_group.sort_by(|a, b| {
+                let ta = get_nearest_reset_time(a);
+                let tb = get_nearest_reset_time(b);
+                match (ta, tb) {
+                    (Some(t1), Some(t2)) => t1.cmp(&t2),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+
+            let mut first_group = true;
+
+            if !active_group.is_empty() {
+                first_group = false;
+                menu.append_item(&MenuItem::new("🟢 Active (Còn token)", true, None))?;
+                for account in active_group {
+                    append_tray_account_item(menu, account, active_account_id, &mut self.commands)?;
+                }
+            }
+
+            if !depleted_group.is_empty() {
+                if !first_group {
+                    menu.append_item(&PredefinedMenuItem::separator())?;
+                }
+                first_group = false;
+                menu.append_item(&MenuItem::new("🔴 Depleted (Hết token)", true, None))?;
+                for account in depleted_group {
+                    append_tray_account_item(menu, account, active_account_id, &mut self.commands)?;
+                }
+            }
+
+            if !login_group.is_empty() || !archived_group.is_empty() {
+                if !first_group {
+                    menu.append_item(&PredefinedMenuItem::separator())?;
+                }
+                let hidden_submenu = Submenu::new("📂 Show Hidden Accounts", true);
+                let mut first_hidden_group = true;
+
+                if !login_group.is_empty() {
+                    hidden_submenu.append_item(&MenuItem::new("⚠️ Login Required", true, None))?;
+                    first_hidden_group = false;
+                    for account in login_group {
+                        append_tray_account_item(
+                            &hidden_submenu,
+                            account,
+                            active_account_id,
+                            &mut self.commands,
+                        )?;
+                    }
+                }
+
+                if !archived_group.is_empty() {
+                    if !first_hidden_group {
+                        hidden_submenu.append_item(&PredefinedMenuItem::separator())?;
+                    }
+                    hidden_submenu.append_item(&MenuItem::new("📁 Archived", true, None))?;
+                    for account in archived_group {
+                        append_tray_account_item(
+                            &hidden_submenu,
+                            account,
+                            active_account_id,
+                            &mut self.commands,
+                        )?;
+                    }
+                }
+
+                menu.append_item(&hidden_submenu)?;
+            }
+        }
+        Ok(())
     }
 
     fn rebuild_add_account_pending_menu(&mut self) -> Result<Menu> {
@@ -1737,6 +1802,7 @@ mod tests {
             plan_label: Some("Pro".to_owned()),
             workspace_id: None,
             workspace_name: None,
+            target_app: None,
             environment: EnvironmentKind::Windows,
             is_active: false,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1771,6 +1837,7 @@ mod tests {
             plan_label: Some("Pro".to_owned()),
             workspace_id: None,
             workspace_name: None,
+            target_app: None,
             environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1806,6 +1873,7 @@ mod tests {
             plan_label: Some("Pro".to_owned()),
             workspace_id: None,
             workspace_name: None,
+            target_app: None,
             environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1836,6 +1904,7 @@ mod tests {
             plan_label: Some("Pro".to_owned()),
             workspace_id: None,
             workspace_name: None,
+            target_app: None,
             environment: EnvironmentKind::Windows,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1887,6 +1956,7 @@ mod tests {
             plan_label: None,
             workspace_id: None,
             workspace_name: None,
+            target_app: None,
             environment: EnvironmentKind::Windows,
             is_active: false,
             created_at: OffsetDateTime::UNIX_EPOCH,

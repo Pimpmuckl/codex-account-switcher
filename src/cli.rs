@@ -27,6 +27,14 @@ use crate::usage::{usage_error_label, usage_error_requires_login};
     about = "Switch Codex accounts by snapshotting live auth state"
 )]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        default_value = "codex",
+        help = "Target application: codex or cursor"
+    )]
+    pub app: String,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -164,29 +172,46 @@ pub fn run() -> Result<()> {
     match cli.command {
         None => run_interactive_app(&app),
         Some(Command::Status { json }) => {
-            let status = app.status()?;
+            let target_app = cli.app.to_ascii_lowercase();
+            let status = if target_app == "cursor" {
+                app.cursor_status()?
+            } else {
+                app.status()?
+            };
             if json {
                 print_json(&status)?;
             } else {
                 println!("Environment: {}", status.environment);
-                println!("Codex root: {}", status.codex_root);
+                if target_app == "cursor" {
+                    println!("Cursor database: {}", status.codex_root);
+                } else {
+                    println!("Codex root: {}", status.codex_root);
+                }
                 match status.current_account {
                     Some(account) => println!("Current account: {}", account.email),
                     None => println!("Current account: not logged in"),
                 }
                 println!("Saved accounts: {}", status.saved_accounts);
                 if !status.process_warnings.is_empty() {
-                    print_process_summary("Codex processes", &status.process_warnings);
+                    let label = if target_app == "cursor" {
+                        "Cursor processes"
+                    } else {
+                        "Codex processes"
+                    };
+                    print_process_summary(label, &status.process_warnings);
                 }
             }
             Ok(())
         }
         Some(Command::List { json }) => {
-            let list = app.list()?;
+            let mut list = app.list()?;
+            let target_app = cli.app.to_ascii_lowercase();
+            list.accounts
+                .retain(|account| account.target_app.as_deref().unwrap_or("codex") == target_app);
             if json {
                 print_json(&list)?;
             } else if list.accounts.is_empty() {
-                println!("No saved accounts in {}.", list.environment);
+                println!("No saved {} accounts in {}.", target_app, list.environment);
             } else {
                 for account in list.accounts {
                     println!("{}", render_account_summary(&account));
@@ -195,7 +220,11 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Save { json }) => {
-            let output = app.save_current()?;
+            let output = if cli.app.eq_ignore_ascii_case("cursor") {
+                app.save_cursor_current()?
+            } else {
+                app.save_current()?
+            };
             if json {
                 print_json(&output)?;
             } else {
@@ -204,6 +233,11 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Login { json }) => {
+            if cli.app.eq_ignore_ascii_case("cursor") {
+                bail!(
+                    "Login flow automation is not supported for Cursor. Please log in within Cursor first, then run 'save'."
+                );
+            }
             let output = app.login_and_save()?;
             if json {
                 print_json(&output)?;
@@ -216,7 +250,12 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Current { json }) => {
-            let status = app.status()?;
+            let target_app = cli.app.to_ascii_lowercase();
+            let status = if target_app == "cursor" {
+                app.cursor_status()?
+            } else {
+                app.status()?
+            };
             if json {
                 print_json(&status)?;
             } else {
@@ -334,19 +373,27 @@ pub fn run() -> Result<()> {
             let output = match account_id {
                 Some(account_id) => {
                     app.validate_activation_target(account_id)?;
-                    let warnings = app.activation_preflight_warnings();
+                    let warnings = app.activation_preflight_warnings_for_account(account_id);
+                    let is_cursor = app.is_cursor_account(account_id);
+                    let label = if is_cursor {
+                        "Cursor processes"
+                    } else {
+                        "Codex processes"
+                    };
+                    let app_name = if is_cursor { "Cursor" } else { "Codex" };
                     if !warnings.is_empty() {
                         if !force {
                             if !json {
-                                print_process_summary("Codex processes", &warnings);
+                                print_process_summary(label, &warnings);
                             }
                             bail!(
-                                "Codex appears to be running. Close those processes first or rerun `activate` with `--force`."
+                                "{} appears to be running. Close those processes first or rerun `activate` with `--force`.",
+                                app_name
                             );
                         }
                         if !json {
                             showed_preflight = true;
-                            print_process_summary("Codex processes", &warnings);
+                            print_process_summary(label, &warnings);
                         }
                     }
                     app.activate_with_running_policy(account_id, force)?
@@ -379,9 +426,7 @@ pub fn run() -> Result<()> {
             } else {
                 println!("Deleted saved snapshot {}", output.deleted_account_id);
             }
-            Ok(
-                (),
-            )
+            Ok(())
         }
         Some(Command::Archive {
             account_id,
@@ -833,6 +878,7 @@ mod tests {
             plan_label: Some("Pro".to_owned()),
             workspace_id: None,
             workspace_name: None,
+            target_app: None,
             environment: EnvironmentKind::Macos,
             is_active: true,
             created_at: OffsetDateTime::UNIX_EPOCH,

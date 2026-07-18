@@ -63,11 +63,23 @@ where
         identity: &DisplayIdentity,
         snapshot: &SnapshotBlob,
     ) -> Result<(SavedAccountMetadata, bool)> {
+        self.save_snapshot_with_app(environment, identity, snapshot, None)
+    }
+
+    pub fn save_snapshot_with_app(
+        &self,
+        environment: &EnvironmentKind,
+        identity: &DisplayIdentity,
+        snapshot: &SnapshotBlob,
+        target_app: Option<String>,
+    ) -> Result<(SavedAccountMetadata, bool)> {
         let mut index = self.index_store.load_index()?;
         let now = OffsetDateTime::now_utc();
         let encoded_snapshot = encode_snapshot(snapshot)?;
         let existing_index = index.accounts.iter().position(|account| {
             &account.environment == environment
+                && account.target_app.as_deref().unwrap_or("codex")
+                    == target_app.as_deref().unwrap_or("codex")
                 && DisplayIdentity {
                     email: account.email.clone(),
                     subject: account.subject.clone(),
@@ -87,6 +99,7 @@ where
             account.plan_label = identity.plan_label.clone();
             account.workspace_id = identity.workspace_id.clone();
             account.workspace_name = identity.workspace_name.clone();
+            account.target_app = target_app;
             account.cached_usage_error = None;
             account.updated_at = now;
             (account.clone(), false)
@@ -109,6 +122,7 @@ where
                 cached_usage_error: None,
                 label: None,
                 is_archived: false,
+                target_app,
             };
             index.accounts.push(metadata.clone());
             (metadata, true)

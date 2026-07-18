@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -20,8 +21,8 @@ use crate::usage::{
 };
 
 use super::{
-    App, account_view, match_saved_account, saved_identity, should_verify_activation_stability,
-    subject_bound_identity_matches,
+    App, account_view, match_saved_account, match_saved_account_with_app, saved_identity,
+    should_verify_activation_stability, subject_bound_identity_matches,
 };
 
 static ACCOUNT_SWITCH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -110,6 +111,25 @@ where
         })
     }
 
+    pub fn save_cursor_current(&self) -> Result<SaveOutput> {
+        let live = crate::cursor::read_live_cursor_auth(&self.env)
+            .context("no live Cursor auth bundle found")?;
+        let (metadata, created) = self.repository.save_snapshot_with_app(
+            &self.env.kind,
+            &live.identity,
+            &live.snapshot,
+            Some("cursor".to_owned()),
+        )?;
+        Ok(SaveOutput {
+            account: account_view(metadata.clone(), Some(metadata.id), None, None),
+            action: if created {
+                SaveAction::Created
+            } else {
+                SaveAction::Refreshed
+            },
+        })
+    }
+
     pub fn activate(&self, account_id: Uuid) -> Result<ActivateOutput> {
         self.activate_with_running_policy(account_id, false)
     }
@@ -135,13 +155,35 @@ where
             .get_or_init(|| Mutex::new(()))
             .lock()
             .map_err(|_| anyhow::anyhow!("account switch lock poisoned"))?;
-        let warnings = crate::process::detect_switch_blocking_codex_processes();
-        self.refresh_current_saved_account_before_activation();
+
+        let account_metadata = self
+            .repository
+            .get_account(&self.env.kind, account_id)?
+            .ok_or_else(|| anyhow::anyhow!("saved account not found"))?;
+        let is_cursor = account_metadata.target_app.as_deref() == Some("cursor");
+
+        let warnings = if is_cursor {
+            crate::process::detect_switch_blocking_cursor_processes()
+        } else {
+            crate::process::detect_switch_blocking_codex_processes()
+        };
+
+        if !is_cursor {
+            self.refresh_current_saved_account_before_activation();
+        }
+
         let (snapshot, snapshot_identity, restore_identity) =
             self.load_activation_target(account_id)?;
         let verify_stable = should_verify_activation_stability(force_running, &warnings);
-        codex::restore_snapshot(&self.env, &snapshot, &restore_identity, verify_stable)
-            .context("failed to restore the selected account snapshot")?;
+
+        if is_cursor {
+            crate::cursor::restore_cursor_snapshot(&self.env, &snapshot)
+                .context("failed to restore the selected Cursor account snapshot")?;
+        } else {
+            codex::restore_snapshot(&self.env, &snapshot, &restore_identity, verify_stable)
+                .context("failed to restore the selected account snapshot")?;
+        }
+
         let metadata = self
             .repository
             .sync_activated_account(&self.env.kind, account_id, &snapshot_identity)
@@ -151,7 +193,7 @@ where
             account_id,
             &metadata.email,
             metadata.label.as_deref(),
-            None,
+            Some(if is_cursor { "cursor" } else { "codex" }),
         );
         Ok(ActivateOutput {
             account: account_view(metadata, Some(account_id), None, None),
@@ -181,7 +223,60 @@ where
     ) -> Result<(SnapshotBlob, DisplayIdentity, DisplayIdentity)> {
         let (metadata, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
         let expected_identity = saved_identity(&metadata);
-        let snapshot_identity = codex::identity_from_snapshot(&snapshot)?;
+
+        let snapshot_identity = if metadata.target_app.as_deref() == Some("cursor") {
+            let file = snapshot
+                .files
+                .iter()
+                .find(|f| f.name == "cursor_auth.json")
+                .context("snapshot missing cursor_auth.json")?;
+            let json_bytes =
+                base64::engine::general_purpose::STANDARD.decode(&file.bytes_base64)?;
+            let serialized_map: std::collections::HashMap<String, String> =
+                serde_json::from_slice(&json_bytes)?;
+
+            let email = serialized_map
+                .get("cursorAuth/cachedEmail")
+                .and_then(|val| base64::engine::general_purpose::STANDARD.decode(val).ok())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .context("Cursor cached email not found in database")?;
+
+            let cached_profile = serialized_map
+                .get("cursorAuth/cachedScopedProfile")
+                .and_then(|val| base64::engine::general_purpose::STANDARD.decode(val).ok())
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+            let name = cached_profile
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|val| {
+                    val.get("displayName")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from)
+                });
+
+            let plan_label = serialized_map
+                .get("cursorAuth/stripeMembershipType")
+                .and_then(|val| base64::engine::general_purpose::STANDARD.decode(val).ok())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(|p| {
+                    if p.eq_ignore_ascii_case("pro") {
+                        "Pro".to_owned()
+                    } else {
+                        p
+                    }
+                });
+
+            DisplayIdentity {
+                email,
+                subject: None,
+                name,
+                plan_label,
+                workspace_id: None,
+                workspace_name: None,
+            }
+        } else {
+            codex::identity_from_snapshot(&snapshot)?
+        };
+
         let restore_identity = if expected_identity.subject.is_some() {
             if !subject_bound_identity_matches(&expected_identity, &snapshot_identity) {
                 anyhow::bail!(
@@ -198,6 +293,24 @@ where
     }
 
     pub fn activation_preflight_warnings(&self) -> Vec<RunningCodexProcess> {
+        crate::process::detect_switch_blocking_codex_processes()
+    }
+
+    pub fn activation_preflight_warnings_for_account(
+        &self,
+        account_id: Uuid,
+    ) -> Vec<RunningCodexProcess> {
+        let is_cursor = self
+            .repository
+            .get_account(&self.env.kind, account_id)
+            .ok()
+            .flatten()
+            .and_then(|meta| meta.target_app)
+            .as_deref()
+            == Some("cursor");
+        if is_cursor {
+            return crate::process::detect_switch_blocking_cursor_processes();
+        }
         crate::process::detect_switch_blocking_codex_processes()
     }
 
@@ -545,6 +658,42 @@ where
             .with_context(|| format!("failed to start command '{}'", command[0]))?;
         let status = child.wait().context("failed to wait for child process")?;
         Ok(status)
+    }
+
+    pub fn cursor_status(&self) -> Result<StatusOutput> {
+        let saved_accounts = self
+            .repository
+            .list_accounts(&self.env.kind)?
+            .into_iter()
+            .filter(|acc| acc.target_app.as_deref() == Some("cursor"))
+            .collect::<Vec<_>>();
+        let live = crate::cursor::try_read_live_cursor_auth(&self.env)?;
+        let current_saved_id = live
+            .as_ref()
+            .and_then(|bundle| {
+                match_saved_account_with_app(&saved_accounts, &bundle.identity, Some("cursor"))
+            })
+            .map(|account| account.id);
+        Ok(StatusOutput {
+            environment: self.env.kind.clone(),
+            codex_root: crate::cursor::cursor_db_path(&self.env)?
+                .display()
+                .to_string(),
+            current_account: live.map(|bundle| bundle.identity),
+            current_account_saved_id: current_saved_id,
+            saved_accounts: saved_accounts.len(),
+            process_warnings: crate::process::detect_running_cursor_processes(),
+        })
+    }
+
+    pub fn is_cursor_account(&self, account_id: Uuid) -> bool {
+        self.repository
+            .get_account(&self.env.kind, account_id)
+            .ok()
+            .flatten()
+            .and_then(|acc| acc.target_app)
+            .as_deref()
+            == Some("cursor")
     }
 }
 

@@ -76,13 +76,11 @@ impl DisplayIdentity {
     }
 
     pub fn workspace_label(&self) -> Option<&str> {
-        self.workspace_name
-            .as_deref()
-            .or_else(|| {
-                self.workspace_id
-                    .as_deref()
-                    .filter(|id| Uuid::parse_str(id).is_err())
-            })
+        self.workspace_name.as_deref().or_else(|| {
+            self.workspace_id
+                .as_deref()
+                .filter(|id| Uuid::parse_str(id).is_err())
+        })
     }
 }
 
@@ -145,6 +143,8 @@ pub struct SavedAccountMetadata {
     pub label: Option<String>,
     #[serde(default)]
     pub is_archived: bool,
+    #[serde(default)]
+    pub target_app: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -177,17 +177,17 @@ pub struct AccountView {
     pub label: Option<String>,
     #[serde(default)]
     pub is_archived: bool,
+    #[serde(default)]
+    pub target_app: Option<String>,
 }
 
 impl AccountView {
     pub fn workspace_label(&self) -> Option<&str> {
-        self.workspace_name
-            .as_deref()
-            .or_else(|| {
-                self.workspace_id
-                    .as_deref()
-                    .filter(|id| Uuid::parse_str(id).is_err())
-            })
+        self.workspace_name.as_deref().or_else(|| {
+            self.workspace_id
+                .as_deref()
+                .filter(|id| Uuid::parse_str(id).is_err())
+        })
     }
 }
 
@@ -305,6 +305,8 @@ pub struct ExportBundleAccount {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
+    #[serde(default)]
+    pub target_app: Option<String>,
     pub snapshot: SnapshotBlob,
 }
 
