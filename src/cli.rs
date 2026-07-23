@@ -1,11 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::app::{App, InteractiveExit, InteractiveMode};
+use crate::app::App;
 use crate::env;
 use crate::import_export::{read_export_file, write_export_file};
 use crate::model::{
@@ -31,7 +32,7 @@ struct Cli {
         long,
         global = true,
         default_value = "codex",
-        help = "Target application: codex or cursor"
+        help = "Target application: codex, cursor, or claude"
     )]
     pub app: String,
 
@@ -78,6 +79,17 @@ enum Command {
     },
     Import {
         path: PathBuf,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import a ChatGPT Codex account from local cookies/token JSON (file path or `-` for stdin).
+    ImportCookies {
+        /// Path to JSON file, or `-` to read stdin.
+        path: PathBuf,
+        #[arg(long, default_value = "codex")]
+        provider: String,
         #[arg(long)]
         label: Option<String>,
         #[arg(long)]
@@ -153,6 +165,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Dashboard,
     Exec {
         account: String,
         #[arg(required = true, last = true)]
@@ -162,19 +175,28 @@ enum Command {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let target_app = cli.app.to_ascii_lowercase();
+    if target_app != "codex" && target_app != "cursor" && target_app != "claude" {
+        anyhow::bail!(
+            "invalid target application: '{}'. Supported: codex, cursor, claude",
+            target_app
+        );
+    }
     let env = env::detect()?;
     let repository = SnapshotRepository::new(
         &env.app_data_dir,
         MigratingSecretStore::new(&env.app_data_dir.join("snapshots")),
     );
-    let app = App::new(env, repository);
+    let app = Arc::new(App::new(env, repository));
     let _ = app.update_launch_at_startup_path_if_enabled();
     match cli.command {
-        None => run_interactive_app(&app),
+        None => run_menubar_app(app, false),
+        Some(Command::Dashboard) => run_menubar_app(app, true),
         Some(Command::Status { json }) => {
-            let target_app = cli.app.to_ascii_lowercase();
             let status = if target_app == "cursor" {
                 app.cursor_status()?
+            } else if target_app == "claude" {
+                app.claude_status()?
             } else {
                 app.status()?
             };
@@ -184,6 +206,8 @@ pub fn run() -> Result<()> {
                 println!("Environment: {}", status.environment);
                 if target_app == "cursor" {
                     println!("Cursor database: {}", status.codex_root);
+                } else if target_app == "claude" {
+                    println!("Claude config: {}", status.codex_root);
                 } else {
                     println!("Codex root: {}", status.codex_root);
                 }
@@ -195,6 +219,8 @@ pub fn run() -> Result<()> {
                 if !status.process_warnings.is_empty() {
                     let label = if target_app == "cursor" {
                         "Cursor processes"
+                    } else if target_app == "claude" {
+                        "Claude processes"
                     } else {
                         "Codex processes"
                     };
@@ -205,7 +231,6 @@ pub fn run() -> Result<()> {
         }
         Some(Command::List { json }) => {
             let mut list = app.list()?;
-            let target_app = cli.app.to_ascii_lowercase();
             list.accounts
                 .retain(|account| account.target_app.as_deref().unwrap_or("codex") == target_app);
             if json {
@@ -220,8 +245,10 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Save { json }) => {
-            let output = if cli.app.eq_ignore_ascii_case("cursor") {
+            let output = if target_app == "cursor" {
                 app.save_cursor_current()?
+            } else if target_app == "claude" {
+                app.save_claude_current()?
             } else {
                 app.save_current()?
             };
@@ -233,9 +260,10 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Login { json }) => {
-            if cli.app.eq_ignore_ascii_case("cursor") {
+            if target_app == "cursor" || target_app == "claude" {
                 bail!(
-                    "Login flow automation is not supported for Cursor. Please log in within Cursor first, then run 'save'."
+                    "Login flow automation is not supported for {}. Please log in within the application first, then run 'save'.",
+                    target_app
                 );
             }
             let output = app.login_and_save()?;
@@ -250,9 +278,10 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::Current { json }) => {
-            let target_app = cli.app.to_ascii_lowercase();
             let status = if target_app == "cursor" {
                 app.cursor_status()?
+            } else if target_app == "claude" {
+                app.claude_status()?
             } else {
                 app.status()?
             };
@@ -329,6 +358,32 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::ImportCookies {
+            path,
+            provider,
+            label,
+            json,
+        }) => {
+            let text = if path.as_os_str() == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                    .context("failed to read cookie JSON from stdin")?;
+                buf
+            } else {
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?
+            };
+            let output = app.import_cookies_json(&provider, &text, label)?;
+            if json {
+                print_json(&output)?;
+            } else {
+                print_import_output(&output);
+                for warning in &output.warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Ok(())
+        }
         Some(Command::Rename {
             account,
             label,
@@ -399,8 +454,9 @@ pub fn run() -> Result<()> {
                     app.activate_with_running_policy(account_id, force)?
                 }
                 None => {
-                    let _ = app.interactive(InteractiveMode::ActivateOnce, force)?;
-                    return Ok(());
+                    bail!(
+                        "account id required. Run `list` to see saved accounts, then `activate <ACCOUNT_ID>`."
+                    );
                 }
             };
             if json {
@@ -417,8 +473,9 @@ pub fn run() -> Result<()> {
             let output = match account_id {
                 Some(account_id) => app.delete(account_id)?,
                 None => {
-                    let _ = app.interactive(InteractiveMode::DeleteOnce, false)?;
-                    return Ok(());
+                    bail!(
+                        "account id required. Run `list` to see saved accounts, then `delete <ACCOUNT_ID>`."
+                    );
                 }
             };
             if json {
@@ -565,57 +622,24 @@ pub fn run() -> Result<()> {
     }
 }
 
-fn run_interactive_app<S>(app: &App<S>) -> Result<()>
+fn run_menubar_app<S>(app: Arc<App<S>>, open_dashboard: bool) -> Result<()>
 where
-    S: crate::secrets::SecretStore,
+    S: crate::secrets::SecretStore + Send + Sync + 'static,
 {
     crate::app::spawn_auto_start_usage_windows_worker(app.env().clone());
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        use std::io::IsTerminal;
-        if !std::io::stdin().is_terminal() {
-            crate::tray::hide_console_window();
-            match crate::tray::run(app)? {
-                crate::tray::TrayExit::ShowTui => {
-                    #[cfg(target_os = "macos")]
-                    {
-                        if let Ok(exe) = std::env::current_exe() {
-                            let _ = std::process::Command::new("osascript")
-                                .arg("-e")
-                                .arg(format!(
-                                    "tell application \"Terminal\" to do script \"'{}'\"",
-                                    exe.display()
-                                ))
-                                .spawn();
-                        }
-                    }
-                    return Ok(());
-                }
-                crate::tray::TrayExit::Quit => return Ok(()),
-            }
-        }
-
-        loop {
-            match app.interactive(InteractiveMode::Persistent, false)? {
-                InteractiveExit::Quit => return Ok(()),
-                InteractiveExit::SendToTray => {
-                    if crate::tray::spawn_detached_tray_instance()? {
-                        return Ok(());
-                    }
-                    crate::tray::hide_console_window();
-                    match crate::tray::run(app)? {
-                        crate::tray::TrayExit::ShowTui => crate::tray::show_console_window(),
-                        crate::tray::TrayExit::Quit => return Ok(()),
-                    }
-                }
-            }
+        crate::tray::hide_console_window();
+        match crate::tray::run(app, open_dashboard)? {
+            crate::tray::TrayExit::Quit => Ok(()),
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        match app.interactive(InteractiveMode::Persistent, false)? {
-            InteractiveExit::Quit => Ok(()),
-        }
+        let _ = open_dashboard;
+        bail!(
+            "No graphical tray on this platform. Use CLI subcommands: status, list, save, activate, usage, delete."
+        );
     }
 }
 
@@ -694,8 +718,14 @@ fn account_usage_summary(account: &AccountView) -> Option<String> {
     }
     if let Some(usage) = &account.usage {
         let now = OffsetDateTime::now_utc();
+        let weekly_only = account
+            .target_app
+            .as_deref()
+            .map(|app| app == "codex")
+            .unwrap_or(true);
         let mut parts = Vec::new();
-        if let Some(five_hour) = &usage.five_hour
+        if !weekly_only
+            && let Some(five_hour) = &usage.five_hour
             && five_hour.reset_at > now
         {
             parts.push(format!("5h {}%", five_hour.remaining_percent));
@@ -793,7 +823,7 @@ fn print_pick_best_output(output: &PickBestOutput) {
             .map(|value| format!("{value:+.1}"))
             .unwrap_or_else(|| "n/a".to_owned());
         let marker = if entry.account_id == output.account.id {
-            " ←"
+            " *"
         } else {
             ""
         };
@@ -842,19 +872,27 @@ fn print_batch_refresh_output(output: &BatchRefreshOutput) {
 fn print_usage_summary(usage: &AccountUsageView) {
     println!("Source: {}", format!("{:?}", usage.source).to_lowercase());
     println!("Fetched at: {}", format_local_reset_at(usage.fetched_at));
-    if let Some(five_hour) = &usage.five_hour {
-        println!(
-            "5h remaining: {}% (reset {})",
-            five_hour.remaining_percent,
-            format_local_reset_at(five_hour.reset_at)
-        );
-    }
+    let now = OffsetDateTime::now_utc();
+    // ChatGPT Codex is weekly-only; omit stale/legacy 5h windows from CLI output.
     if let Some(weekly) = &usage.weekly {
-        println!(
-            "Weekly remaining: {}% (reset {})",
-            weekly.remaining_percent,
-            format_local_reset_at(weekly.reset_at)
-        );
+        if weekly.reset_at <= now {
+            println!("Weekly: past reset");
+        } else {
+            print!(
+                "Weekly: {}% left · resets {}",
+                weekly.remaining_percent,
+                crate::time_display::format_countdown(weekly.reset_at, now)
+            );
+            if let Some(pace) =
+                crate::usage_pace::pace_for_weekly(weekly.used_percent, weekly.reset_at, now)
+            {
+                print!(" · {}", pace.summary_label());
+                if let Some(eta) = pace.eta_label(now) {
+                    print!(" · {eta}");
+                }
+            }
+            println!();
+        }
     }
     if let Some(credits) = &usage.credits {
         println!(
@@ -887,12 +925,12 @@ mod tests {
             usage: Some(AccountUsageView {
                 source: UsageSource::SavedAccessToken,
                 fetched_at: OffsetDateTime::UNIX_EPOCH,
-                five_hour: Some(UsageWindowView {
+                five_hour: None,
+                weekly: Some(UsageWindowView {
                     used_percent: 92,
                     remaining_percent: 8,
-                    reset_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                    reset_at: OffsetDateTime::now_utc() + time::Duration::days(2),
                 }),
-                weekly: None,
                 credits: None,
             }),
             usage_error: None,
@@ -907,7 +945,8 @@ mod tests {
 
         assert!(rendered.starts_with("person@example.com [work]"));
         assert!(rendered.contains("status: active, low quota"));
-        assert!(rendered.contains("5h 8%"));
+        assert!(rendered.contains("weekly 8%"));
+        assert!(!rendered.contains("5h "));
         assert!(rendered.contains("id: "));
     }
 }

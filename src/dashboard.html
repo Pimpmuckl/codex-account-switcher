@@ -1,0 +1,2213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChatGPT Codex</title>
+    <style>
+        :root {
+            --bg-0: #0b0f12;
+            --bg-1: #11171c;
+            --bg-2: #171e25;
+            --bg-3: #1d262e;
+            --line: rgba(255, 255, 255, 0.08);
+            --line-strong: rgba(255, 255, 255, 0.15);
+            --text: #f2f6f9;
+            --muted: #a8b6c4;
+            --faint: #7d8d9d;
+            --accent: #16d3b4;
+            --accent-hover: #2de0c2;
+            --accent-press: #12bda0;
+            --accent-dim: rgba(22, 211, 180, 0.14);
+            --accent-border: rgba(22, 211, 180, 0.38);
+            --codex: #5ec8ff;
+            --cursor: #f0a3c2;
+            --claude: #e8a87c;
+            --ok: #3ecf8e;
+            --warn: #e6b35a;
+            --danger: #ef6b6b;
+            --radius: 10px;
+            /* System fonts only — no network font fetch on every overview open */
+            --font: "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+            --mono: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
+            --ease: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html, body {
+            height: 100%;
+            max-height: 100%;
+            overflow: hidden; /* page itself never scrolls — columns scroll independently */
+        }
+
+        body {
+            font-family: var(--font);
+            color: var(--text);
+            background:
+                radial-gradient(900px 480px at 12% -10%, rgba(22, 211, 180, 0.08), transparent 55%),
+                radial-gradient(700px 420px at 100% 0%, rgba(94, 200, 255, 0.06), transparent 50%),
+                linear-gradient(180deg, #0d1216 0%, var(--bg-0) 40%, #090c0f 100%);
+            line-height: 1.45;
+            display: flex;
+            flex-direction: column;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Hide scrollbars everywhere but keep scroll functionality */
+        .scroll-pane,
+        .logs,
+        .account-list.virtual {
+            scrollbar-width: none; /* Firefox */
+            -ms-overflow-style: none; /* legacy Edge */
+        }
+        .scroll-pane::-webkit-scrollbar,
+        .logs::-webkit-scrollbar,
+        .account-list.virtual::-webkit-scrollbar,
+        body::-webkit-scrollbar,
+        *::-webkit-scrollbar {
+            width: 0 !important;
+            height: 0 !important;
+            display: none !important;
+            background: transparent !important;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.9rem 1.5rem;
+            border-bottom: 1px solid var(--line);
+            background: rgba(11, 15, 18, 0.72);
+            backdrop-filter: blur(14px);
+            -webkit-app-region: drag;
+            user-select: none;
+            flex-shrink: 0;
+            flex-wrap: wrap;
+        }
+
+        .platform-macos header {
+            padding-top: 1.65rem;
+            padding-left: 5.25rem;
+        }
+
+        .brand, .header-actions {
+            -webkit-app-region: no-drag;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .header-actions {
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            max-width: 100%;
+        }
+
+        .brand-mark {
+            width: 1.75rem;
+            height: 1.75rem;
+            border-radius: 6px;
+            background: linear-gradient(145deg, var(--accent), #0ea5a0);
+            color: #04120f;
+            font-family: var(--mono);
+            font-weight: 600;
+            font-size: 0.78rem;
+            letter-spacing: -0.04em;
+            display: grid;
+            place-items: center;
+        }
+
+        .brand-copy {
+            display: flex;
+            flex-direction: column;
+            gap: 0.05rem;
+        }
+
+        .brand-title {
+            font-size: 0.98rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+        }
+
+        .brand-sub {
+            font-size: 0.72rem;
+            color: var(--muted);
+            font-family: var(--mono);
+        }
+
+        button {
+            font-family: inherit;
+            cursor: pointer;
+            border: none;
+            outline: none;
+            transition: var(--ease);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.4rem;
+        }
+
+        button:focus-visible {
+            outline: 2px solid rgba(22, 211, 180, 0.55);
+            outline-offset: 1px;
+        }
+
+        .btn {
+            padding: 0.42rem 0.8rem;
+            border-radius: 7px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        .btn-ghost {
+            background: rgba(255, 255, 255, 0.03);
+            color: var(--text);
+            border: 1px solid var(--line-strong);
+        }
+
+        .btn-ghost:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.24);
+        }
+
+        .btn-ghost:active {
+            background: rgba(255, 255, 255, 0.14);
+        }
+
+        .btn-accent {
+            background: var(--accent);
+            color: #04120f;
+            font-weight: 600;
+            border: 1px solid transparent;
+        }
+
+        .btn-accent:hover {
+            background: var(--accent-hover);
+            color: #04120f;
+        }
+
+        .btn-accent:active {
+            background: var(--accent-press);
+        }
+
+        .shell {
+            flex: 1 1 auto;
+            min-height: 0;
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 300px;
+            gap: 1rem;
+            padding: 1rem 1.25rem 1.25rem;
+            align-items: stretch;
+            overflow: hidden;
+        }
+
+        .main {
+            min-width: 0;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 0.85rem;
+            overflow-x: hidden;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            -webkit-overflow-scrolling: touch;
+            padding-right: 0.15rem;
+        }
+
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.75rem;
+            flex-shrink: 0;
+        }
+
+        .summary-card {
+            background: rgba(23, 30, 37, 0.78);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            padding: 0.8rem 0.95rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .summary-label {
+            font-size: 0.72rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.2rem;
+        }
+
+        .summary-value {
+            font-family: var(--mono);
+            font-size: 1.35rem;
+            font-weight: 600;
+            letter-spacing: -0.03em;
+        }
+
+        .dot {
+            width: 0.5rem;
+            height: 0.5rem;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .dot-codex { background: var(--codex); }
+        .dot-cursor { background: var(--cursor); }
+        .dot-claude { background: var(--claude); }
+
+        /* One LLM service per row (Codex → Cursor → Claude) — less vertical scroll than 3-column cards. */
+        .providers {
+            display: flex;
+            flex-direction: column;
+            gap: 0.85rem;
+            align-items: stretch;
+        }
+
+        .provider {
+            background: rgba(17, 23, 28, 0.88);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .provider-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.85rem 0.95rem;
+            border-bottom: 1px solid var(--line);
+            flex-shrink: 0;
+        }
+
+        .provider-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .provider-code {
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            color: var(--faint);
+            border: 1px solid var(--line);
+            border-radius: 4px;
+            padding: 0.1rem 0.35rem;
+        }
+
+        .account-list {
+            padding: 0.7rem;
+            /* Accounts flow across the full row width instead of one tall column. */
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 0.65rem;
+        }
+
+        .account-list.virtual {
+            display: block;
+            max-height: min(52vh, 560px);
+            overflow-y: auto;
+            overflow-x: hidden;
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior: contain;
+            gap: 0;
+            position: relative;
+        }
+
+        .account-list.virtual .virt-window {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+            gap: 0.65rem;
+        }
+
+        .virt-spacer {
+            width: 100%;
+            pointer-events: none;
+        }
+
+        .virt-window {
+            display: flex;
+            flex-direction: column;
+            gap: 0.65rem;
+        }
+
+        .virt-meta {
+            font-size: 0.68rem;
+            color: var(--faint);
+            font-family: var(--mono);
+            padding: 0 0.15rem 0.35rem;
+        }
+
+        .skeleton-card {
+            background: var(--bg-2);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            padding: 0.85rem;
+            min-height: 5.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+
+        .skeleton-line {
+            height: 0.65rem;
+            border-radius: 4px;
+            background: linear-gradient(90deg, rgba(255,255,255,0.04), rgba(255,255,255,0.1), rgba(255,255,255,0.04));
+            background-size: 200% 100%;
+            animation: skeleton-shine 1.1s ease-in-out infinite;
+        }
+
+        .skeleton-line.w40 { width: 40%; }
+        .skeleton-line.w60 { width: 60%; }
+        .skeleton-line.w80 { width: 80%; }
+        .skeleton-line.w100 { width: 100%; height: 0.32rem; margin-top: 0.35rem; }
+
+        .empty {
+            border: 1px dashed var(--line-strong);
+            border-radius: var(--radius);
+            color: var(--muted);
+            text-align: center;
+            padding: 2rem 1rem;
+            font-size: 0.82rem;
+        }
+
+        .account {
+            background: var(--bg-2);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            padding: 0.85rem;
+            transition: var(--ease);
+        }
+
+        .account:hover {
+            border-color: rgba(255, 255, 255, 0.18);
+            background: var(--bg-3);
+        }
+
+        .account.active {
+            border-color: var(--accent-border);
+            background: linear-gradient(180deg, rgba(22, 211, 180, 0.1), rgba(23, 30, 37, 0.92));
+            box-shadow: inset 0 0 0 1px rgba(22, 211, 180, 0.1);
+        }
+
+        .account.active:hover {
+            background: linear-gradient(180deg, rgba(22, 211, 180, 0.14), rgba(23, 30, 37, 0.95));
+        }
+
+        .account-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 0.5rem;
+            margin-bottom: 0.45rem;
+        }
+
+        .account-email {
+            font-size: 0.86rem;
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            min-width: 0;
+        }
+
+        .chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.28rem;
+            margin-bottom: 0.55rem;
+        }
+
+        .chip {
+            font-size: 0.65rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            border-radius: 999px;
+            padding: 0.12rem 0.42rem;
+            border: 1px solid transparent;
+        }
+
+        .chip-active {
+            color: #b8f5d8;
+            background: rgba(62, 207, 142, 0.12);
+            border-color: rgba(62, 207, 142, 0.28);
+        }
+
+        .chip-plan {
+            color: #b7fff0;
+            background: var(--accent-dim);
+            border-color: var(--accent-border);
+        }
+
+        .chip-exhausted {
+            color: #ffc2c2;
+            background: rgba(239, 107, 107, 0.12);
+            border-color: rgba(239, 107, 107, 0.28);
+        }
+
+        .chip-login {
+            color: #ffd9a8;
+            background: rgba(230, 179, 90, 0.12);
+            border-color: rgba(230, 179, 90, 0.28);
+        }
+
+        .account-label {
+            font-size: 0.74rem;
+            color: var(--muted);
+            margin-bottom: 0.55rem;
+        }
+
+        .meters {
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+
+        .meter-row {
+            display: grid;
+            grid-template-columns: 2.8rem 1fr auto;
+            gap: 0.45rem;
+            align-items: center;
+        }
+
+        .meter-label {
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            color: var(--muted);
+        }
+
+        .meter-track {
+            height: 0.32rem;
+            background: rgba(255, 255, 255, 0.06);
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .meter-fill {
+            height: 100%;
+            border-radius: 999px;
+            /* No width transition — poll/tick updates would jank */
+        }
+
+        .skeleton {
+            background: linear-gradient(90deg, rgba(255,255,255,0.04), rgba(255,255,255,0.08), rgba(255,255,255,0.04));
+            background-size: 200% 100%;
+            animation: skeleton-shine 1.1s ease-in-out infinite;
+            border-radius: 8px;
+            min-height: 4.5rem;
+        }
+
+        @keyframes skeleton-shine {
+            0% { background-position: 100% 0; }
+            100% { background-position: -100% 0; }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .toast, .skeleton, button, .account, .switch-btn, .link-btn, .slider, .slider:before {
+                animation: none !important;
+                transition: none !important;
+            }
+        }
+
+        .fill-ok { background: var(--ok); }
+        .fill-warn { background: var(--warn); }
+        .fill-danger { background: var(--danger); }
+
+        .meter-meta {
+            font-family: var(--mono);
+            font-size: 0.68rem;
+            color: var(--text);
+            min-width: 7.5rem;
+            text-align: right;
+            line-height: 1.3;
+            white-space: normal;
+        }
+
+        .meter-meta .reset {
+            color: var(--warn);
+        }
+
+        .meter-meta .reset-at {
+            display: block;
+            color: var(--faint);
+            font-weight: 400;
+            font-size: 0.64rem;
+        }
+
+        .pace-line {
+            margin-top: 0.45rem;
+            font-size: 0.72rem;
+            color: var(--muted);
+            font-family: var(--mono);
+        }
+
+        .pace-line .deficit { color: var(--danger); }
+        .pace-line .reserve { color: var(--ok); }
+
+        .usage-note {
+            font-size: 0.74rem;
+            color: var(--muted);
+            margin-top: 0.35rem;
+        }
+
+        .account-actions {
+            margin-top: 0.75rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .action-group {
+            display: flex;
+            gap: 0.25rem;
+        }
+
+        .link-btn {
+            background: transparent;
+            color: var(--muted);
+            font-size: 0.74rem;
+            padding: 0.25rem 0.4rem;
+            border-radius: 5px;
+        }
+
+        .link-btn:hover {
+            color: var(--text);
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .link-btn:active {
+            background: rgba(255, 255, 255, 0.12);
+        }
+
+        .switch-btn {
+            background: var(--accent-dim);
+            color: var(--accent);
+            border: 1px solid var(--accent-border);
+            font-size: 0.74rem;
+            font-weight: 600;
+            padding: 0.28rem 0.6rem;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: var(--ease);
+        }
+
+        .switch-btn:hover {
+            background: var(--accent);
+            color: #04120f;
+            border-color: transparent;
+        }
+
+        .switch-btn:active {
+            background: var(--accent-press);
+            color: #04120f;
+        }
+
+        .side {
+            display: flex;
+            flex-direction: column;
+            gap: 0.85rem;
+            min-height: 0;
+            max-height: 100%;
+            overflow: hidden; /* right column does not ride the left list scroll */
+            align-self: stretch;
+        }
+
+        .panel {
+            background: rgba(17, 23, 28, 0.88);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 0.95rem;
+            flex-shrink: 0;
+        }
+
+        .panel.logs-panel {
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        .lang-toggle {
+            display: inline-flex;
+            border: 1px solid var(--line-strong);
+            border-radius: 7px;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .lang-toggle button {
+            background: transparent;
+            color: var(--muted);
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            padding: 0.28rem 0.55rem;
+            min-width: 2.2rem;
+        }
+
+        .lang-toggle button.active {
+            background: var(--accent-dim);
+            color: var(--accent);
+        }
+
+        .lang-toggle button:hover:not(.active) {
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text);
+        }
+
+        .panel-title {
+            font-size: 0.82rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            margin-bottom: 0.85rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid var(--line);
+        }
+
+        .setting {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 0.75rem;
+            padding: 0.55rem 0;
+        }
+
+        .setting + .setting {
+            border-top: 1px solid rgba(255, 255, 255, 0.04);
+        }
+
+        .setting-label {
+            font-size: 0.82rem;
+            font-weight: 500;
+        }
+
+        .setting-desc {
+            font-size: 0.72rem;
+            color: var(--muted);
+            margin-top: 0.15rem;
+            max-width: 14rem;
+        }
+
+        .switch {
+            position: relative;
+            width: 2.4rem;
+            height: 1.3rem;
+            flex-shrink: 0;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            inset: 0;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--line-strong);
+            border-radius: 999px;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+
+        .slider:before {
+            content: "";
+            position: absolute;
+            width: 0.9rem;
+            height: 0.9rem;
+            left: 0.15rem;
+            top: 50%;
+            transform: translateY(-50%);
+            background: #d7dee6;
+            border-radius: 50%;
+            transition: 0.2s;
+        }
+
+        .switch input:checked + .slider {
+            background: var(--accent-dim);
+            border-color: var(--accent-border);
+        }
+
+        .switch input:checked + .slider:before {
+            transform: translate(1.05rem, -50%);
+            background: var(--accent);
+        }
+
+        .logs {
+            flex: 1 1 auto;
+            min-height: 0;
+            max-height: none;
+            overflow-x: hidden;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            display: flex;
+            flex-direction: column;
+            gap: 0.55rem;
+            /* scrollbar fully hidden via global rule above */
+        }
+
+        .credits {
+            margin-top: 0.35rem;
+            padding-top: 0.65rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.04);
+            font-size: 0.68rem;
+            color: var(--faint);
+            line-height: 1.45;
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+        }
+
+        .credits a {
+            color: var(--muted);
+            text-decoration: none;
+            word-break: break-all;
+        }
+
+        .credits a:hover {
+            color: var(--accent);
+            text-decoration: underline;
+        }
+
+        .log-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 0.65rem;
+            padding: 0.42rem 0.15rem 0.42rem 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        }
+
+        .log-copy {
+            min-width: 0;
+            flex: 1;
+        }
+
+        .log-message {
+            font-size: 0.76rem;
+            display: block;
+            line-height: 1.35;
+            word-break: break-word;
+        }
+
+        .log-subtext {
+            font-size: 0.68rem;
+            color: var(--muted);
+            display: block;
+            margin-top: 0.12rem;
+            font-family: var(--mono);
+        }
+
+        .log-time {
+            font-family: var(--mono);
+            font-size: 0.66rem;
+            color: var(--faint);
+            white-space: nowrap;
+            flex-shrink: 0;
+            opacity: 0.85;
+            padding-top: 0.1rem;
+        }
+
+        .toasts {
+            position: fixed;
+            bottom: 1.25rem;
+            right: 1.25rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+            z-index: 100;
+        }
+
+        .toast {
+            min-width: 220px;
+            max-width: 320px;
+            background: rgba(17, 23, 28, 0.96);
+            border: 1px solid var(--line-strong);
+            border-left: 3px solid var(--accent);
+            border-radius: 8px;
+            padding: 0.7rem 0.9rem;
+            font-size: 0.8rem;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+            animation: toast-in 0.22s ease;
+        }
+
+        .toast.success { border-left-color: var(--ok); }
+        .toast.error { border-left-color: var(--danger); }
+        .toast.warning { border-left-color: var(--warn); }
+
+        @keyframes toast-in {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @media (max-width: 980px) {
+            html, body {
+                overflow: auto;
+                height: auto;
+                max-height: none;
+            }
+            .shell {
+                grid-template-columns: 1fr;
+                overflow: visible;
+                min-height: auto;
+            }
+            .main {
+                overflow: visible;
+            }
+            .summary {
+                grid-template-columns: 1fr;
+            }
+            .account-list,
+            .account-list.virtual .virt-window {
+                grid-template-columns: 1fr;
+            }
+            .side {
+                overflow: visible;
+                max-height: none;
+            }
+            .panel.logs-panel {
+                flex: none;
+            }
+            .logs {
+                max-height: 220px;
+            }
+        }
+
+        .live-banners { display: flex; flex-direction: column; gap: 0.55rem; margin-bottom: 0.85rem; }
+        .live-banner {
+            display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+            padding: 0.7rem 0.85rem; border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.03);
+        }
+        .live-banner-title { font-weight: 650; font-size: 0.92rem; }
+        .live-banner-meta { color: var(--muted, #9aa8b5); font-size: 0.78rem; margin-top: 0.15rem; }
+        .import-overlay {
+            position: fixed; inset: 0; z-index: 50; display: none;
+            align-items: center; justify-content: center; padding: 1rem;
+            background: rgba(0,0,0,0.5);
+        }
+        .import-overlay.open { display: flex; }
+        .import-sheet {
+            width: min(520px, 100%); background: #151a21; border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 14px; padding: 1rem; display: flex; flex-direction: column; gap: 0.55rem;
+        }
+        .import-sheet textarea {
+            min-height: 160px; width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.78rem; border-radius: 10px; border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.03); color: inherit; padding: 0.55rem;
+        }
+        .import-sheet select {
+            border-radius: 10px; border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.03); color: inherit; padding: 0.45rem 0.55rem;
+        }
+        .import-error { color: #ffb8b8; font-size: 0.8rem; display: none; }
+        .import-error.show { display: block; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="brand">
+            <div class="brand-mark">CX</div>
+            <div class="brand-copy">
+                <div class="brand-title">ChatGPT Codex</div>
+                <div class="brand-sub" data-i18n="brandSub">limits · accounts · resets</div>
+            </div>
+        </div>
+        <div class="header-actions">
+            <button class="btn btn-ghost" onclick="saveActiveAccount('codex')" data-i18n="backupCodex">Backup Codex</button>
+            <button class="btn btn-ghost" onclick="saveActiveAccount('cursor')" data-i18n="backupCursor">Backup Cursor</button>
+            <button class="btn btn-ghost" onclick="saveActiveAccount('claude')" data-i18n="backupClaude">Backup Claude</button>
+            <button class="btn btn-ghost" onclick="openImportCookies()" data-i18n="importCookies">Import Codex cookies</button>
+            <button class="btn btn-accent" onclick="triggerBestQuota()" data-i18n="autoSwitchBest">Auto Switch Best</button>
+        </div>
+    </header>
+
+    <div class="shell">
+        <div class="main scroll-pane">
+            <div class="summary">
+                <div class="summary-card">
+                    <div>
+                        <div class="summary-label">ChatGPT Codex</div>
+                        <div id="codex-count" class="summary-value">0</div>
+                    </div>
+                    <div class="dot dot-codex"></div>
+                </div>
+                <div class="summary-card">
+                    <div>
+                        <div class="summary-label">Cursor</div>
+                        <div id="cursor-count" class="summary-value">0</div>
+                    </div>
+                    <div class="dot dot-cursor"></div>
+                </div>
+                <div class="summary-card">
+                    <div>
+                        <div class="summary-label">Claude</div>
+                        <div id="claude-count" class="summary-value">0</div>
+                    </div>
+                    <div class="dot dot-claude"></div>
+                </div>
+            </div>
+
+            <div id="live-banners" class="live-banners"></div>
+            <div id="add-pending-banner" class="live-banners"></div>
+
+            <div class="providers">
+                <section class="provider">
+                    <div class="provider-head">
+                        <div class="provider-title">
+                            <span class="dot dot-codex"></span>
+                            ChatGPT Codex
+                        </div>
+                        <div style="display:flex;gap:0.4rem;align-items:center">
+                          <button class="btn btn-ghost" onclick="addAccount('codex')" data-i18n="addAccount">Add account</button>
+                          <span class="provider-code">CX</span>
+                        </div>
+                    </div>
+                    <div id="codex-list" class="account-list" data-loading="1" aria-busy="true">
+                        <div class="skeleton-card"><div class="skeleton-line w60"></div><div class="skeleton-line w40"></div><div class="skeleton-line w100"></div></div>
+                        <div class="skeleton-card"><div class="skeleton-line w80"></div><div class="skeleton-line w40"></div><div class="skeleton-line w100"></div></div>
+                    </div>
+                </section>
+
+                <section class="provider">
+                    <div class="provider-head">
+                        <div class="provider-title">
+                            <span class="dot dot-cursor"></span>
+                            Cursor IDE
+                        </div>
+                        <div style="display:flex;gap:0.4rem;align-items:center">
+                          <button class="btn btn-ghost" onclick="addAccount('cursor')" data-i18n="addAccount">Add account</button>
+                          <span class="provider-code">CR</span>
+                        </div>
+                    </div>
+                    <div id="cursor-list" class="account-list" data-loading="1" aria-busy="true">
+                        <div class="skeleton-card"><div class="skeleton-line w60"></div><div class="skeleton-line w40"></div><div class="skeleton-line w100"></div></div>
+                    </div>
+                </section>
+
+                <section class="provider">
+                    <div class="provider-head">
+                        <div class="provider-title">
+                            <span class="dot dot-claude"></span>
+                            Claude Code
+                        </div>
+                        <div style="display:flex;gap:0.4rem;align-items:center">
+                          <button class="btn btn-ghost" onclick="addAccount('claude')" data-i18n="addAccount">Add account</button>
+                          <span class="provider-code">CL</span>
+                        </div>
+                    </div>
+                    <div id="claude-list" class="account-list" data-loading="1" aria-busy="true">
+                        <div class="skeleton-card"><div class="skeleton-line w60"></div><div class="skeleton-line w40"></div><div class="skeleton-line w100"></div></div>
+                    </div>
+                </section>
+            </div>
+        </div>
+
+        <aside class="side">
+            <div class="panel">
+                <div class="panel-title" data-i18n="preferences">Preferences</div>
+                <div class="setting">
+                    <div>
+                        <div class="setting-label" data-i18n="langLabel">Language</div>
+                        <div class="setting-desc" data-i18n="langDesc">English or Vietnamese UI.</div>
+                    </div>
+                    <div class="lang-toggle" role="group" aria-label="Language">
+                        <button type="button" id="lang-en" onclick="setUiLanguage('en')">EN</button>
+                        <button type="button" id="lang-vi" onclick="setUiLanguage('vi')">VI</button>
+                    </div>
+                </div>
+                <div class="setting">
+                    <div>
+                        <div class="setting-label" data-i18n="showQuotaLabel">Show quota in menu bar</div>
+                        <div class="setting-desc" data-i18n="showQuotaDesc">CX / CR / CL remaining limits next to the tray icon.</div>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="setting-menu-bar" onchange="toggleSetting('menu-bar')">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="setting">
+                    <div>
+                        <div class="setting-label" data-i18n="autoSwitchLabel">Auto-switch when exhausted</div>
+                        <div class="setting-desc" data-i18n="autoSwitchDesc">Activate the best eligible account when quota runs out.</div>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="setting-auto-switch" onchange="toggleSetting('auto-switch')">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="panel logs-panel">
+                <div class="panel-title" data-i18n="activity">Activity</div>
+                <div id="logs-list" class="logs">
+                    <div class="empty" data-i18n="noActivity">No recent activity</div>
+                </div>
+            </div>
+            <div class="credits">
+                <div>
+                    <span data-i18n="forkPrefix">Forked from</span>
+                    <a href="https://github.com/Pimpmuckl/codex-account-switcher" target="_blank" rel="noopener noreferrer">Pimpmuckl/codex-account-switcher</a>
+                </div>
+                <div>
+                    <span data-i18n="creditsPrefix">UI/UX &amp; pace inspiration:</span>
+                    <a href="https://github.com/steipete/CodexBar" target="_blank" rel="noopener noreferrer">CodexBar</a>
+                    <span data-i18n="creditsBy">by steipete</span>
+                </div>
+            </div>
+        </aside>
+    </div>
+
+    <div id="toasts" class="toasts"></div>
+
+    <script>
+        const WEEKLY_SECS = 168 * 3600;
+        const MIN_ELAPSED = 0.03;
+
+        const I18N = {
+            en: {
+                brandSub: 'limits · accounts · resets',
+                backupCodex: 'Backup Codex',
+                backupCursor: 'Backup Cursor',
+                backupClaude: 'Backup Claude',
+                autoSwitchBest: 'Auto Switch Best',
+                emptyCodex: 'No saved Codex accounts',
+                emptyCursor: 'No saved Cursor accounts',
+                emptyClaude: 'No saved Claude accounts',
+                preferences: 'Preferences',
+                langLabel: 'Language',
+                langDesc: 'English or Vietnamese UI.',
+                showQuotaLabel: 'Show quota in menu bar',
+                showQuotaDesc: 'CX / CR / CL remaining limits next to the tray icon.',
+                autoSwitchLabel: 'Auto-switch when exhausted',
+                autoSwitchDesc: 'Activate the best eligible account when quota runs out.',
+                activity: 'Activity',
+                noActivity: 'No recent activity',
+                forkPrefix: 'Forked from',
+                creditsPrefix: 'UI/UX & pace inspiration:',
+                creditsBy: 'by steipete',
+                emptyAccounts: 'No saved {label} accounts',
+                active: 'Active',
+                exhausted: 'Exhausted',
+                login: 'Login',
+                archive: 'Archive',
+                unarchive: 'Unarchive',
+                delete: 'Delete',
+                switch: 'Switch',
+                week: 'Week',
+                session: '5h',
+                pastReset: 'past reset',
+                loginRequiredUsage: 'Login required to refresh usage',
+                noCachedUsage: 'No cached usage yet',
+                noActiveWindows: 'No active quota windows',
+                credits: 'Credits',
+                unlimited: 'unlimited',
+                onPace: 'On pace',
+                inDeficit: '{n}% in deficit',
+                inReserve: '{n}% in reserve',
+                lastsUntilReset: 'Lasts until reset',
+                runsOutNow: 'Runs out now',
+                runsOutIn: 'Runs out in {time}',
+                now: 'now',
+                importCookies: 'Import Codex cookies',
+                importTitle: 'Import Codex from cookies JSON',
+                importHelp: 'Choose a browser cookie export or Codex tokens JSON file. ChatGPT Codex / OpenAI only — Cursor and Claude use Save signed-in session.',
+                importChooseFile: 'Choose JSON file',
+                importNoFile: 'No file selected',
+                importPasteToggle: 'Or paste JSON',
+                importPasteHide: 'Hide paste',
+                importSubmit: 'Import',
+                importCancel: 'Cancel',
+                importing: 'Importing…',
+                importedOk: 'Imported {email}',
+                importFailed: 'Import failed: {error}',
+                importCursorUnsupported: 'Cursor cookie import is not supported. Save a live Cursor session instead.',
+                importClaudeUnsupported: 'Claude cookie import is not supported. Save a live Claude session instead.',
+                liveDetected: 'Detected session',
+                unsavedLive: 'Not saved yet',
+                signedInUnknown: 'Signed in (email unknown)',
+                saveLive: 'Save signed-in session',
+                addAccount: 'Add account',
+                addPendingTitle: 'Adding Codex account / workspace',
+                addPendingStep1: 'Log in to Codex with the new account or workspace',
+                addPendingStep2: 'Return here when login finishes',
+                addPendingStep3: 'Choose Finish to save the new account',
+                finishAdd: 'Finish',
+                cancelAdd: 'Cancel',
+                addingAccount: 'Starting add-account…',
+                addStarted: 'Log in to Codex, then Finish here',
+                addFinished: 'Added {email}',
+                addCancelled: 'Cancelled — original account restored',
+                addCursorHint: 'Sign in to Cursor with the new account, then Save signed-in session.',
+                addClaudeHint: 'Sign in to Claude with the new account, then Save signed-in session.',
+                connectionFailed: 'Connection failed. Retrying...',
+                switchingAccount: 'Switching account...',
+                switchedOk: 'Switched successfully',
+                switchFailed: 'Switch failed: {error}',
+                connectFailed: 'Failed to connect to backend',
+                savingApp: 'Saving current {app} credentials...',
+                savedApp: 'Saved {app} account',
+                saveFailed: 'Failed to save: {error}',
+                findingBest: 'Finding best quota...',
+                switchedBest: 'Switched to best account',
+                noBetter: 'No better account: {error}',
+                archived: 'Account archived',
+                restored: 'Account restored',
+                failed: 'Failed: {error}',
+                confirmDelete: 'Delete {email}?',
+                deleted: 'Account deleted',
+                confirmKillThenSwitch: '{n} running process(es) may block a reliable switch:\n{list}\n\nQuit them and switch now?',
+                terminating: 'Terminating processes...',
+                terminated: 'Processes terminated',
+                terminateFailed: 'Failed to terminate: {error}',
+                settingsSaved: 'Settings saved',
+                ready: 'Ready',
+                low: 'Low',
+                depleted: 'Depleted',
+            },
+            vi: {
+                brandSub: 'hạn mức · tài khoản · làm mới',
+                backupCodex: 'Sao lưu Codex',
+                backupCursor: 'Sao lưu Cursor',
+                backupClaude: 'Sao lưu Claude',
+                autoSwitchBest: 'Tự chuyển tốt nhất',
+                emptyCodex: 'Chưa có tài khoản Codex',
+                emptyCursor: 'Chưa có tài khoản Cursor',
+                emptyClaude: 'Chưa có tài khoản Claude',
+                preferences: 'Tùy chọn',
+                langLabel: 'Ngôn ngữ',
+                langDesc: 'Giao diện tiếng Anh hoặc tiếng Việt.',
+                showQuotaLabel: 'Hiện hạn mức trên menu bar',
+                showQuotaDesc: 'CX / CR / CL còn lại cạnh biểu tượng trên menu bar.',
+                autoSwitchLabel: 'Tự chuyển khi hết hạn mức',
+                autoSwitchDesc: 'Bật tài khoản đủ điều kiện tốt nhất khi hết hạn mức.',
+                activity: 'Hoạt động',
+                noActivity: 'Chưa có hoạt động gần đây',
+                forkPrefix: 'Fork từ',
+                creditsPrefix: 'Gợi ý giao diện & nhịp dùng:',
+                creditsBy: 'của steipete',
+                emptyAccounts: 'Chưa có tài khoản {label}',
+                active: 'Đang dùng',
+                exhausted: 'Hết hạn mức',
+                login: 'Đăng nhập',
+                archive: 'Lưu trữ',
+                unarchive: 'Bỏ lưu trữ',
+                delete: 'Xóa',
+                switch: 'Chuyển',
+                week: 'Tuần',
+                session: '5 giờ',
+                pastReset: 'đã qua mốc làm mới',
+                loginRequiredUsage: 'Cần đăng nhập để làm mới hạn mức',
+                noCachedUsage: 'Chưa có dữ liệu hạn mức đã lưu',
+                noActiveWindows: 'Không có cửa sổ hạn mức đang hoạt động',
+                credits: 'Tín dụng',
+                unlimited: 'không giới hạn',
+                onPace: 'Đúng nhịp',
+                inDeficit: 'Thiếu {n}%',
+                inReserve: 'Dư {n}%',
+                lastsUntilReset: 'Đủ đến lúc làm mới',
+                runsOutNow: 'Hết ngay',
+                runsOutIn: 'Hết sau {time}',
+                now: 'ngay',
+                importCookies: 'Nhập cookies Codex',
+                importTitle: 'Nhập Codex từ cookies JSON',
+                importHelp: 'Chọn file JSON cookies trình duyệt hoặc tokens Codex. Chỉ ChatGPT Codex / OpenAI — Cursor và Claude dùng Lưu phiên đang đăng nhập.',
+                importChooseFile: 'Chọn file JSON',
+                importNoFile: 'Chưa chọn file',
+                importPasteToggle: 'Hoặc dán JSON',
+                importPasteHide: 'Ẩn phần dán',
+                importSubmit: 'Nhập',
+                importCancel: 'Hủy',
+                importing: 'Đang nhập…',
+                importedOk: 'Đã nhập {email}',
+                importFailed: 'Nhập thất bại: {error}',
+                importCursorUnsupported: 'Không hỗ trợ nhập cookies Cursor. Hãy lưu phiên Cursor đang đăng nhập.',
+                importClaudeUnsupported: 'Không hỗ trợ nhập cookies Claude. Hãy lưu phiên Claude đang đăng nhập.',
+                liveDetected: 'Phiên đang dùng',
+                unsavedLive: 'Chưa lưu',
+                signedInUnknown: 'Đã đăng nhập (chưa rõ email)',
+                saveLive: 'Lưu phiên đang đăng nhập',
+                addAccount: 'Thêm tài khoản',
+                addPendingTitle: 'Đang thêm tài khoản / workspace Codex',
+                addPendingStep1: 'Đăng nhập Codex bằng tài khoản hoặc workspace mới',
+                addPendingStep2: 'Quay lại đây khi đăng nhập xong',
+                addPendingStep3: 'Chọn Hoàn tất để lưu tài khoản mới',
+                finishAdd: 'Hoàn tất',
+                cancelAdd: 'Hủy',
+                addingAccount: 'Đang bắt đầu thêm tài khoản…',
+                addStarted: 'Đăng nhập Codex, rồi bấm Hoàn tất tại đây',
+                addFinished: 'Đã thêm {email}',
+                addCancelled: 'Đã hủy — khôi phục tài khoản cũ',
+                addCursorHint: 'Đăng nhập Cursor bằng tài khoản mới, rồi Lưu phiên đang đăng nhập.',
+                addClaudeHint: 'Đăng nhập Claude bằng tài khoản mới, rồi Lưu phiên đang đăng nhập.',
+                connectionFailed: 'Mất kết nối. Đang thử lại...',
+                switchingAccount: 'Đang chuyển tài khoản...',
+                switchedOk: 'Đã chuyển thành công',
+                switchFailed: 'Chuyển thất bại: {error}',
+                connectFailed: 'Không kết nối được máy chủ',
+                savingApp: 'Đang lưu thông tin {app}...',
+                savedApp: 'Đã lưu tài khoản {app}',
+                saveFailed: 'Lưu thất bại: {error}',
+                findingBest: 'Đang tìm hạn mức tốt nhất...',
+                switchedBest: 'Đã chuyển sang tài khoản tốt nhất',
+                noBetter: 'Không có tài khoản tốt hơn: {error}',
+                archived: 'Đã lưu trữ tài khoản',
+                restored: 'Đã khôi phục tài khoản',
+                failed: 'Thất bại: {error}',
+                confirmDelete: 'Xóa {email}?',
+                deleted: 'Đã xóa tài khoản',
+                confirmKillThenSwitch: '{n} tiến trình đang chạy có thể chặn đổi tài khoản:\n{list}\n\nTắt chúng và chuyển ngay?',
+                terminating: 'Đang tắt tiến trình...',
+                terminated: 'Đã tắt tiến trình',
+                terminateFailed: 'Không tắt được: {error}',
+                settingsSaved: 'Đã lưu tùy chọn',
+                ready: 'Sẵn sàng',
+                low: 'Sắp hết',
+                depleted: 'Đã hết',
+            },
+        };
+
+        let currentStatus = null;
+        let lang = 'en';
+        let lastStatusKey = '';
+        let pollTimer = null;
+        let tickTimer = null;
+        let fetchInFlight = false;
+        let fetchAbort = null;
+        /** Process scan only on switch (not polled for overview UI). */
+        const POLL_MS = 20000;
+        /** Local countdown tick without hitting the API. */
+        const TICK_MS = 30000;
+        /** Virtualize provider lists once they exceed this count. */
+        const VIRTUAL_THRESHOLD = 50;
+        const VIRT_ITEM_H = 168;
+        const VIRT_OVERSCAN = 4;
+        /** @type {Map<string, {items: any[], activeId: string|null, weeklyOnly: boolean, label: string}>} */
+        const virtualLists = new Map();
+
+        function t(key, vars = {}) {
+            const dict = I18N[lang] || I18N.en;
+            let text = dict[key] ?? I18N.en[key] ?? key;
+            Object.keys(vars).forEach((name) => {
+                text = text.replaceAll(`{${name}}`, String(vars[name]));
+            });
+            return text;
+        }
+
+        function applyStaticI18n() {
+            document.documentElement.lang = lang;
+            document.querySelectorAll('[data-i18n]').forEach((el) => {
+                const key = el.getAttribute('data-i18n');
+                if (key) el.textContent = t(key);
+            });
+            const enBtn = document.getElementById('lang-en');
+            const viBtn = document.getElementById('lang-vi');
+            if (enBtn && viBtn) {
+                enBtn.classList.toggle('active', lang === 'en');
+                viBtn.classList.toggle('active', lang === 'vi');
+            }
+        }
+
+        function setUiLanguage(next) {
+            if (next !== 'en' && next !== 'vi') return;
+            lang = next;
+            applyStaticI18n();
+            lastStatusKey = '';
+            renderUI();
+            postApi('/api/settings', { key: 'ui-language', value: next })
+                .then((data) => {
+                    if (data.success) showToast(t('settingsSaved'), 'success');
+                    else showToast(t('failed', { error: data.error || '' }), 'error');
+                })
+                .catch(() => showToast(t('connectFailed'), 'error'));
+        }
+
+        function statusFingerprint(data) {
+            try {
+                const accounts = (data.accounts || []).map((a) => [
+                    a.id,
+                    a.email,
+                    a.target_app || 'codex',
+                    a.is_archived ? 1 : 0,
+                    a.plan_label || '',
+                    a.usage?.weekly?.remaining_percent ?? null,
+                    a.usage?.weekly?.reset_at ?? null,
+                    a.usage?.five_hour?.remaining_percent ?? null,
+                    a.usage?.five_hour?.reset_at ?? null,
+                    a.usage_error || '',
+                ]);
+                const liveKey = (live) => (live ? [live.email || '', live.plan_label || ''] : null);
+                const warnings = (data.process_warnings || []).map((w) => w.pid).join(',');
+                const logsLen = (data.logs || []).length;
+                const lastLog = logsLen ? data.logs[0]?.timestamp : 0;
+                return JSON.stringify({
+                    lang,
+                    ac: data.active_codex_id,
+                    ar: data.active_cursor_id,
+                    al: data.active_claude_id,
+                    lc: liveKey(data.live_codex),
+                    lr: liveKey(data.live_cursor),
+                    ll: liveKey(data.live_claude),
+                    pending: !!data.codex_add_account_pending,
+                    settings: data.settings,
+                    accounts,
+                    warnings,
+                    logsLen,
+                    lastLog,
+                });
+            } catch (_) {
+                return String(Date.now());
+            }
+        }
+
+        function startPolling() {
+            if (pollTimer) clearInterval(pollTimer);
+            if (tickTimer) clearInterval(tickTimer);
+            pollTimer = setInterval(() => fetchState({ quiet: true }), POLL_MS);
+            tickTimer = setInterval(tickCountdowns, TICK_MS);
+        }
+
+        function stopPolling() {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+            if (tickTimer) {
+                clearInterval(tickTimer);
+                tickTimer = null;
+            }
+        }
+
+        function tickCountdowns() {
+            if (document.hidden || !currentStatus) return;
+            patchMetersInPlace();
+        }
+
+        function patchMetersInPlace() {
+            const now = new Date();
+            document.querySelectorAll('.meter-row').forEach((row) => {
+                const meta = row.querySelector('.meter-meta');
+                const fill = row.querySelector('.meter-fill');
+                if (!meta || !fill) return;
+                const resetIso = row.getAttribute('data-reset-at');
+                if (!resetIso) return;
+                const resetAt = parseResetAt(resetIso);
+                if (!resetAt) return;
+                const remaining = Number(row.getAttribute('data-remaining') || '0');
+                const resetDt = formatResetDateTime(resetAt);
+                const resetLine = resetDt ? `<span class="reset-at">${escapeHtml(resetDt)}</span>` : '';
+                if (remaining === 0 && resetAt > now) {
+                    meta.innerHTML = `<span class="reset">${escapeHtml(formatCountdown(resetAt, now))}</span>${resetLine}`;
+                } else if (resetAt > now) {
+                    meta.innerHTML = `${remaining}% <span class="reset">${escapeHtml(formatCountdown(resetAt, now))}</span>${resetLine}`;
+                } else {
+                    meta.innerHTML = `${escapeHtml(t('pastReset'))}${resetLine}`;
+                    fill.style.width = '0%';
+                }
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            applyStaticI18n();
+            fetchState({ force: true });
+            startPolling();
+        });
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                stopPolling();
+            } else {
+                fetchState({ force: true, quiet: true });
+                startPolling();
+            }
+        });
+
+        function fetchState(opts) {
+            const force = !!(opts && opts.force);
+            const quiet = !!(opts && opts.quiet);
+            if (fetchInFlight && !force) return;
+            if (document.hidden && !force) return;
+            if (fetchAbort) {
+                try { fetchAbort.abort(); } catch (_) {}
+            }
+            const ctrl = new AbortController();
+            fetchAbort = ctrl;
+            fetchInFlight = true;
+            const timer = setTimeout(() => ctrl.abort(), 12000);
+            // Status without process scan — blockers are checked only in the switch flow.
+            fetch('/api/status', { signal: ctrl.signal })
+                .then(res => res.json())
+                .then(data => {
+                    currentStatus = data;
+                    const resolved = data?.settings?.ui_language_resolved;
+                    if (resolved === 'en' || resolved === 'vi') {
+                        if (lang !== resolved) {
+                            lang = resolved;
+                            applyStaticI18n();
+                        }
+                    }
+                    const key = statusFingerprint(data);
+                    if (!force && key === lastStatusKey) {
+                        patchMetersInPlace();
+                        return;
+                    }
+                    lastStatusKey = key;
+                    renderUI();
+                })
+                .catch((err) => {
+                    if (err && err.name === 'AbortError') return;
+                    if (!quiet) showToast(t('connectionFailed'), 'error');
+                })
+                .finally(() => {
+                    clearTimeout(timer);
+                    if (fetchAbort === ctrl) fetchAbort = null;
+                    fetchInFlight = false;
+                });
+        }
+
+        function renderUI() {
+            if (!currentStatus) return;
+
+            document.body.classList.toggle('platform-macos', currentStatus.environment === 'macos');
+
+            const accounts = currentStatus.accounts || [];
+            const codexAccs = accounts.filter(a => !a.target_app || a.target_app === 'codex');
+            const cursorAccs = accounts.filter(a => a.target_app === 'cursor');
+            const claudeAccs = accounts.filter(a => a.target_app === 'claude');
+
+            document.getElementById('codex-count').textContent = codexAccs.length;
+            document.getElementById('cursor-count').textContent = cursorAccs.length;
+            document.getElementById('claude-count').textContent = claudeAccs.length;
+
+            renderLiveBanners();
+            renderAddPendingBanner();
+            renderAppList('codex-list', codexAccs, currentStatus.active_codex_id, 'ChatGPT Codex', true);
+            renderAppList('cursor-list', cursorAccs, currentStatus.active_cursor_id, 'Cursor', false);
+            renderAppList('claude-list', claudeAccs, currentStatus.active_claude_id, 'Claude', false);
+
+            document.getElementById('setting-menu-bar').checked = currentStatus.settings.show_quota_in_menu_bar;
+            document.getElementById('setting-auto-switch').checked = currentStatus.settings.auto_switch_on_limit;
+            const enBtn = document.getElementById('lang-en');
+            const viBtn = document.getElementById('lang-vi');
+            if (enBtn && viBtn) {
+                enBtn.classList.toggle('active', lang === 'en');
+                viBtn.classList.toggle('active', lang === 'vi');
+            }
+
+            const logsContainer = document.getElementById('logs-list');
+            const logs = currentStatus.logs || [];
+            if (logs.length > 0) {
+                const locale = lang === 'vi' ? 'vi-VN' : 'en-US';
+                logsContainer.innerHTML = logs.map(log => {
+                    const message = log.message
+                        || formatActivityMessage(log.action, log.email, log.label);
+                    const subtext = log.subtext || log.detail || '';
+                    const timeStr = formatActivityTime(log, locale);
+                    return `
+                        <div class="log-item">
+                            <div class="log-copy">
+                                <span class="log-message">${escapeHtml(message)}</span>
+                                ${subtext ? `<span class="log-subtext">${escapeHtml(subtext)}</span>` : ''}
+                            </div>
+                            <span class="log-time">${escapeHtml(timeStr)}</span>
+                        </div>
+                    `;
+                }).join('');
+            } else {
+                logsContainer.innerHTML = `<div class="empty">${escapeHtml(t('noActivity'))}</div>`;
+            }
+        }
+
+        function formatActivityMessage(action, email, label) {
+            const who = label ? `${email || ''} (${label})` : (email || '');
+            if (action === 'activate') {
+                return who ? `Switched to ${who}` : (lang === 'vi' ? 'Đã chuyển tài khoản' : 'Switched account');
+            }
+            if (action === 'pick_best') {
+                return who ? `Best quota → ${who}` : (lang === 'vi' ? 'Đã chọn hạn mức tốt nhất' : 'Picked best quota');
+            }
+            return who || action || (lang === 'vi' ? 'Hoạt động' : 'Activity');
+        }
+
+        function formatActivityTime(log, locale) {
+            let date = null;
+            if (typeof log.timestamp_unix === 'number' && log.timestamp_unix > 0) {
+                date = new Date(log.timestamp_unix * 1000);
+            } else if (typeof log.timestamp === 'string' && log.timestamp) {
+                date = new Date(log.timestamp);
+            } else if (typeof log.timestamp === 'number' && log.timestamp > 0) {
+                // Seconds if small, ms if large
+                date = new Date(log.timestamp < 1e12 ? log.timestamp * 1000 : log.timestamp);
+            } else if (Array.isArray(log.timestamp) && log.timestamp.length >= 3) {
+                // Legacy time-crate tuple: [year, ordinal, h, m, s, ...]
+                const year = Number(log.timestamp[0]);
+                const ordinal = Number(log.timestamp[1]);
+                const hour = Number(log.timestamp[2] || 0);
+                const minute = Number(log.timestamp[3] || 0);
+                const second = Number(log.timestamp[4] || 0);
+                date = new Date(Date.UTC(year, 0, 1, hour, minute, second));
+                date.setUTCDate(ordinal);
+            }
+            if (!date || Number.isNaN(date.getTime())) return '—';
+            return date.toLocaleTimeString(locale, {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false,
+            });
+        }
+
+        function parseResetAt(value) {
+            if (value == null || value === '') return null;
+            if (typeof value === 'string') {
+                const date = new Date(value);
+                return Number.isNaN(date.getTime()) ? null : date;
+            }
+            // Legacy `time` crate tuple: [year, ordinal, hour, minute, second, ...]
+            if (Array.isArray(value) && value.length >= 3) {
+                const year = Number(value[0]);
+                const ordinal = Number(value[1]);
+                const hour = Number(value[2] || 0);
+                const minute = Number(value[3] || 0);
+                const second = Number(value[4] || 0);
+                if (!Number.isFinite(year) || !Number.isFinite(ordinal)) return null;
+                const d = new Date(Date.UTC(year, 0, 1, hour, minute, second));
+                d.setUTCDate(ordinal);
+                return Number.isNaN(d.getTime()) ? null : d;
+            }
+            if (typeof value === 'number') {
+                const d = new Date(value);
+                return Number.isNaN(d.getTime()) ? null : d;
+            }
+            return null;
+        }
+
+        function formatCountdown(resetAt, now = new Date()) {
+            const ms = resetAt.getTime() - now.getTime();
+            if (ms <= 0) return t('now');
+            const totalMinutes = Math.ceil(ms / 60000);
+            const days = Math.floor(totalMinutes / (60 * 24));
+            const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+            const minutes = totalMinutes % 60;
+            if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+            if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+            return `${Math.max(1, minutes)}m`;
+        }
+
+        /** Local reset datetime: DD/MM/YYYY HH:mm */
+        function formatResetDateTime(resetAt) {
+            if (!resetAt) return '';
+            const d = resetAt instanceof Date ? resetAt : parseResetAt(resetAt);
+            if (!d) return '';
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
+
+        function fillClass(remaining) {
+            if (remaining <= 15) return 'fill-danger';
+            if (remaining <= 40) return 'fill-warn';
+            return 'fill-ok';
+        }
+
+        function computePace(usedPercent, resetAt, windowSecs, now = new Date()) {
+            if (!resetAt || windowSecs <= 0) return null;
+            const until = (resetAt.getTime() - now.getTime()) / 1000;
+            if (until <= 0 || until > windowSecs) return null;
+            const elapsed = Math.max(0, Math.min(windowSecs, windowSecs - until));
+            if (elapsed < windowSecs * MIN_ELAPSED) return null;
+            const actual = Math.max(0, Math.min(100, Number(usedPercent) || 0));
+            if (elapsed === 0 && actual > 0) return null;
+            const expected = (elapsed / windowSecs) * 100;
+            const delta = actual - expected;
+            const abs = Math.abs(delta);
+            let stage = 'on';
+            if (abs > 2) stage = delta >= 0 ? 'deficit' : 'reserve';
+            let willLast = false;
+            let etaSecs = null;
+            if (actual >= 100) {
+                etaSecs = 0;
+            } else if (elapsed > 0 && actual > 0) {
+                const rate = actual / elapsed;
+                const candidate = (100 - actual) / rate;
+                if (candidate >= until) willLast = true;
+                else etaSecs = candidate;
+            } else if (elapsed > 0 && actual === 0) {
+                willLast = true;
+            }
+            const deltaRounded = Math.round(Math.abs(delta));
+            let label = t('onPace');
+            if (stage === 'deficit') label = t('inDeficit', { n: deltaRounded });
+            if (stage === 'reserve') label = t('inReserve', { n: deltaRounded });
+            let eta = null;
+            if (willLast) eta = t('lastsUntilReset');
+            else if (etaSecs !== null) {
+                if (etaSecs <= 0) eta = t('runsOutNow');
+                else eta = t('runsOutIn', {
+                    time: formatCountdown(new Date(now.getTime() + etaSecs * 1000), now),
+                });
+            }
+            return { label, eta, stage };
+        }
+
+        function renderMeter(label, window, now) {
+            if (!window) return '';
+            const resetAt = parseResetAt(window.reset_at);
+            const remaining = Number(window.remaining_percent ?? 0);
+            const active = resetAt && resetAt > now;
+            const resetDt = resetAt ? formatResetDateTime(resetAt) : '';
+            const resetLine = resetDt ? `<span class="reset-at">${escapeHtml(resetDt)}</span>` : '';
+            let valueText = `${remaining}%`;
+            let width = remaining;
+            if (!active) {
+                valueText = `${escapeHtml(t('pastReset'))}${resetLine}`;
+                width = 0;
+            } else if (remaining === 0) {
+                valueText = `<span class="reset">${escapeHtml(formatCountdown(resetAt, now))}</span>${resetLine}`;
+                width = 0;
+            } else if (resetAt) {
+                valueText = `${remaining}% <span class="reset">${escapeHtml(formatCountdown(resetAt, now))}</span>${resetLine}`;
+            }
+            const resetAttr = window.reset_at ? ` data-reset-at="${escapeHtml(window.reset_at)}"` : '';
+            return `
+                <div class="meter-row"${resetAttr} data-remaining="${remaining}">
+                    <div class="meter-label">${escapeHtml(label)}</div>
+                    <div class="meter-track">
+                        <div class="meter-fill ${fillClass(remaining)}" style="width:${Math.max(0, Math.min(100, width))}%"></div>
+                    </div>
+                    <div class="meter-meta">${valueText}</div>
+                </div>
+            `;
+        }
+
+        function renderUsageBlock(account, weeklyOnly) {
+            if (account.usage_error && /login required/i.test(account.usage_error)) {
+                return `<div class="usage-note">${escapeHtml(t('loginRequiredUsage'))}</div>`;
+            }
+            const usage = account.usage;
+            if (!usage) {
+                return `<div class="usage-note">${escapeHtml(t('noCachedUsage'))}</div>`;
+            }
+
+            const now = new Date();
+            const five = usage.five_hour;
+            const weekly = usage.weekly;
+            // Codex prefers weekly; fall back to 5h when weekly is missing so % still shows.
+            const meters = weeklyOnly
+                ? [
+                    weekly ? renderMeter(t('week'), weekly, now) : '',
+                    !weekly && five ? renderMeter(t('session'), five, now) : '',
+                  ].join('')
+                : [
+                    five ? renderMeter(t('session'), five, now) : '',
+                    weekly ? renderMeter(t('week'), weekly, now) : '',
+                  ].join('');
+
+            let paceHtml = '';
+            if (weekly && parseResetAt(weekly.reset_at) > now) {
+                const pace = computePace(weekly.used_percent, parseResetAt(weekly.reset_at), WEEKLY_SECS, now);
+                if (pace) {
+                    const cls = pace.stage === 'deficit' ? 'deficit' : (pace.stage === 'reserve' ? 'reserve' : '');
+                    paceHtml = `<div class="pace-line"><span class="${cls}">${escapeHtml(pace.label)}</span>${pace.eta ? ` · ${escapeHtml(pace.eta)}` : ''}</div>`;
+                }
+            }
+
+            if (!meters && !usage.credits) {
+                return `<div class="usage-note">${escapeHtml(t('noActiveWindows'))}</div>`;
+            }
+
+            let credits = '';
+            if (usage.credits) {
+                const c = usage.credits;
+                credits = `<div class="usage-note">${escapeHtml(t('credits'))}: ${escapeHtml(c.balance)}${c.unlimited ? ` (${escapeHtml(t('unlimited'))})` : ''}</div>`;
+            }
+
+            return `<div class="meters">${meters}</div>${paceHtml}${credits}`;
+        }
+
+        function isExhausted(account, weeklyOnly) {
+            const usage = account.usage;
+            if (!usage) return false;
+            const now = new Date();
+            const windows = weeklyOnly
+                ? [usage.weekly].filter(Boolean)
+                : [usage.five_hour, usage.weekly].filter(Boolean);
+            return windows.some(w => {
+                const resetAt = parseResetAt(w.reset_at);
+                return resetAt && resetAt > now && Number(w.remaining_percent) === 0;
+            });
+        }
+
+        function renderAccountCard(account, activeId, weeklyOnly) {
+            const isActive = account.id === activeId;
+            const exhausted = isExhausted(account, weeklyOnly);
+            const needsLogin = account.usage_error && /login required/i.test(account.usage_error || '');
+            const chips = [
+                isActive ? `<span class="chip chip-active">${escapeHtml(t('active'))}</span>` : '',
+                account.plan_label ? `<span class="chip chip-plan">${escapeHtml(account.plan_label)}</span>` : '',
+                exhausted ? `<span class="chip chip-exhausted">${escapeHtml(t('exhausted'))}</span>` : '',
+                needsLogin ? `<span class="chip chip-login">${escapeHtml(t('login'))}</span>` : '',
+            ].join('');
+
+            const labelText = account.label
+                ? `<div class="account-label">${escapeHtml(account.label)}</div>`
+                : '';
+
+            return `
+                <article class="account ${isActive ? 'active' : ''}">
+                    <div class="account-top">
+                        <div class="account-email" title="${escapeHtml(account.email)}">${escapeHtml(displayEmail(account.email))}</div>
+                    </div>
+                    <div class="chips">${chips}</div>
+                    ${labelText}
+                    ${renderUsageBlock(account, weeklyOnly)}
+                    <div class="account-actions">
+                        <div class="action-group">
+                            <button class="link-btn" onclick="archiveAccount('${account.id}', ${!account.is_archived})">
+                                ${escapeHtml(account.is_archived ? t('unarchive') : t('archive'))}
+                            </button>
+                            <button class="link-btn" onclick="deleteAccount('${account.id}', '${escapeHtml(account.email)}')">${escapeHtml(t('delete'))}</button>
+                        </div>
+                        ${!isActive ? `<button class="switch-btn" onclick="activateAccount('${account.id}')">${escapeHtml(t('switch'))}</button>` : ''}
+                    </div>
+                </article>
+            `;
+        }
+
+        function paintVirtualWindow(elementId) {
+            const state = virtualLists.get(elementId);
+            const container = document.getElementById(elementId);
+            if (!state || !container) return;
+            const { items, activeId, weeklyOnly } = state;
+            const scrollTop = container.scrollTop;
+            const viewH = container.clientHeight || 480;
+            const start = Math.max(0, Math.floor(scrollTop / VIRT_ITEM_H) - VIRT_OVERSCAN);
+            const visible = Math.ceil(viewH / VIRT_ITEM_H) + VIRT_OVERSCAN * 2;
+            const end = Math.min(items.length, start + visible);
+            const topH = start * VIRT_ITEM_H;
+            const bottomH = Math.max(0, (items.length - end) * VIRT_ITEM_H);
+            const slice = items.slice(start, end);
+            const windowEl = container.querySelector('.virt-window');
+            const topSpacer = container.querySelector('.virt-spacer-top');
+            const bottomSpacer = container.querySelector('.virt-spacer-bottom');
+            if (topSpacer) topSpacer.style.height = `${topH}px`;
+            if (bottomSpacer) bottomSpacer.style.height = `${bottomH}px`;
+            if (windowEl) {
+                windowEl.innerHTML = slice.map((a) => renderAccountCard(a, activeId, weeklyOnly)).join('');
+            }
+        }
+
+        function bindVirtualScroll(container, elementId) {
+            if (container.dataset.virtBound === '1') return;
+            container.dataset.virtBound = '1';
+            let raf = 0;
+            container.addEventListener('scroll', () => {
+                if (raf) return;
+                raf = requestAnimationFrame(() => {
+                    raf = 0;
+                    paintVirtualWindow(elementId);
+                });
+            }, { passive: true });
+        }
+
+        function renderAppList(elementId, items, activeId, label, weeklyOnly) {
+            const container = document.getElementById(elementId);
+            if (!container) return;
+            container.removeAttribute('data-loading');
+            container.setAttribute('aria-busy', 'false');
+
+            if (items.length === 0) {
+                virtualLists.delete(elementId);
+                container.classList.remove('virtual');
+                container.innerHTML = `<div class="empty">${escapeHtml(t('emptyAccounts', { label }))}</div>`;
+                return;
+            }
+
+            // Prefer active account near the top for usability.
+            const ordered = items.slice().sort((a, b) => {
+                if (a.id === activeId) return -1;
+                if (b.id === activeId) return 1;
+                return 0;
+            });
+
+            if (ordered.length <= VIRTUAL_THRESHOLD) {
+                virtualLists.delete(elementId);
+                container.classList.remove('virtual');
+                container.innerHTML = ordered.map((a) => renderAccountCard(a, activeId, weeklyOnly)).join('');
+                return;
+            }
+
+            virtualLists.set(elementId, {
+                items: ordered,
+                activeId,
+                weeklyOnly,
+                label,
+            });
+            container.classList.add('virtual');
+            container.innerHTML = `
+                <div class="virt-meta">${ordered.length} accounts · virtualized</div>
+                <div class="virt-spacer virt-spacer-top" style="height:0"></div>
+                <div class="virt-window"></div>
+                <div class="virt-spacer virt-spacer-bottom" style="height:0"></div>
+            `;
+            bindVirtualScroll(container, elementId);
+            paintVirtualWindow(elementId);
+        }
+
+        /** On-demand process scan + optional kill before switch. Returns false if user cancels. */
+        function ensureClearBlockersThenSwitch() {
+            return fetch('/api/status?processes=1')
+                .then((res) => res.json())
+                .then((data) => {
+                    const warnings = data.process_warnings || [];
+                    if (!warnings.length) return true;
+                    const list = warnings
+                        .slice(0, 8)
+                        .map((w) => `• PID ${w.pid}: ${w.executable || '?'}`)
+                        .join('\n');
+                    const more = warnings.length > 8 ? `\n… +${warnings.length - 8}` : '';
+                    if (!confirm(t('confirmKillThenSwitch', { n: warnings.length, list: list + more }))) {
+                        return false;
+                    }
+                    showToast(t('terminating'), 'warning');
+                    return postApi('/api/kill', {}).then((killRes) => {
+                        if (!killRes.success) {
+                            showToast(t('terminateFailed', { error: killRes.error || '' }), 'error');
+                            return false;
+                        }
+                        return true;
+                    });
+                })
+                .catch(() => true); // If scan fails, still attempt switch.
+        }
+
+        function activateAccount(id) {
+            ensureClearBlockersThenSwitch()
+                .then((ok) => {
+                    if (!ok) return;
+                    showToast(t('switchingAccount'), 'warning');
+                    return postApi('/api/activate', { id }).then((data) => {
+                        if (data.success) {
+                            showToast(t('switchedOk'), 'success');
+                            fetchState({ force: true });
+                        } else {
+                            showToast(t('switchFailed', { error: data.error }), 'error');
+                        }
+                    });
+                })
+                .catch(() => showToast(t('connectFailed'), 'error'));
+        }
+
+
+        const CLAUDE_UNKNOWN_EMAIL = 'claude-user@unknown.com';
+
+        function displayEmail(email) {
+            if (!email || email === CLAUDE_UNKNOWN_EMAIL) return t('signedInUnknown');
+            return email;
+        }
+
+        function renderLiveBanners() {
+            const box = document.getElementById('live-banners');
+            if (!box || !currentStatus) return;
+            const rows = [
+                { key: 'codex', label: 'ChatGPT Codex', live: currentStatus.live_codex, activeId: currentStatus.active_codex_id, app: 'codex' },
+                { key: 'cursor', label: 'Cursor', live: currentStatus.live_cursor, activeId: currentStatus.active_cursor_id, app: 'cursor' },
+                { key: 'claude', label: 'Claude', live: currentStatus.live_claude, activeId: currentStatus.active_claude_id, app: 'claude' },
+            ];
+            const html = rows.map((row) => {
+                if (!row.live) return '';
+                if (row.activeId) return '';
+                const plan = row.live.plan_label ? ` · ${escapeHtml(row.live.plan_label)}` : '';
+                return `<div class="live-banner">
+                    <div>
+                        <div class="live-banner-title">${escapeHtml(row.label)} · ${escapeHtml(displayEmail(row.live.email))}</div>
+                        <div class="live-banner-meta">${escapeHtml(t('liveDetected'))} · ${escapeHtml(t('unsavedLive'))}${plan}</div>
+                    </div>
+                    <button class="btn btn-accent" onclick="saveActiveAccount('${row.app}')">${escapeHtml(t('saveLive'))}</button>
+                </div>`;
+            }).filter(Boolean).join('');
+            box.innerHTML = html;
+        }
+
+        function openImportCookies() {
+            const overlay = document.getElementById('import-overlay');
+            const err = document.getElementById('import-error');
+            const file = document.getElementById('import-file');
+            const name = document.getElementById('import-file-name');
+            const panel = document.getElementById('import-paste-panel');
+            const toggle = document.getElementById('import-paste-toggle');
+            if (err) { err.textContent = ''; err.classList.remove('show'); }
+            if (file) file.value = '';
+            if (name) name.textContent = t('importNoFile');
+            if (panel) panel.style.display = 'none';
+            if (toggle) toggle.textContent = t('importPasteToggle');
+            if (overlay) overlay.classList.add('open');
+        }
+        function closeImportCookies() {
+            const overlay = document.getElementById('import-overlay');
+            if (overlay) overlay.classList.remove('open');
+        }
+        function toggleImportPaste() {
+            const panel = document.getElementById('import-paste-panel');
+            const toggle = document.getElementById('import-paste-toggle');
+            if (!panel) return;
+            const open = panel.style.display !== 'block';
+            panel.style.display = open ? 'block' : 'none';
+            if (toggle) toggle.textContent = open ? t('importPasteHide') : t('importPasteToggle');
+        }
+        function readImportJsonText() {
+            return new Promise((resolve, reject) => {
+                const file = document.getElementById('import-file')?.files?.[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(String(reader.result || ''));
+                    reader.onerror = () => reject(new Error('failed to read file'));
+                    reader.readAsText(file);
+                    return;
+                }
+                resolve(document.getElementById('import-json')?.value || '');
+            });
+        }
+        function submitImportCookies() {
+            const err = document.getElementById('import-error');
+            readImportJsonText()
+                .then((json) => {
+                    if (!String(json || '').trim()) {
+                        if (err) { err.textContent = t('importFailed', { error: 'empty JSON' }); err.classList.add('show'); }
+                        return;
+                    }
+                    showToast(t('importing'), 'warning');
+                    return postApi('/api/import-cookies', { provider: 'codex', json })
+                        .then((data) => {
+                            if (data.success) {
+                                showToast(t('importedOk', { email: data.email || '' }), 'success');
+                                closeImportCookies();
+                                const ta = document.getElementById('import-json');
+                                if (ta) ta.value = '';
+                                const file = document.getElementById('import-file');
+                                if (file) file.value = '';
+                                const name = document.getElementById('import-file-name');
+                                if (name) name.textContent = t('importNoFile');
+                                fetchState({ force: true });
+                            } else {
+                                const msg = t('importFailed', { error: data.error || '' });
+                                if (err) { err.textContent = msg; err.classList.add('show'); }
+                                showToast(msg, 'error');
+                            }
+                        });
+                })
+                .catch((e) => {
+                    const msg = t('importFailed', { error: e?.message || String(e) });
+                    if (err) { err.textContent = msg; err.classList.add('show'); }
+                    showToast(msg, 'error');
+                });
+        }
+        function addAccount(app) {
+            const provider = (app || 'codex').toLowerCase();
+            if (provider === 'cursor') {
+                showToast(t('addCursorHint'), 'warning');
+                return;
+            }
+            if (provider === 'claude') {
+                showToast(t('addClaudeHint'), 'warning');
+                return;
+            }
+            showToast(t('addingAccount'), 'warning');
+            postApi('/api/add-account', { action: 'begin', app: 'codex' })
+                .then((data) => {
+                    if (data.success) {
+                        showToast(t('addStarted'), 'success');
+                        fetchState({ force: true });
+                    } else showToast(t('failed', { error: data.error || '' }), 'error');
+                })
+                .catch(() => showToast(t('connectFailed'), 'error'));
+        }
+        function finishAddAccount() {
+            showToast(t('savingApp', { app: 'Codex' }), 'warning');
+            postApi('/api/add-account', { action: 'finish', app: 'codex' })
+                .then((data) => {
+                    if (data.success) {
+                        showToast(t('addFinished', { email: data.email || '' }), 'success');
+                        if (data.warning) showToast(data.warning, 'warning');
+                        fetchState({ force: true });
+                    } else showToast(t('failed', { error: data.error || '' }), 'error');
+                })
+                .catch(() => showToast(t('connectFailed'), 'error'));
+        }
+        function cancelAddAccount() {
+            postApi('/api/add-account', { action: 'cancel', app: 'codex' })
+                .then((data) => {
+                    if (data.success) {
+                        showToast(t('addCancelled'), 'success');
+                        fetchState({ force: true });
+                    } else showToast(t('failed', { error: data.error || '' }), 'error');
+                })
+                .catch(() => showToast(t('connectFailed'), 'error'));
+        }
+        function renderAddPendingBanner() {
+            const box = document.getElementById('add-pending-banner');
+            if (!box) return;
+            if (!currentStatus?.codex_add_account_pending) {
+                box.innerHTML = '';
+                return;
+            }
+            box.innerHTML = `<div class="live-banner">
+                <div>
+                    <div class="live-banner-title">${escapeHtml(t('addPendingTitle'))}</div>
+                    <div class="live-banner-meta">1. ${escapeHtml(t('addPendingStep1'))}<br>2. ${escapeHtml(t('addPendingStep2'))}<br>3. ${escapeHtml(t('addPendingStep3'))}</div>
+                </div>
+                <div style="display:flex;gap:0.4rem;flex-wrap:wrap">
+                  <button class="btn btn-accent" onclick="finishAddAccount()">${escapeHtml(t('finishAdd'))}</button>
+                  <button class="btn btn-ghost" onclick="cancelAddAccount()">${escapeHtml(t('cancelAdd'))}</button>
+                </div>
+            </div>`;
+        }
+        document.getElementById('import-file')?.addEventListener('change', (event) => {
+            const file = event.target?.files?.[0];
+            const name = document.getElementById('import-file-name');
+            if (name) name.textContent = file ? file.name : t('importNoFile');
+        });
+
+        function saveActiveAccount(app) {
+            showToast(t('savingApp', { app }), 'warning');
+            postApi('/api/save', { app })
+                .then(data => {
+                    if (data.success) {
+                        showToast(t('savedApp', { app }), 'success');
+                        fetchState({ force: true });
+                    } else {
+                        showToast(t('saveFailed', { error: data.error }), 'error');
+                    }
+                })
+                .catch(() => showToast(t('connectFailed'), 'error'));
+        }
+
+        function triggerBestQuota() {
+            ensureClearBlockersThenSwitch()
+                .then((ok) => {
+                    if (!ok) return;
+                    showToast(t('findingBest'), 'warning');
+                    return postApi('/api/activate', { id: 'best' }).then((data) => {
+                        if (data.success) {
+                            showToast(t('switchedBest'), 'success');
+                            fetchState({ force: true });
+                        } else {
+                            showToast(t('noBetter', { error: data.error || '' }), 'warning');
+                        }
+                    });
+                })
+                .catch(() => showToast(t('connectFailed'), 'error'));
+        }
+
+        function archiveAccount(id, archived) {
+            postApi('/api/archive', { id, archived })
+                .then(data => {
+                    if (data.success) {
+                        showToast(archived ? t('archived') : t('restored'), 'success');
+                        fetchState({ force: true });
+                    } else {
+                        showToast(t('failed', { error: data.error }), 'error');
+                    }
+                });
+        }
+
+        function deleteAccount(id, email) {
+            if (confirm(t('confirmDelete', { email }))) {
+                postApi('/api/delete', { id })
+                    .then(data => {
+                        if (data.success) {
+                            showToast(t('deleted'), 'success');
+                            fetchState({ force: true });
+                        } else {
+                            showToast(t('failed', { error: data.error }), 'error');
+                        }
+                    });
+            }
+        }
+
+        function toggleSetting(key) {
+            let val;
+            if (key === 'menu-bar') val = document.getElementById('setting-menu-bar').checked;
+            else if (key === 'auto-switch') val = document.getElementById('setting-auto-switch').checked;
+            else return;
+
+            postApi('/api/settings', { key, value: val })
+                .then(data => {
+                    if (data.success) {
+                        showToast(t('settingsSaved'), 'success');
+                        fetchState({ force: true });
+                    }
+                });
+        }
+
+        function postApi(url, body, timeoutMs) {
+            const ms = timeoutMs == null ? 15000 : timeoutMs;
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), ms);
+            return fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body ?? {}),
+                signal: ctrl.signal,
+            })
+                .then(res => res.json())
+                .finally(() => clearTimeout(timer));
+        }
+
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toasts');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = message;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(8px)';
+                toast.style.transition = 'all 0.2s ease';
+                setTimeout(() => toast.remove(), 200);
+            }, 2800);
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+    </script>
+
+<div id="import-overlay" class="import-overlay" onclick="if(event.target===this)closeImportCookies()">
+  <div class="import-sheet" role="dialog" aria-modal="true">
+    <strong data-i18n="importTitle">Import Codex from cookies JSON</strong>
+    <div class="live-banner-meta" data-i18n="importHelp">Choose a browser cookie export or Codex tokens JSON file. ChatGPT Codex / OpenAI only — Cursor and Claude use Save signed-in session.</div>
+    <input id="import-file" type="file" accept=".json,application/json,text/json,text/plain" hidden />
+    <div style="display:flex;gap:0.45rem;flex-wrap:wrap;align-items:center">
+      <button type="button" class="btn btn-accent" onclick="document.getElementById('import-file').click()" data-i18n="importChooseFile">Choose JSON file</button>
+      <span id="import-file-name" class="live-banner-meta" data-i18n="importNoFile">No file selected</span>
+    </div>
+    <button type="button" class="btn btn-ghost" id="import-paste-toggle" onclick="toggleImportPaste()" data-i18n="importPasteToggle">Or paste JSON</button>
+    <div id="import-paste-panel" style="display:none">
+      <textarea id="import-json" spellcheck="false" placeholder='[{"name":"id_token","value":"..."},{"name":"access_token","value":"..."}]'></textarea>
+    </div>
+    <div id="import-error" class="import-error"></div>
+    <div style="display:flex;gap:0.45rem;flex-wrap:wrap">
+      <button class="btn btn-accent" onclick="submitImportCookies()" data-i18n="importSubmit">Import</button>
+      <button class="btn btn-ghost" onclick="closeImportCookies()" data-i18n="importCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,3 +1,6 @@
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::model::RunningCodexProcess;
@@ -5,6 +8,113 @@ use crate::model::RunningCodexProcess;
 const SUMMARY_LIMIT: usize = 72;
 const EXECUTABLE_WIDTH: usize = 12;
 const ROLE_WIDTH: usize = 14;
+/// Short TTL so tray title/tooltip/menu + dashboard polls share one OS process walk.
+const PROCESS_SCAN_CACHE_TTL: Duration = Duration::from_millis(2500);
+
+#[derive(Clone, Default)]
+pub struct ProcessScanSnapshot {
+    pub codex: Vec<RunningCodexProcess>,
+    pub cursor: Vec<RunningCodexProcess>,
+    pub claude: Vec<RunningCodexProcess>,
+}
+
+struct ProcessScanCache {
+    at: Instant,
+    snapshot: ProcessScanSnapshot,
+}
+
+static PROCESS_SCAN_CACHE: Mutex<Option<ProcessScanCache>> = Mutex::new(None);
+
+/// One sysinfo walk classifying Codex / Cursor / Claude processes.
+pub fn detect_all_processes() -> ProcessScanSnapshot {
+    if let Ok(guard) = PROCESS_SCAN_CACHE.lock()
+        && let Some(cache) = guard.as_ref()
+        && cache.at.elapsed() < PROCESS_SCAN_CACHE_TTL
+    {
+        return cache.snapshot.clone();
+    }
+    let snapshot = scan_all_processes_uncached();
+    if let Ok(mut guard) = PROCESS_SCAN_CACHE.lock() {
+        *guard = Some(ProcessScanCache {
+            at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+    }
+    snapshot
+}
+
+fn scan_all_processes_uncached() -> ProcessScanSnapshot {
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always)
+            .without_tasks(),
+    );
+    let current_pid = std::process::id();
+    let mut codex = Vec::new();
+    let mut cursor = Vec::new();
+    let mut claude = Vec::new();
+
+    for (pid, process) in system.processes() {
+        if pid.as_u32() == current_pid {
+            continue;
+        }
+        let name = process.name().to_string_lossy().to_ascii_lowercase();
+        let command = process
+            .cmd()
+            .iter()
+            .map(|item| item.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        if matches_codex_process(&name, &command) {
+            codex.push(format_process(*pid, &name, &command));
+            continue;
+        }
+        if name.contains("cursor")
+            || command
+                .iter()
+                .any(|arg| arg.to_ascii_lowercase().contains("cursor"))
+        {
+            cursor.push(RunningCodexProcess {
+                pid: pid.as_u32(),
+                executable: name.clone(),
+                role: "editor".to_owned(),
+                summary: Some(command.join(" ")),
+            });
+            continue;
+        }
+        if name.contains("claude")
+            || command
+                .iter()
+                .any(|arg| arg.to_ascii_lowercase().contains("claude"))
+        {
+            claude.push(RunningCodexProcess {
+                pid: pid.as_u32(),
+                executable: name,
+                role: "cli-agent".to_owned(),
+                summary: Some(command.join(" ")),
+            });
+        }
+    }
+
+    codex.sort_by(|left, right| {
+        left.executable
+            .cmp(&right.executable)
+            .then_with(|| left.role.cmp(&right.role))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    cursor.sort_by_key(|p| p.pid);
+    claude.sort_by_key(|p| p.pid);
+
+    ProcessScanSnapshot {
+        codex,
+        cursor,
+        claude,
+    }
+}
 
 #[cfg(target_os = "macos")]
 const MACOS_CHATGPT_CLI_PATH: &str = "/Applications/ChatGPT.app/Contents/Resources/codex";
@@ -28,43 +138,7 @@ pub fn codex_cli_path() -> std::path::PathBuf {
 }
 
 pub fn detect_running_codex_processes() -> Vec<RunningCodexProcess> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing()
-            .with_cmd(UpdateKind::Always)
-            .with_exe(UpdateKind::Always)
-            .without_tasks(),
-    );
-    let current_pid = std::process::id();
-    let mut processes = system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            if pid.as_u32() == current_pid {
-                return None;
-            }
-            let name = process.name().to_string_lossy().to_ascii_lowercase();
-            let command = process
-                .cmd()
-                .iter()
-                .map(|item| item.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            if matches_codex_process(&name, &command) {
-                Some(format_process(*pid, &name, &command))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    processes.sort_by(|left, right| {
-        left.executable
-            .cmp(&right.executable)
-            .then_with(|| left.role.cmp(&right.role))
-            .then_with(|| left.pid.cmp(&right.pid))
-    });
-    processes
+    detect_all_processes().codex
 }
 
 /// IDE/extension `codex app-server` processes do not hold live auth and should not
@@ -81,51 +155,19 @@ pub fn detect_switch_blocking_codex_processes() -> Vec<RunningCodexProcess> {
 }
 
 pub fn detect_running_cursor_processes() -> Vec<RunningCodexProcess> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing()
-            .with_cmd(UpdateKind::Always)
-            .with_exe(UpdateKind::Always)
-            .without_tasks(),
-    );
-    let current_pid = std::process::id();
-    let mut processes = system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            if pid.as_u32() == current_pid {
-                return None;
-            }
-            let name = process.name().to_string_lossy().to_ascii_lowercase();
-            let command = process
-                .cmd()
-                .iter()
-                .map(|item| item.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            if name.contains("cursor")
-                || command
-                    .iter()
-                    .any(|arg| arg.to_ascii_lowercase().contains("cursor"))
-            {
-                Some(RunningCodexProcess {
-                    pid: pid.as_u32(),
-                    executable: name,
-                    role: "editor".to_owned(),
-                    summary: Some(command.join(" ")),
-                })
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    processes.sort_by_key(|left| left.pid);
-    processes
+    detect_all_processes().cursor
 }
 
 pub fn detect_switch_blocking_cursor_processes() -> Vec<RunningCodexProcess> {
     detect_running_cursor_processes()
+}
+
+pub fn detect_running_claude_processes() -> Vec<RunningCodexProcess> {
+    detect_all_processes().claude
+}
+
+pub fn detect_switch_blocking_claude_processes() -> Vec<RunningCodexProcess> {
+    detect_running_claude_processes()
 }
 
 pub fn format_process_table(processes: &[RunningCodexProcess]) -> Vec<String> {
@@ -332,6 +374,9 @@ const MACOS_CHATGPT_MAIN_PROCESS_PATTERN: &str = "/Applications/ChatGPT.app/Cont
 #[cfg(target_os = "macos")]
 const MACOS_CODEX_MAIN_PROCESS_PATTERN: &str = "/Applications/Codex.app/Contents/MacOS/Codex";
 
+/// Codex Desktop OAuth callback port (browser redirects here after auth.openai.com).
+pub const CODEX_OAUTH_CALLBACK_PORT: u16 = 1455;
+
 /// Gracefully stop the Codex desktop app before swapping auth snapshots.
 pub fn quit_running_codex_app() {
     #[cfg(target_os = "macos")]
@@ -360,6 +405,143 @@ pub fn quit_running_codex_app() {
             .output();
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+}
+
+/// Quit Codex/ChatGPT and wait until main processes are gone (OAuth needs a clean restart).
+pub fn quit_and_wait_for_codex_app() {
+    quit_running_codex_app();
+    let _ = wait_for_codex_processes_to_exit_timeout(std::time::Duration::from_secs(12));
+    // Brief settle so the previous instance releases :1455 before relaunch.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+/// True when something is accepting TCP connections on the Codex OAuth callback port.
+pub fn codex_oauth_callback_listening() -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], CODEX_OAUTH_CALLBACK_PORT)),
+        std::time::Duration::from_millis(150),
+    )
+    .is_ok()
+}
+
+/// Wait until Codex Desktop binds `:1455` for the OAuth redirect (or timeout).
+pub fn wait_for_codex_oauth_callback(timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if codex_oauth_callback_listening() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    codex_oauth_callback_listening()
+}
+
+/// Wait until nothing is listening on the OAuth callback port.
+pub fn wait_for_codex_oauth_port_free(timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if !codex_oauth_callback_listening() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    !codex_oauth_callback_listening()
+}
+
+/// Best-effort free of `:1455` (Desktop/CLI leftovers hold this and blank OAuth pages).
+pub fn free_codex_oauth_port() {
+    quit_and_wait_for_codex_app();
+    force_quit_switch_blocking_codex_processes();
+    #[cfg(unix)]
+    {
+        // Kill any remaining listener on the OAuth callback port.
+        if let Ok(output) = std::process::Command::new("lsof")
+            .args([
+                "-nP",
+                &format!("-iTCP:{CODEX_OAUTH_CALLBACK_PORT}"),
+                "-sTCP:LISTEN",
+                "-t",
+            ])
+            .output()
+        {
+            let pids = String::from_utf8_lossy(&output.stdout);
+            for pid in pids.split_whitespace() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", pid])
+                    .output();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            for pid in pids.split_whitespace() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", pid])
+                    .output();
+            }
+        }
+    }
+    let _ = wait_for_codex_oauth_port_free(std::time::Duration::from_secs(5));
+}
+
+#[derive(Debug, Clone)]
+pub struct InteractiveLoginLaunch {
+    pub oauth_port_ready: bool,
+    pub method: &'static str,
+    pub detail: String,
+}
+
+/// Start interactive Codex login the reliable way:
+/// 1) free `:1455`
+/// 2) run `codex login` (binds OAuth server **then** opens the browser)
+///
+/// Opening ChatGPT Desktop with wiped `auth.json` uses a streamlined web flow that
+/// often lands on a blank / stuck `auth.openai.com/oauth/authorize` page.
+pub fn start_codex_cli_interactive_login(codex_home: &std::path::Path) -> InteractiveLoginLaunch {
+    free_codex_oauth_port();
+
+    let cli = codex_cli_path();
+    let spawn = std::process::Command::new(&cli)
+        .arg("login")
+        .env("CODEX_HOME", codex_home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    match spawn {
+        Ok(_child) => {
+            // CLI owns the browser tab; wait until its callback server is up.
+            let ready = wait_for_codex_oauth_callback(std::time::Duration::from_secs(20));
+            InteractiveLoginLaunch {
+                oauth_port_ready: ready,
+                method: "codex-login",
+                detail: if ready {
+                    "Browser login started via `codex login`. Close any blank tabs and finish in the new browser window, then return here."
+                        .to_owned()
+                } else {
+                    format!(
+                        "Started `{} login`, but port {CODEX_OAUTH_CALLBACK_PORT} is not listening yet. Wait a few seconds; if the page is blank, close it and run Add account again.",
+                        cli.display()
+                    )
+                },
+            }
+        }
+        Err(error) => {
+            // Last resort: Desktop app (historically flaky blank OAuth pages).
+            launch_codex_app();
+            let ready = wait_for_codex_oauth_callback(std::time::Duration::from_secs(12));
+            InteractiveLoginLaunch {
+                oauth_port_ready: ready,
+                method: "desktop-fallback",
+                detail: format!(
+                    "Could not run `codex login` ({error}). Opened ChatGPT/Codex Desktop instead — if the browser page is blank, install/fix Codex CLI and retry."
+                ),
+            }
+        }
+    }
+}
+
+/// Prefers CLI login over Desktop relaunch. Pass the live Codex home (`~/.codex`).
+pub fn relaunch_codex_for_interactive_login(codex_home: &std::path::Path) -> InteractiveLoginLaunch {
+    start_codex_cli_interactive_login(codex_home)
 }
 
 /// Force-stop Codex processes that can hold live auth open during an urgent switch.
@@ -394,6 +576,44 @@ pub fn force_quit_switch_blocking_codex_processes() {
     }
 
     std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+pub fn force_quit_processes(processes: &[RunningCodexProcess]) {
+    if processes.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        for process in processes {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &process.pid.to_string()])
+                .output();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for process in processes {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &process.pid.to_string()])
+                .output();
+        }
+    }
+    #[cfg(windows)]
+    {
+        for process in processes {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/f", "/pid", &process.pid.to_string()])
+                .output();
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+pub fn force_quit_all_switch_blocking_processes() {
+    let mut processes = detect_switch_blocking_codex_processes();
+    processes.extend(detect_switch_blocking_cursor_processes());
+    processes.extend(detect_switch_blocking_claude_processes());
+    processes.sort_by_key(|w| w.pid);
+    processes.dedup_by_key(|w| w.pid);
+    force_quit_processes(&processes);
 }
 
 pub const SWITCH_WAIT_POLL_MS: u64 = 2_000;
@@ -479,10 +699,19 @@ switch ($result) {
 }
 
 /// Relaunch the Codex/ChatGPT desktop app after auth has been restored.
+///
+/// Launches **one** preferred app only. Starting both ChatGPT and Codex races
+/// two OAuth listeners on `localhost:1455` and freezes sign-in in the browser.
 pub fn launch_codex_app() {
     #[cfg(target_os = "macos")]
     {
-        if std::path::Path::new("/Applications/ChatGPT.app").exists() {
+        // Prefer Codex Desktop when installed (matches originator=Codex Desktop OAuth).
+        // Fall back to ChatGPT.app (bundled Codex) when Codex.app is absent.
+        if std::path::Path::new("/Applications/Codex.app").exists() {
+            let _ = std::process::Command::new("open")
+                .args(["-a", "Codex"])
+                .spawn();
+        } else if std::path::Path::new("/Applications/ChatGPT.app").exists() {
             let _ = std::process::Command::new("open")
                 .args(["-a", "ChatGPT"])
                 .spawn();
@@ -494,11 +723,9 @@ pub fn launch_codex_app() {
     }
     #[cfg(target_os = "windows")]
     {
+        // Single app only — starting both races two OAuth listeners on :1455.
         let _ = std::process::Command::new("cmd")
             .args(["/c", "start", "", "ChatGPT"])
-            .spawn();
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", "Codex"])
             .spawn();
     }
 }

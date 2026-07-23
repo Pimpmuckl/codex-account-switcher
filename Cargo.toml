@@ -14,8 +14,6 @@ categories = ["command-line-utilities"]
 anyhow = "1.0.102"
 base64 = "0.22.1"
 clap = { version = "4.6.0", features = ["derive"] }
-console = "0.16.3"
-dialoguer = "0.12.0"
 directories = "6.0.0"
 flate2 = "1.1.5"
 libc = "0.2.180"
@@ -27,11 +25,13 @@ ureq = { version = "3.1.2", features = ["json"] }
 uuid = { version = "1.23.0", features = ["serde", "v4"] }
 zip = { version = "2.2.3", default-features = false, features = ["deflate"] }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
+tiny_http = "0.12.0"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }
 tray-icon = { version = "0.22.1", default-features = false }
-winit = { version = "0.30.13", default-features = false }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.41", features = ["transparent"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }

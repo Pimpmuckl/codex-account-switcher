@@ -255,6 +255,7 @@ fn import_snapshot<S: SecretStore>(
         email: metadata.email,
         label: metadata.label,
         created,
+        warnings: Vec::new(),
     })
 }
 

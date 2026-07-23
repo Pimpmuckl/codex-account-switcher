@@ -22,6 +22,76 @@ fn default_show_quota_in_menu_bar() -> bool {
     true
 }
 
+fn default_ui_language() -> String {
+    "auto".to_owned()
+}
+
+/// Preference stored in settings: `"auto"`, `"en"`, or `"vi"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedUiLanguage {
+    En,
+    Vi,
+}
+
+impl ResolvedUiLanguage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Vi => "vi",
+        }
+    }
+}
+
+pub fn normalize_ui_language(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some("auto"),
+        "en" | "en-us" | "en_gb" | "english" => Some("en"),
+        "vi" | "vi-vn" | "vi_vn" | "vietnamese" => Some("vi"),
+        _ => None,
+    }
+}
+
+pub fn resolve_ui_language(preference: &str) -> ResolvedUiLanguage {
+    match normalize_ui_language(preference).unwrap_or("auto") {
+        "en" => ResolvedUiLanguage::En,
+        "vi" => ResolvedUiLanguage::Vi,
+        _ => {
+            if system_prefers_vietnamese() {
+                ResolvedUiLanguage::Vi
+            } else {
+                ResolvedUiLanguage::En
+            }
+        }
+    }
+}
+
+pub fn system_prefers_vietnamese() -> bool {
+    for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(value) = std::env::var(key) {
+            let lower = value.to_ascii_lowercase();
+            if lower.starts_with("vi") || lower.contains(".vi") {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleLanguages"])
+            .output()
+            && output.status.success()
+        {
+            let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            if text.contains("\"vi") || text.contains("vi-") || text.contains("vi_") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppSettings {
     #[serde(default)]
@@ -39,6 +109,11 @@ pub struct AppSettings {
     /// Show quota percentage/status directly in the menu bar / tray icon.
     #[serde(default = "default_show_quota_in_menu_bar")]
     pub show_quota_in_menu_bar: bool,
+    #[serde(default)]
+    pub disable_blocker_warnings: bool,
+    /// UI language preference: `auto` (system), `en`, or `vi`.
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
 }
 
 impl Default for AppSettings {
@@ -50,6 +125,8 @@ impl Default for AppSettings {
             near_limit_threshold_percent: DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT,
             auto_switch_poll_seconds: DEFAULT_AUTO_SWITCH_POLL_SECONDS,
             show_quota_in_menu_bar: true,
+            disable_blocker_warnings: false,
+            ui_language: default_ui_language(),
         }
     }
 }
@@ -103,6 +180,7 @@ mod tests {
             DEFAULT_AUTO_SWITCH_POLL_SECONDS
         );
         assert!(settings.show_quota_in_menu_bar);
+        assert_eq!(settings.ui_language, "auto");
     }
 
     #[test]
@@ -115,6 +193,7 @@ mod tests {
                 auto_switch_on_limit: true,
                 launch_at_startup: true,
                 show_quota_in_menu_bar: false,
+                ui_language: "vi".to_owned(),
                 ..AppSettings::default()
             },
         )
@@ -126,6 +205,14 @@ mod tests {
         assert!(settings.auto_switch_on_limit);
         assert!(settings.launch_at_startup);
         assert!(!settings.show_quota_in_menu_bar);
+        assert_eq!(settings.ui_language, "vi");
+    }
+
+    #[test]
+    fn resolve_ui_language_honors_explicit_preference() {
+        assert_eq!(resolve_ui_language("en"), ResolvedUiLanguage::En);
+        assert_eq!(resolve_ui_language("vi"), ResolvedUiLanguage::Vi);
+        assert_eq!(normalize_ui_language("VI-vn"), Some("vi"));
     }
 
     #[test]

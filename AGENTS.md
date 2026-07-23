@@ -9,13 +9,13 @@
 
 ## Architecture
 
-- `src/main.rs` → `cli::run()` routes subcommands or interactive/tray mode.
+- `src/main.rs` → `cli::run()` routes clap subcommands, or launches the menubar tray when no subcommand is given (macOS/Windows).
 - `app/service.rs` holds core business logic; `App<S: SecretStore>` is generic over storage.
 - `repository/` persists snapshot metadata + gzip blobs; `secrets.rs` handles local/keyring migration.
-- `codex.rs` reads/restores live `~/.codex/auth.json` + `cap_sid`.
+- `codex.rs` / `cursor.rs` / `claude.rs` read/restore live auth for each provider.
 - `usage.rs` fetches quota from OpenAI APIs; `app/auto_start.rs` runs background workers.
-- Tray (`tray.rs`) and TUI (`app/tui.rs`) are Windows/macOS-only for tray; Linux/WSL is TUI-only.
-- `contrib/macos-menubar/` is an optional Python wrapper; the Rust binary has its own native tray.
+- Tray (`tray.rs`) is the primary macOS/Windows UX: left-click opens a CodexBar-style meter-card popover (`/menu`); right-click keeps the NSMenu; Overview is a secondary wry window (`/`).
+- Linux/WSL: CLI subcommands only (no tray / no TUI).
 
 ## Validation
 

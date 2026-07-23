@@ -236,6 +236,19 @@ pub struct ShowQuotaInMenuBarStatusOutput {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct DisableBlockerWarningsStatusOutput {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UiLanguageStatusOutput {
+    /// Stored preference: `auto`, `en`, or `vi`.
+    pub preference: String,
+    /// Resolved language used by UI surfaces: `en` or `vi`.
+    pub resolved: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct AutoStartUsageWindowsRunOutput {
     pub enabled: bool,
     pub checked_accounts: usize,
@@ -316,6 +329,8 @@ pub struct ImportOutput {
     pub email: String,
     pub label: Option<String>,
     pub created: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -366,6 +381,8 @@ pub struct DeleteOutput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountUsageView {
     pub source: UsageSource,
+    /// RFC3339 in JSON (JS-friendly); still accepts legacy `time` tuples on load.
+    #[serde(with = "crate::time_serde::offset_datetime")]
     pub fetched_at: OffsetDateTime,
     pub five_hour: Option<UsageWindowView>,
     pub weekly: Option<UsageWindowView>,
@@ -456,6 +473,7 @@ impl AccountUsageView {
 pub struct UsageWindowView {
     pub used_percent: u8,
     pub remaining_percent: u8,
+    #[serde(with = "crate::time_serde::offset_datetime")]
     pub reset_at: OffsetDateTime,
 }
 

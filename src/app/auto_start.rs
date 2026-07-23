@@ -16,8 +16,9 @@ use crate::codex;
 use crate::env::AppEnv;
 use crate::model::{
     AUTH_FILES, AutoStartUsageWindowAccountResult, AutoStartUsageWindowsRunOutput,
-    AutoStartUsageWindowsStatusOutput, AutoSwitchOnLimitStatusOutput, DisplayIdentity,
-    LaunchAtStartupStatusOutput, ShowQuotaInMenuBarStatusOutput, SnapshotBlob,
+    AutoStartUsageWindowsStatusOutput, AutoSwitchOnLimitStatusOutput,
+    DisableBlockerWarningsStatusOutput, DisplayIdentity, LaunchAtStartupStatusOutput,
+    ShowQuotaInMenuBarStatusOutput, SnapshotBlob,
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
@@ -108,6 +109,49 @@ where
         Ok(ShowQuotaInMenuBarStatusOutput { enabled })
     }
 
+    pub fn disable_blocker_warnings_status(&self) -> Result<DisableBlockerWarningsStatusOutput> {
+        let settings = load_settings(&self.env.app_data_dir)?;
+        Ok(DisableBlockerWarningsStatusOutput {
+            enabled: settings.disable_blocker_warnings,
+        })
+    }
+
+    pub fn set_disable_blocker_warnings(
+        &self,
+        enabled: bool,
+    ) -> Result<DisableBlockerWarningsStatusOutput> {
+        let mut settings = load_settings(&self.env.app_data_dir)?;
+        settings.disable_blocker_warnings = enabled;
+        save_settings(&self.env.app_data_dir, &settings)?;
+        Ok(DisableBlockerWarningsStatusOutput { enabled })
+    }
+
+    pub fn ui_language_status(&self) -> Result<crate::model::UiLanguageStatusOutput> {
+        let settings = load_settings(&self.env.app_data_dir)?;
+        let preference = crate::settings::normalize_ui_language(&settings.ui_language)
+            .unwrap_or("auto")
+            .to_owned();
+        let resolved = crate::settings::resolve_ui_language(&preference)
+            .as_str()
+            .to_owned();
+        Ok(crate::model::UiLanguageStatusOutput {
+            preference,
+            resolved,
+        })
+    }
+
+    pub fn set_ui_language(
+        &self,
+        preference: &str,
+    ) -> Result<crate::model::UiLanguageStatusOutput> {
+        let normalized = crate::settings::normalize_ui_language(preference)
+            .ok_or_else(|| anyhow::anyhow!("unsupported ui language: {preference}"))?;
+        let mut settings = load_settings(&self.env.app_data_dir)?;
+        settings.ui_language = normalized.to_owned();
+        save_settings(&self.env.app_data_dir, &settings)?;
+        self.ui_language_status()
+    }
+
     pub fn set_launch_at_startup(&self, enabled: bool) -> Result<LaunchAtStartupStatusOutput> {
         let mut settings = load_settings(&self.env.app_data_dir)?;
         settings.launch_at_startup = enabled;
@@ -163,6 +207,11 @@ where
     pub fn auto_switch_on_limit_once(&self) -> Result<Option<Uuid>> {
         let settings = load_settings(&self.env.app_data_dir)?;
         if !settings.auto_switch_on_limit {
+            return Ok(None);
+        }
+        // Never quit/relaunch Codex while the user is in browser OAuth
+        // (redirect_uri=http://localhost:1455/auth/callback).
+        if codex::interactive_login_in_progress(&self.env) {
             return Ok(None);
         }
         let threshold = settings.near_limit_threshold_percent;
@@ -249,6 +298,11 @@ where
             skipped: Vec::new(),
         };
         if require_enabled && !enabled {
+            return Ok(output);
+        }
+
+        // Pings use `codex exec` and menu refresh; skip entirely during OAuth login.
+        if codex::interactive_login_in_progress(&self.env) {
             return Ok(output);
         }
 
@@ -605,7 +659,18 @@ exit 1
 }
 
 #[cfg(target_os = "macos")]
-fn macos_launch_agent_plist_content(program_path: &Path) -> String {
+fn macos_launch_agent_log_dir(home_dir: &Path) -> PathBuf {
+    home_dir
+        .join("Library")
+        .join("Logs")
+        .join("com.anlvdt.codex-account-switcher")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_launch_agent_plist_content(home_dir: &Path, program_path: &Path) -> String {
+    let log_dir = macos_launch_agent_log_dir(home_dir);
+    let stdout = log_dir.join("launchd.stdout.log");
+    let stderr = log_dir.join("launchd.stderr.log");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -619,11 +684,19 @@ fn macos_launch_agent_plist_content(program_path: &Path) -> String {
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <true/>
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
+    <key>StandardOutPath</key>
+    <string>{}</string>
+    <key>StandardErrorPath</key>
+    <string>{}</string>
 </dict>
 </plist>"#,
-        program_path.display()
+        program_path.display(),
+        stdout.display(),
+        stderr.display()
     )
 }
 
@@ -650,7 +723,11 @@ fn write_macos_launch_agent_plist(home_dir: &Path, program_path: &Path) -> Resul
     if let Some(parent) = plist_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&plist_path, macos_launch_agent_plist_content(program_path))?;
+    fs::create_dir_all(macos_launch_agent_log_dir(home_dir))?;
+    fs::write(
+        &plist_path,
+        macos_launch_agent_plist_content(home_dir, program_path),
+    )?;
     Ok(plist_path)
 }
 
@@ -731,7 +808,7 @@ fn update_macos_launch_at_startup_if_needed(home_dir: &Path, exe: &Path) -> Resu
     let installed_exe = install_macos_menubar_binary(home_dir, exe)?;
     write_macos_launcher_script(home_dir, exe)?;
     let plist_path = macos_launch_agent_plist_path(home_dir);
-    let plist_content = macos_launch_agent_plist_content(&installed_exe);
+    let plist_content = macos_launch_agent_plist_content(home_dir, &installed_exe);
     let plist_changed = fs::read_to_string(&plist_path)
         .map(|content| content != plist_content)
         .unwrap_or(true);
@@ -755,7 +832,7 @@ fn notify_auto_switch(body: &str) {
         let _ = std::process::Command::new("osascript")
             .arg("-e")
             .arg(format!(
-                "display notification \"{}\" with title \"Codex Switcher\"",
+                "display notification \"{}\" with title \"ChatGPT Codex\"",
                 body.replace('"', "\\\"")
             ))
             .spawn();
@@ -1318,6 +1395,9 @@ mod tests {
         let plist = fs::read_to_string(&plist_path)?;
         assert!(plist.contains("codex-account-switcher-menubar"));
         assert!(!plist.contains("codex-account-switcher-launcher.sh"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("launchd.stdout.log"));
+        assert!(plist.contains("launchd.stderr.log"));
         assert!(
             home_dir
                 .join(".local")

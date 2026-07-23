@@ -1,0 +1,1951 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChatGPT Codex</title>
+<style>
+:root {
+  --bg: #12151a;
+  --bg-2: #1a1f27;
+  --bg-3: #222833;
+  --line: rgba(255,255,255,0.09);
+  --line-strong: rgba(255,255,255,0.16);
+  --text: #f2f6f9;
+  --muted: #a8b6c4;
+  --faint: #7d8d9d;
+  --accent: #16d3b4;
+  --accent-hover: #2de0c2;
+  --accent-press: #12bda0;
+  --accent-dim: rgba(22,211,180,0.14);
+  --accent-border: rgba(22,211,180,0.38);
+  --codex: #5ec8ff;
+  --cursor: #f0a3c2;
+  --claude: #e8a87c;
+  --ok: #3ecf8e;
+  --warn: #e6b35a;
+  --danger: #ef6b6b;
+  --font: "SF Pro Text", -apple-system, BlinkMacSystemFont, "Helvetica Neue", system-ui, sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, Monaco, monospace;
+  --ease: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  --r-panel: 16px;
+  --r-card: 12px;
+  --r-row: 10px;
+  --r-btn: 9px;
+  --r-chip: 999px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+/* Fixed viewport: WKWebView must not grow with content or overflow never scrolls. */
+html, body {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent !important;
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+.panel {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-height: 100%;
+  display: grid;
+  /* minmax(0,1fr) is the real scroll fix — plain 1fr/flex can refuse to shrink in WebKit */
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: #12151a;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-panel);
+  overflow: hidden;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.38);
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.7rem 0.85rem 0.55rem;
+  border-bottom: 1px solid var(--line);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+}
+.brand-mark {
+  width: 1.45rem;
+  height: 1.45rem;
+  border-radius: var(--r-btn);
+  background: linear-gradient(145deg, var(--accent), #0ea5a0);
+  color: #04120f;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 0.72rem;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+.brand-title {
+  font-size: 1rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+.brand-sub {
+  font-size: 0.74rem;
+  color: var(--muted);
+  font-family: var(--mono);
+  margin-top: 0.06rem;
+}
+.header-actions {
+  display: flex;
+  gap: 0.3rem;
+  flex-shrink: 0;
+  align-items: center;
+}
+button {
+  font-family: inherit;
+  border: none;
+  cursor: pointer;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  transition: var(--ease);
+}
+button:focus-visible {
+  outline: 2px solid rgba(22,211,180,0.55);
+  outline-offset: 1px;
+}
+.btn {
+  padding: 0.38rem 0.62rem;
+  border-radius: var(--r-btn);
+  font-size: 0.8rem;
+  font-weight: 550;
+  border: 1px solid var(--line-strong);
+  background: rgba(255,255,255,0.04);
+  white-space: nowrap;
+  flex: 0 0 auto;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
+}
+.btn:hover {
+  background: rgba(255,255,255,0.11);
+  border-color: rgba(255,255,255,0.24);
+}
+.btn:active {
+  background: rgba(255,255,255,0.16);
+  border-color: rgba(255,255,255,0.28);
+}
+.btn-accent {
+  background: var(--accent);
+  color: #04120f;
+  border-color: transparent;
+  font-weight: 600;
+}
+.btn-accent:hover {
+  background: var(--accent-hover);
+  border-color: transparent;
+  color: #04120f;
+}
+.btn-accent:active {
+  background: var(--accent-press);
+}
+/* Single scrollport between sticky header/footer */
+#scrollport {
+  min-height: 0;
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: scroll;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  padding: 0.45rem 0.55rem 0.65rem;
+}
+#scrollport::-webkit-scrollbar { width: 7px; }
+#scrollport::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.18);
+  border-radius: 999px;
+}
+#providers {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  /* Tall enough that many accounts always overflow the fixed popover */
+  min-height: min-content;
+}
+.skeleton-block {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.skeleton-line {
+  height: 0.55rem;
+  border-radius: 4px;
+  background: linear-gradient(90deg, rgba(255,255,255,0.04), rgba(255,255,255,0.1), rgba(255,255,255,0.04));
+  background-size: 200% 100%;
+  animation: menu-skel 1.1s ease-in-out infinite;
+}
+.skeleton-line.w50 { width: 50%; }
+.skeleton-line.w70 { width: 70%; }
+.skeleton-line.w100 { width: 100%; height: 5px; margin-top: 0.2rem; }
+@keyframes menu-skel {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+.accounts.virtual {
+  max-height: 14rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  position: relative;
+}
+.virt-spacer { width: 100%; pointer-events: none; }
+.virt-window { display: flex; flex-direction: column; }
+.virt-hint {
+  font-size: 0.68rem;
+  color: var(--faint);
+  padding: 0.15rem 0.48rem 0.25rem;
+  font-family: var(--mono);
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-line { animation: none; }
+}
+.provider {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.provider-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.5rem 0.65rem;
+  border-bottom: 1px solid transparent;
+  cursor: pointer;
+  user-select: none;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+.provider-head:hover {
+  background: rgba(255,255,255,0.04);
+}
+.provider.open .provider-head {
+  border-bottom-color: var(--line);
+}
+.provider-body {
+  display: none;
+}
+.provider.open .provider-body {
+  display: block;
+}
+.provider-chevron {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-right: 2px solid var(--faint);
+  border-bottom: 2px solid var(--faint);
+  transform: rotate(-45deg);
+  margin-right: 0.15rem;
+  flex-shrink: 0;
+  transition: transform 0.12s ease;
+}
+.provider.open .provider-chevron {
+  transform: rotate(45deg);
+}
+.provider-head-main {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+  flex: 1;
+}
+.provider-summary {
+  font-size: 0.72rem;
+  color: var(--faint);
+  max-width: 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 1;
+}
+.provider-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.88rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.dot {
+  width: 0.44rem;
+  height: 0.44rem;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot-codex { background: var(--codex); }
+.dot-cursor { background: var(--cursor); }
+.dot-claude { background: var(--claude); }
+.provider-code {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--faint);
+  letter-spacing: 0.06em;
+  font-weight: 500;
+}
+.live {
+  padding: 0.55rem 0.65rem 0.4rem;
+  border-bottom: 1px solid var(--line);
+}
+.live-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.28rem;
+}
+.live-email {
+  font-size: 0.9rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.live-plan {
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  color: var(--muted);
+  flex-shrink: 0;
+  font-weight: 500;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.14rem 0.42rem;
+  border-radius: var(--r-chip);
+  margin-right: 0.2rem;
+  letter-spacing: 0.01em;
+}
+.chip-active { background: var(--accent-dim); color: var(--accent); }
+.chip-unsaved { background: rgba(230,179,90,0.18); color: #f0c56e; }
+.chip-login { background: rgba(239,107,107,0.16); color: #ffb8b8; }
+.chip-exhausted { background: rgba(239,107,107,0.16); color: #ffb8b8; }
+.chip-ready { background: rgba(62,207,142,0.16); color: #55d99c; }
+.chip-low { background: rgba(230,179,90,0.18); color: #f0c56e; }
+.meters { display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.38rem; }
+.meter-row {
+  display: grid;
+  grid-template-columns: 2.7rem 1fr auto;
+  gap: 0.4rem;
+  align-items: center;
+}
+.meter-label {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.meter-track {
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.09);
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--ok);
+  /* width changes are applied directly — no transition to avoid poll-driven reflow jank */
+}
+.meter-fill.warn { background: var(--warn); }
+.meter-fill.danger { background: var(--danger); }
+.meter-meta {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  white-space: nowrap;
+  font-weight: 500;
+}
+.meter-meta .reset { color: var(--faint); }
+.pace-line {
+  margin-top: 0.3rem;
+  font-size: 0.74rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+.pace-line .deficit { color: #ff9a9a; font-weight: 600; }
+.pace-line .reserve { color: #55d99c; font-weight: 600; }
+.note {
+  font-size: 0.78rem;
+  color: var(--muted);
+  padding: 0.15rem 0;
+  line-height: 1.4;
+}
+.accounts { padding: 0.28rem 0.4rem 0.42rem; }
+.account {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.45rem;
+  padding: 0.45rem 0.48rem;
+  border-radius: var(--r-row);
+  border: 1px solid transparent;
+  cursor: default;
+}
+.account:hover {
+  background: rgba(255,255,255,0.07);
+  border-color: rgba(255,255,255,0.08);
+}
+.account.active {
+  background: rgba(22,211,180,0.1);
+  border-color: rgba(22,211,180,0.18);
+}
+.account.active:hover {
+  background: rgba(22,211,180,0.14);
+}
+.account-main { min-width: 0; flex: 1; }
+.account-email {
+  font-size: 0.86rem;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.account-meta {
+  font-size: 0.74rem;
+  color: var(--muted);
+  margin-top: 0.12rem;
+  line-height: 1.35;
+}
+.account-quota {
+  margin-top: 0.35rem;
+}
+.account-quota .meters {
+  margin-top: 0.2rem;
+  gap: 0.22rem;
+}
+.account-quota .meter-row {
+  grid-template-columns: 2.5rem 1fr auto;
+  gap: 0.35rem;
+}
+.account-quota .meter-meta {
+  font-size: 0.68rem;
+  max-width: 11.5rem;
+  text-align: right;
+  white-space: normal;
+  line-height: 1.25;
+}
+.account-quota .meter-meta .reset-at {
+  display: block;
+  color: var(--faint);
+  font-weight: 400;
+}
+.account .switch-btn {
+  margin-top: 0.15rem;
+}
+.live .meter-meta .reset-at {
+  display: block;
+  color: var(--faint);
+  font-weight: 400;
+}
+.switch-btn, .save-btn {
+  flex-shrink: 0;
+  padding: 0.32rem 0.55rem;
+  border-radius: var(--r-btn);
+  font-size: 0.76rem;
+  font-weight: 600;
+  border: 1px solid var(--line-strong);
+  background: rgba(255,255,255,0.04);
+  cursor: pointer;
+  transition: var(--ease);
+}
+.switch-btn:hover {
+  background: var(--accent);
+  color: #04120f;
+  border-color: transparent;
+}
+.switch-btn:active {
+  background: var(--accent-press);
+  color: #04120f;
+}
+.save-btn {
+  background: var(--accent-dim);
+  border-color: var(--accent-border);
+  color: var(--accent);
+  margin: 0.35rem 0.65rem 0.55rem;
+  width: calc(100% - 1.3rem);
+  display: block;
+  text-align: center;
+  padding: 0.38rem 0.55rem;
+}
+.save-btn:hover {
+  background: var(--accent);
+  color: #04120f;
+  border-color: transparent;
+}
+.save-btn:active {
+  background: var(--accent-press);
+  color: #04120f;
+}
+.empty {
+  padding: 0.55rem 0.65rem 0.7rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.expand-btn {
+  display: block;
+  width: calc(100% - 0.8rem);
+  margin: 0.15rem 0.4rem 0.35rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: var(--r-btn);
+  border: 1px dashed var(--line-strong);
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 550;
+  text-align: center;
+  cursor: pointer;
+}
+.expand-btn:hover {
+  color: var(--text);
+  border-color: rgba(255,255,255,0.24);
+  background: rgba(255,255,255,0.04);
+}
+footer {
+  border-top: 1px solid var(--line);
+  padding: 0.45rem 0.65rem 0.55rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  background: linear-gradient(180deg, rgba(18,21,26,0.92), #12151a);
+}
+.footer-row {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.footer-row.primary {
+  gap: 0.35rem;
+}
+.footer-row .btn,
+.footer-row .footer-link {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  min-width: 0;
+  max-width: none;
+}
+.footer-spacer { flex: 1 1 auto; min-width: 0.25rem; }
+.footer-link {
+  font-size: 0.76rem;
+  color: var(--muted);
+  padding: 0.3rem 0.45rem;
+  border-radius: var(--r-btn);
+  cursor: pointer;
+  transition: var(--ease);
+}
+.footer-link:hover {
+  background: rgba(255,255,255,0.09);
+  color: var(--text);
+}
+.footer-link:active {
+  background: rgba(255,255,255,0.14);
+}
+.credits {
+  font-size: 0.68rem;
+  color: var(--faint);
+  line-height: 1.4;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.credits a {
+  color: var(--muted);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color 0.12s ease;
+  word-break: break-all;
+}
+.credits a:hover { color: var(--accent); }
+.toasts {
+  position: fixed;
+  bottom: 0.6rem;
+  left: 0.6rem;
+  right: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  z-index: 20;
+  pointer-events: none;
+}
+.toast {
+  background: rgba(17,23,28,0.97);
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-row);
+  padding: 0.45rem 0.6rem;
+  font-size: 0.78rem;
+  box-shadow: 0 6px 14px rgba(0,0,0,0.28);
+  color: var(--text);
+}
+.toast.error { border-left-color: var(--danger); }
+.toast.success { border-left-color: var(--ok); }
+.toast.warning { border-left-color: var(--warn); }
+.lang-mini {
+  display: flex;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-btn);
+  overflow: hidden;
+}
+.lang-mini button {
+  padding: 0.28rem 0.45rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.03em;
+  transition: var(--ease);
+}
+.lang-mini button:hover:not(.active) {
+  background: rgba(255,255,255,0.08);
+  color: var(--text);
+}
+.lang-mini button.active {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+.lang-mini button:active:not(.active) {
+  background: rgba(255,255,255,0.12);
+}
+@media (prefers-reduced-motion: reduce) {
+  button, .account, .footer-link, .credits a, .switch-btn, .save-btn {
+    transition: none;
+  }
+}
+
+.import-overlay {
+  position: fixed; inset: 0; z-index: 40;
+  background: rgba(0,0,0,0.45);
+  display: none; align-items: flex-end; justify-content: center;
+  padding: 0.55rem;
+}
+.import-overlay.open { display: flex; }
+.import-sheet {
+  width: 100%; max-height: 92%;
+  background: #171b22;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-card);
+  padding: 0.7rem 0.75rem 0.8rem;
+  display: flex; flex-direction: column; gap: 0.45rem;
+  box-shadow: 0 12px 28px rgba(0,0,0,0.4);
+  contain: layout paint style;
+}
+.import-sheet h3 { font-size: 0.92rem; font-weight: 650; }
+.import-help { font-size: 0.74rem; color: var(--muted); line-height: 1.4; }
+.import-file-row {
+  display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;
+}
+.import-file-name {
+  font-size: 0.74rem; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 100%;
+}
+.import-paste-toggle {
+  align-self: flex-start;
+  background: transparent; border: none;
+  color: var(--accent); font: inherit; font-size: 0.74rem;
+  padding: 0.1rem 0; cursor: pointer;
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.import-paste-panel { display: none; }
+.import-paste-panel.open { display: block; }
+.import-sheet select, .import-sheet textarea {
+  width: 100%; font: inherit; color: var(--text);
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-btn);
+  padding: 0.4rem 0.5rem;
+}
+.import-sheet textarea {
+  min-height: 7.5rem; resize: vertical; font-family: var(--mono); font-size: 0.72rem;
+}
+.import-actions { display: flex; gap: 0.35rem; flex-wrap: wrap; align-items: center; }
+.import-error { font-size: 0.74rem; color: #ffb8b8; line-height: 1.35; display: none; }
+.import-error.show { display: block; }
+.add-pending {
+  margin: 0.3rem 0 0.45rem;
+  padding: 0.55rem 0.6rem;
+  border-radius: var(--r-card);
+  border: 1px solid rgba(230,179,90,0.35);
+  background: rgba(230,179,90,0.12);
+  display: flex; flex-direction: column; gap: 0.4rem;
+}
+.add-pending-title { font-size: 0.82rem; font-weight: 650; color: #f0c56e; }
+.add-pending-steps { margin: 0; padding-left: 1.05rem; font-size: 0.74rem; color: var(--muted); line-height: 1.4; }
+#add-pending-banner:empty { display: none; }
+#add-pending-banner .add-pending { margin: 0.55rem 0.75rem 0.15rem; }
+.provider-actions {
+  display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.4rem;
+}
+</style>
+</head>
+<body>
+<div class="panel">
+  <header>
+    <div class="brand">
+      <div class="brand-mark">CX</div>
+      <div>
+        <div class="brand-title">ChatGPT Codex</div>
+        <div class="brand-sub" data-i18n="brandSub">limits · accounts · resets</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <div class="lang-mini" role="group">
+        <button type="button" id="lang-en" onclick="setUiLanguage('en')">EN</button>
+        <button type="button" id="lang-vi" onclick="setUiLanguage('vi')">VI</button>
+      </div>
+      <button class="btn" onclick="refreshAll()" data-i18n="refresh">Refresh</button>
+    </div>
+  </header>
+  <div id="scrollport">
+    <div id="add-pending-banner"></div>
+    <div id="providers" aria-busy="true">
+      <div class="skeleton-block">
+        <div class="skeleton-line w50"></div>
+        <div class="skeleton-line w70"></div>
+        <div class="skeleton-line w100"></div>
+      </div>
+      <div class="skeleton-block">
+        <div class="skeleton-line w50"></div>
+        <div class="skeleton-line w70"></div>
+        <div class="skeleton-line w100"></div>
+      </div>
+      <div class="skeleton-block">
+        <div class="skeleton-line w50"></div>
+        <div class="skeleton-line w70"></div>
+        <div class="skeleton-line w100"></div>
+      </div>
+    </div>
+  </div>
+  <footer>
+    <div class="footer-row primary">
+      <button class="btn btn-accent" onclick="triggerBestQuota()" data-i18n="bestQuota">Best quota</button>
+      <button class="btn" onclick="openOverview()" data-i18n="overview">Overview</button>
+      <span class="footer-spacer" aria-hidden="true"></span>
+      <button class="footer-link" onclick="quitApp()" data-i18n="quit">Quit</button>
+    </div>
+    <div class="footer-row">
+      <button class="btn" onclick="openImportCookies()" data-i18n="importCookies">Import Codex cookies…</button>
+    </div>
+    <div class="credits">
+      <div>
+        <span data-i18n="forkPrefix">Forked from</span>
+        <a href="https://github.com/Pimpmuckl/codex-account-switcher" target="_blank" rel="noreferrer">Pimpmuckl/codex-account-switcher</a>
+      </div>
+      <div>
+        <span data-i18n="creditsPrefix">UI inspired by</span>
+        <a href="https://github.com/steipete/CodexBar" target="_blank" rel="noreferrer">CodexBar</a>
+        <span data-i18n="creditsBy">by steipete</span>
+      </div>
+    </div>
+  </footer>
+</div>
+<div id="toasts" class="toasts"></div>
+<div id="import-overlay" class="import-overlay" onclick="if(event.target===this)closeImportCookies()">
+  <div class="import-sheet" role="dialog" aria-modal="true">
+    <h3 data-i18n="importTitle">Import cookies JSON</h3>
+    <p class="import-help" data-i18n="importHelp">Import Codex (OpenAI tokens/session cookies) or Cursor (WorkosCursorSessionToken from cursor.com). Values stay local and are never logged.</p>
+    <label class="import-help" for="import-provider" data-i18n="importProvider">Provider</label>
+    <select id="import-provider">
+      <option value="auto" selected>Auto</option>
+      <option value="codex">ChatGPT Codex</option>
+      <option value="cursor">Cursor</option>
+    </select>
+    <input id="import-file" type="file" accept=".json,application/json,text/json,text/plain" hidden />
+    <div class="import-file-row">
+      <button type="button" class="btn btn-accent" onclick="document.getElementById('import-file').click()" data-i18n="importChooseFile">Choose JSON file</button>
+      <span id="import-file-name" class="import-file-name" data-i18n="importNoFile">No file selected</span>
+    </div>
+    <button type="button" class="import-paste-toggle" id="import-paste-toggle" onclick="toggleImportPaste()" data-i18n="importPasteToggle">Or paste JSON</button>
+    <div id="import-paste-panel" class="import-paste-panel">
+      <textarea id="import-json" spellcheck="false" data-i18n-placeholder="importPlaceholder" placeholder='[{"name":"id_token","value":"..."},{"name":"access_token","value":"..."}]'></textarea>
+    </div>
+    <div id="import-error" class="import-error"></div>
+    <div class="import-actions">
+      <button class="btn btn-accent" onclick="submitImportCookies()" data-i18n="importSubmit">Import</button>
+      <button class="btn" onclick="closeImportCookies()" data-i18n="importCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+<script>
+const WEEKLY_SECS = 168 * 3600;
+const I18N = {
+  en: {
+    brandSub: 'limits · accounts · resets',
+    refresh: 'Refresh',
+    bestQuota: 'Best quota',
+    overview: 'Overview',
+    quit: 'Quit',
+    forkPrefix: 'Forked from',
+    creditsPrefix: 'UI inspired by',
+    creditsBy: 'by steipete',
+    notLoggedIn: 'Not logged in',
+    unsaved: 'unsaved',
+    active: 'Active',
+    ready: 'Ready',
+    low: 'Low',
+    depleted: 'Depleted',
+    login: 'Login',
+    exhausted: 'Exhausted',
+    week: 'Week',
+    session: '5h',
+    pastReset: 'past reset',
+    onPace: 'On pace',
+    inDeficit: '{n}% in deficit',
+    inReserve: '{n}% in reserve',
+    lastsUntilReset: 'Lasts until reset',
+    runsOutNow: 'Runs out now',
+    runsOutIn: 'Runs out in {time}',
+    now: 'now',
+    loginRequiredUsage: 'Login required to refresh usage',
+    noCachedUsage: 'No cached usage yet',
+    noSaved: 'No saved accounts yet.',
+    emptyCursor: 'No saved Cursor accounts. Use Save signed-in session while Cursor is logged in.',
+    emptyClaude: 'No saved Claude accounts. Use Save signed-in session while Claude is logged in.',
+    emptyCodex: 'No saved Codex accounts. Use Add account or Save signed-in session.',
+    saveActive: 'Save signed-in session',
+    saveLive: 'Save signed-in session',
+    addAccount: 'Add account',
+    addPendingTitle: 'Adding Codex account / workspace',
+    addPendingStep1: 'Log in to Codex with the new account or workspace',
+    addPendingStep2: 'Return here when login finishes',
+    addPendingStep3: 'Choose Finish to save the new account',
+    finishAdd: 'Finish',
+    cancelAdd: 'Cancel',
+    addingAccount: 'Starting…',
+    addStarted: 'Finish the new browser login tab (close blank pages), then Finish here',
+    addFinished: 'Added {email}',
+    addCancelled: 'Cancelled — original account restored',
+    addTimedOut: 'Add account timed out — try again',
+    addCursorHint: 'Sign in to Cursor with the new account, then Save signed-in session.',
+    addClaudeHint: 'Sign in to Claude with the new account, then Save signed-in session.',
+    switch: 'Switch',
+    switching: 'Switching…',
+    switchedOk: 'Switched',
+    switchFailed: 'Switch failed: {error}',
+    confirmKillThenSwitch: '{n} running process(es) may block a reliable switch:\n{list}\n\nQuit them and switch now?',
+    terminating: 'Terminating processes…',
+    terminateFailed: 'Failed to terminate: {error}',
+    saving: 'Saving…',
+    savedOk: 'Saved',
+    saveFailed: 'Save failed: {error}',
+    findingBest: 'Finding best quota…',
+    switchedBest: 'Switched to best account',
+    noBetter: 'No better account: {error}',
+    connectFailed: 'Backend unavailable',
+    settingsSaved: 'Language updated',
+    failed: 'Failed: {error}',
+    remaining: '{n}% left',
+    signedInUnknown: 'Signed in (email unknown)',
+    liveDetected: 'Detected session',
+    importCookies: 'Import cookies…',
+    importTitle: 'Import cookies JSON',
+    importHelp: 'Import Codex (OpenAI tokens/session cookies) or Cursor (WorkosCursorSessionToken from cursor.com). Values stay local and are never logged.',
+    importChooseFile: 'Choose JSON file',
+    importNoFile: 'No file selected',
+    importPasteToggle: 'Or paste JSON',
+    importPasteHide: 'Hide paste',
+    importProvider: 'Provider',
+    importPlaceholder: '[{"name":"id_token","value":"..."},{"name":"access_token","value":"..."}]',
+    importSubmit: 'Import',
+    importCancel: 'Cancel',
+    importing: 'Importing…',
+    importedOk: 'Imported {email}',
+    importFailed: 'Import failed: {error}',
+    importCursorUnsupported: 'Cursor cookie import is not supported. Save a live Cursor session instead.',
+    importClaudeUnsupported: 'Claude cookie import is not supported. Save a live Claude session instead.',
+    showMore: 'Show {n} more',
+    showLess: 'Show less',
+  },
+  vi: {
+    brandSub: 'hạn mức · tài khoản · làm mới',
+    refresh: 'Làm mới',
+    bestQuota: 'Hạn mức tốt nhất',
+    overview: 'Tổng quan',
+    quit: 'Thoát',
+    forkPrefix: 'Fork từ',
+    creditsPrefix: 'UI tham khảo',
+    creditsBy: 'của steipete',
+    notLoggedIn: 'Chưa đăng nhập',
+    unsaved: 'chưa lưu',
+    active: 'Đang dùng',
+    ready: 'Sẵn sàng',
+    low: 'Sắp hết',
+    depleted: 'Đã hết',
+    login: 'Đăng nhập',
+    exhausted: 'Hết hạn mức',
+    week: 'Tuần',
+    session: '5 giờ',
+    pastReset: 'đã qua mốc làm mới',
+    onPace: 'Đúng nhịp',
+    inDeficit: 'Thiếu {n}%',
+    inReserve: 'Dư {n}%',
+    lastsUntilReset: 'Đủ đến lúc làm mới',
+    runsOutNow: 'Hết ngay',
+    runsOutIn: 'Hết sau {time}',
+    now: 'ngay',
+    loginRequiredUsage: 'Cần đăng nhập để làm mới hạn mức',
+    noCachedUsage: 'Chưa có dữ liệu hạn mức',
+    noSaved: 'Chưa có tài khoản đã lưu.',
+    emptyCursor: 'Chưa có tài khoản Cursor. Dùng Lưu phiên đang đăng nhập khi Cursor đã đăng nhập.',
+    emptyClaude: 'Chưa có tài khoản Claude. Dùng Lưu phiên đang đăng nhập khi Claude đã đăng nhập.',
+    emptyCodex: 'Chưa có tài khoản Codex. Dùng Thêm tài khoản hoặc Lưu phiên đang đăng nhập.',
+    saveActive: 'Lưu phiên đang đăng nhập',
+    saveLive: 'Lưu phiên đang đăng nhập',
+    addAccount: 'Thêm tài khoản',
+    addPendingTitle: 'Đang thêm tài khoản / workspace Codex',
+    addPendingStep1: 'Đăng nhập Codex bằng tài khoản hoặc workspace mới',
+    addPendingStep2: 'Quay lại đây khi đăng nhập xong',
+    addPendingStep3: 'Chọn Hoàn tất để lưu tài khoản mới',
+    finishAdd: 'Hoàn tất',
+    cancelAdd: 'Hủy',
+    addingAccount: 'Đang bắt đầu…',
+    addStarted: 'Hoàn tất tab đăng nhập trình duyệt mới (đóng trang trống), rồi bấm Hoàn tất',
+    addFinished: 'Đã thêm {email}',
+    addCancelled: 'Đã hủy — khôi phục tài khoản cũ',
+    addTimedOut: 'Hết thời gian thêm tài khoản — thử lại',
+    addCursorHint: 'Đăng nhập Cursor bằng tài khoản mới, rồi Lưu phiên đang đăng nhập.',
+    addClaudeHint: 'Đăng nhập Claude bằng tài khoản mới, rồi Lưu phiên đang đăng nhập.',
+    switch: 'Chuyển',
+    switching: 'Đang chuyển…',
+    switchedOk: 'Đã chuyển',
+    switchFailed: 'Chuyển thất bại: {error}',
+    confirmKillThenSwitch: '{n} tiến trình đang chạy có thể chặn đổi tài khoản:\n{list}\n\nTắt chúng và chuyển ngay?',
+    terminating: 'Đang tắt tiến trình…',
+    terminateFailed: 'Không tắt được: {error}',
+    saving: 'Đang lưu…',
+    savedOk: 'Đã lưu',
+    saveFailed: 'Lưu thất bại: {error}',
+    findingBest: 'Đang tìm hạn mức tốt nhất…',
+    switchedBest: 'Đã chuyển sang tài khoản tốt nhất',
+    noBetter: 'Không có tài khoản tốt hơn: {error}',
+    connectFailed: 'Không kết nối được máy chủ',
+    settingsSaved: 'Đã cập nhật ngôn ngữ',
+    failed: 'Thất bại: {error}',
+    remaining: 'còn {n}%',
+    signedInUnknown: 'Đã đăng nhập (chưa rõ email)',
+    liveDetected: 'Phiên đang dùng',
+    importCookies: 'Nhập cookies…',
+    importTitle: 'Nhập cookies JSON',
+    importHelp: 'Nhập Codex (tokens/session OpenAI) hoặc Cursor (WorkosCursorSessionToken từ cursor.com). Dữ liệu giữ cục bộ, không ghi log.',
+    importChooseFile: 'Chọn file JSON',
+    importNoFile: 'Chưa chọn file',
+    importPasteToggle: 'Hoặc dán JSON',
+    importPasteHide: 'Ẩn phần dán',
+    importProvider: 'Dịch vụ',
+    importPlaceholder: '[{"name":"id_token","value":"..."},{"name":"access_token","value":"..."}]',
+    importSubmit: 'Nhập',
+    importCancel: 'Hủy',
+    importing: 'Đang nhập…',
+    importedOk: 'Đã nhập {email}',
+    importFailed: 'Nhập thất bại: {error}',
+    importCursorUnsupported: 'Không hỗ trợ nhập cookies Cursor. Hãy lưu phiên Cursor đang đăng nhập.',
+    importClaudeUnsupported: 'Không hỗ trợ nhập cookies Claude. Hãy lưu phiên Claude đang đăng nhập.',
+    showMore: 'Xem thêm {n}',
+    showLess: 'Thu gọn',
+  },
+};
+
+let lang = 'en';
+let currentStatus = null;
+let lastStatusKey = '';
+let pollTimer = null;
+let tickTimer = null;
+let fetchInFlight = false;
+let fetchAbort = null;
+/** Popover is short-lived — poll gently; ticks keep countdowns fresh. */
+const POLL_MS = 30000;
+const TICK_MS = 30000;
+/** Menu never needs blocker process scans. */
+const STATUS_URL = '/api/status';
+const VIRTUAL_THRESHOLD = 50;
+/** Row height estimate with quota meters + reset datetime under each account. */
+const VIRT_ROW_H = 108;
+const VIRT_OVERSCAN = 6;
+const CLAUDE_UNKNOWN_EMAIL = 'claude-user@unknown.com';
+/** @type {'codex'|'cursor'|'claude'|null} */
+let openProvider = null;
+/** @type {Map<string, {items: any[], activeId: string|null, weeklyOnly: boolean}>} */
+const menuVirtual = new Map();
+
+function readStoredOpenProvider() {
+  try {
+    const saved = localStorage.getItem('cas.openProvider');
+    if (saved === 'codex' || saved === 'cursor' || saved === 'claude') return saved;
+  } catch (_) {}
+  return null;
+}
+
+function persistOpenProvider(key) {
+  try { localStorage.setItem('cas.openProvider', key); } catch (_) {}
+}
+
+function ensureOpenProvider() {
+  if (openProvider === 'codex' || openProvider === 'cursor' || openProvider === 'claude') return;
+  const stored = readStoredOpenProvider();
+  if (stored) {
+    openProvider = stored;
+    return;
+  }
+  if (currentStatus) {
+    if (currentStatus.active_codex_id || currentStatus.live_codex) {
+      openProvider = 'codex';
+      return;
+    }
+    if (currentStatus.active_cursor_id || currentStatus.live_cursor) {
+      openProvider = 'cursor';
+      return;
+    }
+    if (currentStatus.active_claude_id || currentStatus.live_claude) {
+      openProvider = 'claude';
+      return;
+    }
+  }
+  openProvider = 'codex';
+}
+
+function setOpenProvider(key) {
+  if (key !== 'codex' && key !== 'cursor' && key !== 'claude') return;
+  if (openProvider === key) return;
+  openProvider = key;
+  persistOpenProvider(key);
+  lastStatusKey = '';
+  render(true);
+}
+
+function t(key, vars = {}) {
+  const dict = I18N[lang] || I18N.en;
+  let text = dict[key] ?? I18N.en[key] ?? key;
+  Object.keys(vars).forEach((name) => {
+    text = text.replaceAll(`{${name}}`, String(vars[name]));
+  });
+  return text;
+}
+
+function applyStaticI18n() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-i18n]').forEach((el) => {
+    const key = el.getAttribute('data-i18n');
+    if (key) el.textContent = t(key);
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach((el) => {
+    const key = el.getAttribute('data-i18n-placeholder');
+    if (key) el.setAttribute('placeholder', t(key));
+  });
+  const enBtn = document.getElementById('lang-en');
+  const viBtn = document.getElementById('lang-vi');
+  if (enBtn && viBtn) {
+    enBtn.classList.toggle('active', lang === 'en');
+    viBtn.classList.toggle('active', lang === 'vi');
+  }
+}
+
+function setUiLanguage(next) {
+  if (next !== 'en' && next !== 'vi') return;
+  lang = next;
+  applyStaticI18n();
+  render(true);
+  postApi('/api/settings', { key: 'ui-language', value: next })
+    .then((data) => {
+      if (data.success) showToast(t('settingsSaved'), 'success');
+      else showToast(t('failed', { error: data.error || '' }), 'error');
+    })
+    .catch(() => showToast(t('connectFailed'), 'error'));
+}
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+function displayEmail(email) {
+  if (!email || email === CLAUDE_UNKNOWN_EMAIL) return t('signedInUnknown');
+  return email;
+}
+
+function structureFingerprint(data) {
+  try {
+    const accounts = (data.accounts || []).map((a) => [
+      a.id, a.email, a.target_app || 'codex', a.is_archived, a.plan_label || '',
+      a.usage?.weekly?.remaining_percent ?? null,
+      a.usage?.weekly?.reset_at ?? null,
+      a.usage?.five_hour?.remaining_percent ?? null,
+      a.usage?.five_hour?.reset_at ?? null,
+      a.usage_error || '',
+    ]);
+    const liveKey = (live) => live ? [live.email || '', live.plan_label || ''] : null;
+    return JSON.stringify({
+      lang,
+      ac: data.active_codex_id,
+      ar: data.active_cursor_id,
+      al: data.active_claude_id,
+      lc: liveKey(data.live_codex),
+      lr: liveKey(data.live_cursor),
+      ll: liveKey(data.live_claude),
+      pending: !!data.codex_add_account_pending,
+      accounts,
+      open: openProvider,
+    });
+  } catch (_) {
+    return String(Date.now());
+  }
+}
+
+function postApi(url, body, timeoutMs) {
+  const ms = timeoutMs == null ? 12000 : timeoutMs;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+    signal: ctrl.signal,
+  })
+    .then((r) => r.json())
+    .finally(() => clearTimeout(timer));
+}
+
+function showToast(msg, kind) {
+  const box = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = `toast ${kind || ''}`;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 2800);
+}
+
+function parseResetAt(value) {
+  if (value == null || value === '') return null;
+  // RFC3339 / ISO string (preferred after API fix)
+  if (typeof value === 'string') {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  // Legacy `time` crate serde tuple:
+  // [year, ordinal_day, hour, minute, second, nanosecond, off_h, off_m, off_s]
+  if (Array.isArray(value) && value.length >= 3) {
+    const year = Number(value[0]);
+    const ordinal = Number(value[1]);
+    const hour = Number(value[2] || 0);
+    const minute = Number(value[3] || 0);
+    const second = Number(value[4] || 0);
+    if (!Number.isFinite(year) || !Number.isFinite(ordinal)) return null;
+    const d = new Date(Date.UTC(year, 0, 1, hour, minute, second));
+    d.setUTCDate(ordinal);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (typeof value === 'number') {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+function formatCountdown(resetAt, now) {
+  const ms = resetAt - now;
+  if (ms <= 0) return t('now');
+  const totalMin = Math.floor(ms / 60000);
+  const days = Math.floor(totalMin / (60 * 24));
+  const hours = Math.floor((totalMin % (60 * 24)) / 60);
+  const mins = Math.max(1, totalMin % 60);
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return mins > 0 && hours < 8 ? `${hours}h ${mins}m` : `${hours}h`;
+  return `${mins}m`;
+}
+
+/** Local reset datetime: DD/MM/YYYY HH:mm */
+function formatResetDateTime(resetAt) {
+  if (!resetAt) return '';
+  const d = resetAt instanceof Date ? resetAt : parseResetAt(resetAt);
+  if (!d) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function fillClass(remaining) {
+  if (remaining <= 10) return 'danger';
+  if (remaining <= 30) return 'warn';
+  return '';
+}
+
+function computePace(usedPercent, resetAt, windowSecs, now) {
+  if (!resetAt || resetAt <= now) return null;
+  const timeUntil = (resetAt - now) / 1000;
+  if (timeUntil > windowSecs) return null;
+  const elapsed = Math.max(0, Math.min(windowSecs, windowSecs - timeUntil));
+  if (elapsed < windowSecs * 0.03) return null;
+  const actual = Math.max(0, Math.min(100, Number(usedPercent) || 0));
+  const expected = (elapsed / windowSecs) * 100;
+  const delta = actual - expected;
+  const deltaRounded = Math.round(Math.abs(delta));
+  let stage = 'on';
+  if (delta > 2) stage = 'deficit';
+  else if (delta < -2) stage = 'reserve';
+  let label = t('onPace');
+  if (stage === 'deficit') label = t('inDeficit', { n: deltaRounded });
+  if (stage === 'reserve') label = t('inReserve', { n: deltaRounded });
+  let eta = null;
+  let willLast = false;
+  if (actual >= 100) eta = t('runsOutNow');
+  else if (elapsed > 0 && actual > 0) {
+    const rate = actual / elapsed;
+    const candidate = (100 - actual) / rate;
+    if (candidate >= timeUntil) willLast = true;
+    else eta = t('runsOutIn', { time: formatCountdown(new Date(now.getTime() + candidate * 1000), now) });
+  } else if (elapsed > 0 && actual === 0) willLast = true;
+  if (willLast) eta = t('lastsUntilReset');
+  return { label, eta, stage };
+}
+
+function renderMeter(label, window, now) {
+  if (!window) return '';
+  const resetAt = parseResetAt(window.reset_at);
+  const remaining = Number(window.remaining_percent ?? 0);
+  const active = resetAt && resetAt > now;
+  const resetDt = resetAt ? formatResetDateTime(resetAt) : '';
+  let valueText = `${remaining}%`;
+  let width = remaining;
+  if (!active) {
+    valueText = t('pastReset');
+    if (resetDt) valueText += `<span class="reset-at">${escapeHtml(resetDt)}</span>`;
+    width = 0;
+  } else if (remaining === 0) {
+    valueText = `<span class="reset">${escapeHtml(formatCountdown(resetAt, now))}</span>`;
+    if (resetDt) valueText += `<span class="reset-at">${escapeHtml(resetDt)}</span>`;
+    width = 0;
+  } else if (resetAt) {
+    valueText = `${remaining}% <span class="reset">${escapeHtml(formatCountdown(resetAt, now))}</span>`;
+    if (resetDt) valueText += `<span class="reset-at">${escapeHtml(resetDt)}</span>`;
+  }
+  const resetAttr = window.reset_at ? ` data-reset-at="${escapeHtml(window.reset_at)}"` : '';
+  return `<div class="meter-row"${resetAttr} data-remaining="${remaining}">
+    <div class="meter-label">${escapeHtml(label)}</div>
+    <div class="meter-track"><div class="meter-fill ${fillClass(remaining)}" style="width:${Math.max(0, Math.min(100, width))}%"></div></div>
+    <div class="meter-meta">${valueText}</div>
+  </div>`;
+}
+
+function statusTag(account, weeklyOnly) {
+  if (account.usage_error && /login required/i.test(account.usage_error)) return t('login');
+  const usage = account.usage;
+  if (!usage) return '';
+  const now = new Date();
+  const windows = weeklyOnly
+    ? [usage.weekly].filter(Boolean)
+    : [usage.five_hour, usage.weekly].filter(Boolean);
+  const depleted = windows.some((w) => {
+    const resetAt = parseResetAt(w.reset_at);
+    return resetAt && resetAt > now && Number(w.remaining_percent) === 0;
+  });
+  if (depleted) return t('depleted');
+  const near = windows.some((w) => {
+    const resetAt = parseResetAt(w.reset_at);
+    return resetAt && resetAt > now && Number(w.remaining_percent) > 0 && Number(w.remaining_percent) <= 10;
+  });
+  if (near) return t('low');
+  return t('ready');
+}
+
+function renderUsage(account, weeklyOnly) {
+  if (account.usage_error && /login required/i.test(account.usage_error || '')) {
+    return `<div class="note">${escapeHtml(t('loginRequiredUsage'))}</div>`;
+  }
+  const usage = account.usage;
+  if (!usage) return `<div class="note">${escapeHtml(t('noCachedUsage'))}</div>`;
+  const now = new Date();
+  const five = usage.five_hour;
+  const weekly = usage.weekly;
+  // Show every window present:
+  // Codex: weekly (and 5h when API still returns it)
+  // Cursor: 5h=Auto pool, week=monthly total
+  // Claude: 5h + 7-day
+  const meters = [
+    five ? renderMeter(t('session'), five, now) : '',
+    weekly ? renderMeter(t('week'), weekly, now) : '',
+  ].join('');
+  if (!meters) {
+    return `<div class="note">${escapeHtml(t('noCachedUsage'))}</div>`;
+  }
+  let paceHtml = '';
+  if (weekly && parseResetAt(weekly.reset_at) > now) {
+    const pace = computePace(weekly.used_percent, parseResetAt(weekly.reset_at), WEEKLY_SECS, now);
+    if (pace) {
+      const cls = pace.stage === 'deficit' ? 'deficit' : (pace.stage === 'reserve' ? 'reserve' : '');
+      paceHtml = `<div class="pace-line"><span class="${cls}">${escapeHtml(pace.label)}</span>${pace.eta ? ` · ${escapeHtml(pace.eta)}` : ''}</div>`;
+    }
+  }
+  return `<div class="meters">${meters}</div>${paceHtml}`;
+}
+
+function findActive(accounts, activeId, liveEmail) {
+  if (activeId) {
+    const hit = accounts.find((a) => a.id === activeId);
+    if (hit) return hit;
+  }
+  if (liveEmail) {
+    return accounts.find((a) => a.email === liveEmail) || null;
+  }
+  return null;
+}
+
+function liveIdentity(appKey) {
+  if (!currentStatus) return { activeId: null, accounts: [], active: null, live: null };
+  const activeId = appKey === 'codex' ? currentStatus.active_codex_id
+    : appKey === 'cursor' ? currentStatus.active_cursor_id
+    : currentStatus.active_claude_id;
+  const live = appKey === 'codex' ? currentStatus.live_codex
+    : appKey === 'cursor' ? currentStatus.live_cursor
+    : currentStatus.live_claude;
+  const accounts = (currentStatus.accounts || []).filter((a) => {
+    const app = a.target_app || 'codex';
+    return app === appKey;
+  });
+  const active = findActive(accounts, activeId, live?.email || null);
+  return { activeId, accounts, active, live };
+}
+
+function renderProvider(cfg) {
+  const { key, title, code, weeklyOnly, emptyKey, saveApp } = cfg;
+  const { activeId, accounts, active, live } = liveIdentity(key);
+  const isOpen = openProvider === key;
+
+  let summary = t('notLoggedIn');
+  if (active) summary = displayEmail(active.email);
+  else if (live) summary = displayEmail(live.email);
+
+  let liveHtml = '';
+  if (active) {
+    const tag = statusTag(active, weeklyOnly);
+    const chips = [
+      `<span class="chip chip-active">${escapeHtml(t('active'))}</span>`,
+      tag ? `<span class="chip chip-${tag === t('low') ? 'low' : (tag === t('depleted') || tag === t('login') ? 'login' : 'ready')}">${escapeHtml(tag)}</span>` : '',
+    ].join('');
+    liveHtml = `<div class="live">
+      <div class="live-row">
+        <div class="live-email" title="${escapeHtml(active.email)}">${escapeHtml(displayEmail(active.email))}</div>
+        <div class="live-plan">${escapeHtml(active.plan_label || '')}</div>
+      </div>
+      <div>${chips}</div>
+      ${renderUsage(active, weeklyOnly)}
+    </div>`;
+  } else if (live) {
+    const chips = [
+      `<span class="chip chip-active">${escapeHtml(t('liveDetected'))}</span>`,
+      `<span class="chip chip-unsaved">${escapeHtml(t('unsaved'))}</span>`,
+    ].join('');
+    liveHtml = `<div class="live">
+      <div class="live-row">
+        <div class="live-email" title="${escapeHtml(live.email)}">${escapeHtml(displayEmail(live.email))}</div>
+        <div class="live-plan">${escapeHtml(live.plan_label || '')}</div>
+      </div>
+      <div>${chips}</div>
+      <div class="note">${escapeHtml(t('noCachedUsage'))}</div>
+    </div>
+    <button class="btn btn-accent save-btn" onclick="event.stopPropagation();saveActive('${saveApp}')">${escapeHtml(t('saveLive'))}</button>`;
+  } else {
+    liveHtml = `<div class="live"><div class="note">${escapeHtml(t('notLoggedIn'))}</div></div>
+      <button class="save-btn" onclick="event.stopPropagation();saveActive('${saveApp}')">${escapeHtml(t('saveActive'))}</button>`;
+  }
+
+  let listHtml = '';
+  const others = accounts.filter((a) => !a.is_archived);
+  if (others.length === 0) {
+    menuVirtual.delete(key);
+    listHtml = `<div class="empty">${escapeHtml(t(emptyKey))}</div>`;
+  } else {
+    const ordered = others.slice().sort((a, b) => {
+      if (a.id === activeId) return -1;
+      if (b.id === activeId) return 1;
+      return 0;
+    });
+    if (!isOpen || ordered.length <= VIRTUAL_THRESHOLD) {
+      menuVirtual.delete(key);
+      listHtml = `<div class="accounts">${ordered.map((account) => renderMenuAccountRow(account, activeId, weeklyOnly)).join('')}</div>`;
+    } else {
+      // Large open provider — virtualize rows so DOM stays light.
+      menuVirtual.set(key, { items: ordered, activeId, weeklyOnly });
+      listHtml = `<div class="virt-hint">${ordered.length} accounts</div>
+        <div class="accounts virtual" data-virt-key="${escapeHtml(key)}">
+          <div class="virt-spacer virt-spacer-top" style="height:0"></div>
+          <div class="virt-window"></div>
+          <div class="virt-spacer virt-spacer-bottom" style="height:0"></div>
+        </div>`;
+    }
+  }
+
+  let pendingHtml = '';
+  // Pending steps also render in the sticky top banner; keep a compact note here.
+  if (key === 'codex' && currentStatus?.codex_add_account_pending) {
+    pendingHtml = `<div class="note" style="color:#f0c56e">${escapeHtml(t('addStarted'))}</div>`;
+  }
+
+  const actionsHtml = currentStatus?.codex_add_account_pending && key === 'codex'
+    ? ''
+    : `<div class="provider-actions">
+    <button class="btn" onclick="event.stopPropagation();addAccount('${saveApp}')">${escapeHtml(t('addAccount'))}</button>
+  </div>`;
+
+  return `<section class="provider ${isOpen ? 'open' : ''}" data-provider="${escapeHtml(key)}">
+    <button type="button" class="provider-head" onclick="setOpenProvider('${key}')" aria-expanded="${isOpen ? 'true' : 'false'}">
+      <div class="provider-head-main">
+        <span class="provider-chevron" aria-hidden="true"></span>
+        <div class="provider-title"><span class="dot dot-${key === 'codex' ? 'codex' : key}"></span>${escapeHtml(title)}</div>
+        ${isOpen ? '' : `<span class="provider-summary" title="${escapeHtml(summary)}">${escapeHtml(summary)}</span>`}
+      </div>
+      <span class="provider-code">${escapeHtml(code)}</span>
+    </button>
+    <div class="provider-body">
+      ${pendingHtml}
+      ${liveHtml}
+      ${actionsHtml}
+      ${listHtml}
+    </div>
+  </section>`;
+}
+
+function statusFingerprint(data) {
+  return structureFingerprint(data);
+}
+
+function renderAddPendingBanner() {
+  const box = document.getElementById('add-pending-banner');
+  if (!box) return;
+  if (!currentStatus?.codex_add_account_pending) {
+    box.innerHTML = '';
+    return;
+  }
+  box.innerHTML = `<div class="add-pending">
+    <div class="add-pending-title">${escapeHtml(t('addPendingTitle'))}</div>
+    <ol class="add-pending-steps">
+      <li>${escapeHtml(t('addPendingStep1'))}</li>
+      <li>${escapeHtml(t('addPendingStep2'))}</li>
+      <li>${escapeHtml(t('addPendingStep3'))}</li>
+    </ol>
+    <div class="provider-actions">
+      <button class="btn btn-accent" onclick="finishAddAccount()">${escapeHtml(t('finishAdd'))}</button>
+      <button class="btn" onclick="cancelAddAccount()">${escapeHtml(t('cancelAdd'))}</button>
+    </div>
+  </div>`;
+}
+
+function renderMenuAccountRow(account, activeId, weeklyOnly) {
+  const isActive = account.id === activeId;
+  const tag = statusTag(account, weeklyOnly);
+  const meta = [account.plan_label, tag].filter(Boolean).join(' · ');
+  // Every account shows remaining quota + reset datetime under the row.
+  const quotaHtml = `<div class="account-quota">${renderUsage(account, weeklyOnly)}</div>`;
+  return `<div class="account ${isActive ? 'active' : ''}">
+    <div class="account-main">
+      <div class="account-email">${escapeHtml(displayEmail(account.email))}</div>
+      ${meta ? `<div class="account-meta">${escapeHtml(meta)}</div>` : ''}
+      ${quotaHtml}
+    </div>
+    ${isActive ? '' : `<button class="switch-btn" onclick="activate('${account.id}')">${escapeHtml(t('switch'))}</button>`}
+  </div>`;
+}
+
+function paintMenuVirtual(key) {
+  const state = menuVirtual.get(key);
+  const scroller = document.querySelector(`.accounts.virtual[data-virt-key="${key}"]`);
+  if (!state || !scroller) return;
+  const { items, activeId, weeklyOnly } = state;
+  const scrollTop = scroller.scrollTop;
+  const viewH = scroller.clientHeight || 220;
+  const start = Math.max(0, Math.floor(scrollTop / VIRT_ROW_H) - VIRT_OVERSCAN);
+  const visible = Math.ceil(viewH / VIRT_ROW_H) + VIRT_OVERSCAN * 2;
+  const end = Math.min(items.length, start + visible);
+  const topH = start * VIRT_ROW_H;
+  const bottomH = Math.max(0, (items.length - end) * VIRT_ROW_H);
+  const top = scroller.querySelector('.virt-spacer-top');
+  const bottom = scroller.querySelector('.virt-spacer-bottom');
+  const win = scroller.querySelector('.virt-window');
+  if (top) top.style.height = `${topH}px`;
+  if (bottom) bottom.style.height = `${bottomH}px`;
+  if (win) {
+    win.innerHTML = items.slice(start, end).map((a) => renderMenuAccountRow(a, activeId, weeklyOnly)).join('');
+  }
+}
+
+function bindMenuVirtualScrollers() {
+  document.querySelectorAll('.accounts.virtual[data-virt-key]').forEach((el) => {
+    if (el.dataset.virtBound === '1') return;
+    el.dataset.virtBound = '1';
+    const key = el.getAttribute('data-virt-key');
+    let raf = 0;
+    el.addEventListener('scroll', () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        paintMenuVirtual(key);
+      });
+    }, { passive: true });
+    paintMenuVirtual(key);
+  });
+}
+
+function render(force) {
+  if (!currentStatus) return;
+  ensureOpenProvider();
+  const key = structureFingerprint(currentStatus);
+  if (!force && key === lastStatusKey) {
+    patchMetersInPlace();
+    return;
+  }
+  lastStatusKey = key;
+  renderAddPendingBanner();
+  const root = document.getElementById('providers');
+  const html = [
+    renderProvider({
+      key: 'codex',
+      title: 'ChatGPT Codex',
+      code: 'CX',
+      weeklyOnly: true,
+      emptyKey: 'emptyCodex',
+      saveApp: 'codex',
+    }),
+    renderProvider({
+      key: 'cursor',
+      title: 'Cursor',
+      code: 'CR',
+      weeklyOnly: false,
+      emptyKey: 'emptyCursor',
+      saveApp: 'cursor',
+    }),
+    renderProvider({
+      key: 'claude',
+      title: 'Claude',
+      code: 'CL',
+      weeklyOnly: false,
+      emptyKey: 'emptyClaude',
+      saveApp: 'claude',
+    }),
+  ].join('');
+  root.innerHTML = html;
+  root.setAttribute('aria-busy', 'false');
+  bindMenuVirtualScrollers();
+}
+
+function patchMetersInPlace() {
+  if (!currentStatus) return;
+  const now = new Date();
+  document.querySelectorAll('.meter-row').forEach((row) => {
+    const meta = row.querySelector('.meter-meta');
+    const fill = row.querySelector('.meter-fill');
+    if (!meta || !fill) return;
+    const resetIso = row.getAttribute('data-reset-at');
+    if (!resetIso) return;
+    const resetAt = parseResetAt(resetIso);
+    if (!resetAt) return;
+    const remaining = Number(row.getAttribute('data-remaining') || '0');
+    const resetDt = formatResetDateTime(resetAt);
+    const resetLine = resetDt ? `<span class="reset-at">${escapeHtml(resetDt)}</span>` : '';
+    if (remaining === 0 && resetAt > now) {
+      meta.innerHTML = `<span class="reset">${escapeHtml(formatCountdown(resetAt, now))}</span>${resetLine}`;
+    } else if (resetAt > now) {
+      meta.innerHTML = `${remaining}% <span class="reset">${escapeHtml(formatCountdown(resetAt, now))}</span>${resetLine}`;
+    } else {
+      meta.innerHTML = `${escapeHtml(t('pastReset'))}${resetLine}`;
+      fill.style.width = '0%';
+    }
+  });
+}
+
+function fetchState(opts) {
+  const force = !!(opts && opts.force);
+  const quiet = !!(opts && opts.quiet);
+  if (fetchInFlight && !force) return;
+  if (document.hidden && !force) return;
+  if (fetchAbort) {
+    try { fetchAbort.abort(); } catch (_) {}
+  }
+  const ctrl = new AbortController();
+  fetchAbort = ctrl;
+  fetchInFlight = true;
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  // Never request process scans from the popover — Overview owns that path.
+  fetch(STATUS_URL, { signal: ctrl.signal })
+    .then((r) => r.json())
+    .then((data) => {
+      currentStatus = data;
+      const resolved = data?.settings?.ui_language_resolved;
+      if (resolved === 'en' || resolved === 'vi') {
+        if (lang !== resolved) {
+          lang = resolved;
+          applyStaticI18n();
+        }
+      }
+      render(!!force);
+    })
+    .catch((err) => {
+      if (err && err.name === 'AbortError') {
+        if (!quiet && force) showToast(t('addTimedOut'), 'error');
+        return;
+      }
+      if (!quiet) showToast(t('connectFailed'), 'error');
+    })
+    .finally(() => {
+      clearTimeout(timer);
+      if (fetchAbort === ctrl) fetchAbort = null;
+      fetchInFlight = false;
+    });
+}
+
+function tickCountdowns() {
+  if (document.hidden || !currentStatus) return;
+  // Cheap in-place countdown refresh — avoid wiping the whole DOM every tick.
+  patchMetersInPlace();
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  if (tickTimer) clearInterval(tickTimer);
+  pollTimer = setInterval(() => fetchState({ quiet: true }), POLL_MS);
+  tickTimer = setInterval(tickCountdowns, TICK_MS);
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  if (tickTimer) {
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+}
+
+window.__popoverShown = function popoverShown() {
+  // Called from Rust when a cached popover is re-shown (no document reload).
+  fetchState({ force: true, quiet: true });
+  startPolling();
+};
+
+window.__popoverHidden = function popoverHidden() {
+  // Called from Rust when the popover is hidden but the webview is reused.
+  stopPolling();
+};
+
+/** On-demand process scan + optional kill before switch. Returns false if user cancels. */
+function ensureClearBlockersThenSwitch() {
+  return fetch('/api/status?processes=1')
+    .then((res) => res.json())
+    .then((data) => {
+      const warnings = data.process_warnings || [];
+      if (!warnings.length) return true;
+      const list = warnings
+        .slice(0, 8)
+        .map((w) => `• PID ${w.pid}: ${w.executable || '?'}`)
+        .join('\n');
+      const more = warnings.length > 8 ? `\n… +${warnings.length - 8}` : '';
+      if (!confirm(t('confirmKillThenSwitch', { n: warnings.length, list: list + more }))) {
+        return false;
+      }
+      showToast(t('terminating'), 'warning');
+      return postApi('/api/kill', {}).then((killRes) => {
+        if (!killRes.success) {
+          showToast(t('terminateFailed', { error: killRes.error || '' }), 'error');
+          return false;
+        }
+        return true;
+      });
+    })
+    .catch(() => true);
+}
+
+function activate(id) {
+  ensureClearBlockersThenSwitch()
+    .then((ok) => {
+      if (!ok) return;
+      showToast(t('switching'), 'warning');
+      return postApi('/api/activate', { id }).then((data) => {
+        if (data.success) {
+          showToast(t('switchedOk'), 'success');
+          fetchState({ force: true });
+        } else showToast(t('switchFailed', { error: data.error || '' }), 'error');
+      });
+    })
+    .catch(() => showToast(t('connectFailed'), 'error'));
+}
+
+function saveActive(app) {
+  showToast(t('saving'), 'warning');
+  postApi('/api/save', { app })
+    .then((data) => {
+      if (data.success) {
+        showToast(t('savedOk'), 'success');
+        fetchState({ force: true });
+      } else showToast(t('saveFailed', { error: data.error || '' }), 'error');
+    })
+    .catch(() => showToast(t('connectFailed'), 'error'));
+}
+
+function triggerBestQuota() {
+  ensureClearBlockersThenSwitch()
+    .then((ok) => {
+      if (!ok) return;
+      showToast(t('findingBest'), 'warning');
+      return postApi('/api/activate', { id: 'best' }).then((data) => {
+        if (data.success) {
+          showToast(t('switchedBest'), 'success');
+          fetchState({ force: true });
+        } else showToast(t('noBetter', { error: data.error || '' }), 'warning');
+      });
+    })
+    .catch(() => showToast(t('connectFailed'), 'error'));
+}
+
+function refreshAll() {
+  fetchState({ force: true });
+}
+
+function openOverview() {
+  try {
+    window.ipc.postMessage('open-overview');
+  } catch (_) {
+    window.location.href = '/';
+  }
+}
+
+function quitApp() {
+  try {
+    window.ipc.postMessage('quit');
+  } catch (_) {
+    showToast(t('quit'), 'warning');
+  }
+}
+
+function openImportCookies() {
+  const overlay = document.getElementById('import-overlay');
+  const err = document.getElementById('import-error');
+  const file = document.getElementById('import-file');
+  const name = document.getElementById('import-file-name');
+  const panel = document.getElementById('import-paste-panel');
+  const toggle = document.getElementById('import-paste-toggle');
+  if (err) { err.textContent = ''; err.classList.remove('show'); }
+  if (file) file.value = '';
+  if (name) name.textContent = t('importNoFile');
+  if (panel) panel.classList.remove('open');
+  if (toggle) toggle.textContent = t('importPasteToggle');
+  if (overlay) overlay.classList.add('open');
+}
+
+function closeImportCookies() {
+  const overlay = document.getElementById('import-overlay');
+  if (overlay) overlay.classList.remove('open');
+}
+
+function toggleImportPaste() {
+  const panel = document.getElementById('import-paste-panel');
+  const toggle = document.getElementById('import-paste-toggle');
+  if (!panel) return;
+  const open = panel.classList.toggle('open');
+  if (toggle) toggle.textContent = open ? t('importPasteHide') : t('importPasteToggle');
+}
+
+function readImportJsonText() {
+  return new Promise((resolve, reject) => {
+    const fileInput = document.getElementById('import-file');
+    const file = fileInput?.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('failed to read file'));
+      reader.readAsText(file);
+      return;
+    }
+    resolve(document.getElementById('import-json')?.value || '');
+  });
+}
+
+function submitImportCookies() {
+  const err = document.getElementById('import-error');
+  readImportJsonText()
+    .then((json) => {
+      if (!String(json || '').trim()) {
+        if (err) { err.textContent = t('importFailed', { error: 'empty JSON' }); err.classList.add('show'); }
+        return;
+      }
+      showToast(t('importing'), 'warning');
+      const provider = document.getElementById('import-provider')?.value || 'auto';
+      return postApi('/api/import-cookies', { provider, json }).then((data) => {
+        if (data.success) {
+          showToast(t('importedOk', { email: data.email || '' }), 'success');
+          if (Array.isArray(data.warnings)) {
+            data.warnings.forEach((w) => showToast(w, 'warning'));
+          }
+          closeImportCookies();
+          const ta = document.getElementById('import-json');
+          if (ta) ta.value = '';
+          const file = document.getElementById('import-file');
+          if (file) file.value = '';
+          const name = document.getElementById('import-file-name');
+          if (name) name.textContent = t('importNoFile');
+          fetchState({ force: true });
+        } else {
+          const msg = t('importFailed', { error: data.error || '' });
+          if (err) { err.textContent = msg; err.classList.add('show'); }
+          showToast(msg, 'error');
+        }
+      });
+    })
+    .catch((e) => {
+      const msg = t('importFailed', { error: e?.message || String(e) });
+      if (err) { err.textContent = msg; err.classList.add('show'); }
+      showToast(msg, 'error');
+    });
+}
+
+function addAccount(app) {
+  const provider = (app || 'codex').toLowerCase();
+  if (provider === 'cursor') {
+    showToast(t('addCursorHint'), 'warning');
+    setOpenProvider('cursor');
+    return;
+  }
+  if (provider === 'claude') {
+    showToast(t('addClaudeHint'), 'warning');
+    setOpenProvider('claude');
+    return;
+  }
+  showToast(t('addingAccount'), 'warning');
+  postApi('/api/add-account', { action: 'begin', app: 'codex' }, 12000)
+    .then((data) => {
+      if (data.success) {
+        // Optimistic pending UI — never wait on a blank spinner for status.
+        if (!currentStatus) currentStatus = {};
+        currentStatus.codex_add_account_pending = true;
+        setOpenProvider('codex');
+        render(true);
+        showToast(t('addStarted'), 'success');
+        fetchState({ force: true, quiet: true });
+      } else showToast(t('failed', { error: data.error || '' }), 'error');
+    })
+    .catch((err) => {
+      if (err && err.name === 'AbortError') showToast(t('addTimedOut'), 'error');
+      else showToast(t('connectFailed'), 'error');
+    });
+}
+
+function finishAddAccount() {
+  showToast(t('saving'), 'warning');
+  postApi('/api/add-account', { action: 'finish', app: 'codex' }, 15000)
+    .then((data) => {
+      if (data.success) {
+        if (currentStatus) currentStatus.codex_add_account_pending = false;
+        render(true);
+        showToast(t('addFinished', { email: data.email || '' }), 'success');
+        if (data.warning) showToast(data.warning, 'warning');
+        fetchState({ force: true, quiet: true });
+      } else showToast(t('failed', { error: data.error || '' }), 'error');
+    })
+    .catch((err) => {
+      if (err && err.name === 'AbortError') showToast(t('addTimedOut'), 'error');
+      else showToast(t('connectFailed'), 'error');
+    });
+}
+
+function cancelAddAccount() {
+  postApi('/api/add-account', { action: 'cancel', app: 'codex' }, 15000)
+    .then((data) => {
+      if (data.success) {
+        if (currentStatus) currentStatus.codex_add_account_pending = false;
+        render(true);
+        showToast(t('addCancelled'), 'success');
+        fetchState({ force: true, quiet: true });
+      } else showToast(t('failed', { error: data.error || '' }), 'error');
+    })
+    .catch((err) => {
+      if (err && err.name === 'AbortError') showToast(t('addTimedOut'), 'error');
+      else showToast(t('connectFailed'), 'error');
+    });
+}
+
+document.getElementById('import-file')?.addEventListener('change', (event) => {
+  const file = event.target?.files?.[0];
+  const name = document.getElementById('import-file-name');
+  if (name) name.textContent = file ? file.name : t('importNoFile');
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+  applyStaticI18n();
+  bindScrollport();
+  openProvider = readStoredOpenProvider();
+  fetchState({ force: true });
+  startPolling();
+});
+
+function bindScrollport() {
+  const el = document.getElementById('scrollport');
+  if (!el || el.dataset.wheelBound === '1') return;
+  el.dataset.wheelBound = '1';
+  // WKWebView on macOS sometimes fails to scroll overflow divs via trackpad;
+  // apply delta manually so the fixed scrollport always moves.
+  el.addEventListener('wheel', (e) => {
+    const before = el.scrollTop;
+    el.scrollTop += e.deltaY;
+    if (el.scrollTop !== before) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, { passive: false });
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopPolling();
+  } else {
+    fetchState({ force: true, quiet: true });
+    startPolling();
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const overlay = document.getElementById('import-overlay');
+  if (overlay && overlay.classList.contains('open')) {
+    e.preventDefault();
+    closeImportCookies();
+  }
+});
+</script>
+</body>
+</html>

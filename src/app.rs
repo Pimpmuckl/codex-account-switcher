@@ -1,6 +1,5 @@
 mod auto_start;
 mod service;
-mod tui;
 
 use uuid::Uuid;
 
@@ -20,20 +19,6 @@ use crate::usage::usage_error_requires_login;
 pub struct App<S> {
     env: AppEnv,
     repository: SnapshotRepository<S>,
-}
-
-#[derive(Clone, Copy)]
-pub enum InteractiveMode {
-    Persistent,
-    ActivateOnce,
-    DeleteOnce,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InteractiveExit {
-    Quit,
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    SendToTray,
 }
 
 fn account_view(
@@ -84,22 +69,70 @@ fn match_saved_account_with_app<'a>(
     identity: &DisplayIdentity,
     target_app: Option<&str>,
 ) -> Option<&'a SavedAccountMetadata> {
-    accounts.iter().find(|account| {
-        account.target_app.as_deref().unwrap_or("codex") == target_app.unwrap_or("codex")
+    let app = target_app.unwrap_or("codex");
+    if let Some(found) = accounts.iter().find(|account| {
+        account.target_app.as_deref().unwrap_or("codex") == app
             && saved_identity(account).matches(identity)
-    })
+    }) {
+        return Some(found);
+    }
+
+    // Claude Code often exposes tokens without email (keychain / credentials).
+    // Status uses a lightweight identity path that never blocks on CLI, so live
+    // email can be the placeholder even when a saved Claude snapshot exists.
+    // Bind to the sole / best-guess Claude account so tray quota still resolves.
+    if app == "claude"
+        && identity
+            .email
+            .eq_ignore_ascii_case(crate::claude::CLAUDE_UNKNOWN_EMAIL)
+    {
+        return fallback_unresolved_claude_account(accounts, identity);
+    }
+    None
 }
 
-fn account_view_matches_identity(account: &AccountView, identity: &DisplayIdentity) -> bool {
-    DisplayIdentity {
-        email: account.email.clone(),
-        subject: account.subject.clone(),
-        name: account.name.clone(),
-        plan_label: account.plan_label.clone(),
-        workspace_id: account.workspace_id.clone(),
-        workspace_name: account.workspace_name.clone(),
+/// When live Claude identity has no email, pick the best saved Claude snapshot.
+fn fallback_unresolved_claude_account<'a>(
+    accounts: &'a [SavedAccountMetadata],
+    identity: &DisplayIdentity,
+) -> Option<&'a SavedAccountMetadata> {
+    let mut candidates: Vec<&'a SavedAccountMetadata> = accounts
+        .iter()
+        .filter(|account| {
+            account.target_app.as_deref() == Some("claude") && !account.is_archived
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
     }
-    .matches(identity)
+    // Prefer same subscription plan when multiple Claude accounts exist.
+    if let Some(plan) = identity.plan_label.as_deref() {
+        let plan_matches: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|account| {
+                account
+                    .plan_label
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(plan))
+            })
+            .collect();
+        if !plan_matches.is_empty() {
+            candidates = plan_matches;
+        }
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0]);
+    }
+    candidates.into_iter().max_by_key(|account| {
+        (
+            account
+                .last_activated_at
+                .map(|t| t.unix_timestamp_nanos())
+                .unwrap_or(0),
+            account.updated_at.unix_timestamp_nanos(),
+        )
+    })
 }
 
 fn saved_identity(account: &SavedAccountMetadata) -> DisplayIdentity {

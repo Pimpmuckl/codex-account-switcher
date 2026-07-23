@@ -20,7 +20,9 @@ It does not modify other Codex config, history, sessions, or sqlite state.
 
 ## Commands
 
-Run without arguments for interactive mode. On Windows and macOS, a TTY launches the persistent TUI; a non-TTY session launches the native system tray instead.
+Run without arguments to launch the native menubar (macOS/Windows). On Linux/WSL, use clap subcommands instead — there is no terminal UI.
+
+Left-click the menu bar icon for CodexBar-style meter cards (ChatGPT Codex weekly-only, plus Cursor and Claude). Right-click for the classic menu. Overview is available from the popover or menu.
 
 ```text
 codex-account-switcher
@@ -28,8 +30,8 @@ codex-account-switcher status [--json]
 codex-account-switcher list [--json]
 codex-account-switcher save [--json]
 codex-account-switcher usage [ACCOUNT_ID] [--json]
-codex-account-switcher activate [ACCOUNT_ID] [--force] [--json]
-codex-account-switcher delete [ACCOUNT_ID] [--json]
+codex-account-switcher activate ACCOUNT_ID [--force] [--json]
+codex-account-switcher delete ACCOUNT_ID [--json]
 codex-account-switcher auto-start-usage-windows [--enable|--disable] [--run] [--json]
 codex-account-switcher auto-switch-on-limit [--enable|--disable] [--run] [--json]
 codex-account-switcher exec ACCOUNT COMMAND [ARGS...]
@@ -45,8 +47,8 @@ codex-account-switcher exec ACCOUNT COMMAND [ARGS...]
 - `usage` fetches current usage for the live account or for a saved account by id.
 - `activate` restores a saved snapshot. Reliable swaps require all Codex processes to be closed first; `--force` lets the command attempt activation anyway, but it still fails if the restored files do not stay stable.
 - `delete` removes the saved snapshot from the switcher store only.
-- `auto-start-usage-windows` is opt-in from the CLI, TUI, or tray checkmark. When enabled, the interactive app refreshes saved weekly windows every 5 minutes and starts due windows with a minimal `codex exec` ping when Codex is on `PATH`.
-- `auto-switch-on-limit` is opt-in from the CLI, TUI, or tray. When enabled, the app monitors the active account's quota and automatically switches to another saved account with remaining quota when the current account is exhausted. On macOS and Windows it can quit and relaunch Codex after switching.
+- `auto-start-usage-windows` is opt-in from the CLI or menubar. When enabled, the menubar app refreshes saved weekly windows every 5 minutes and starts due windows with a minimal `codex exec` ping when Codex is on `PATH`.
+- `auto-switch-on-limit` is opt-in from the CLI or menubar. When enabled, the app monitors the active account's quota and automatically switches to another saved account with remaining quota when the current account is exhausted. On macOS and Windows it can quit and relaunch Codex after switching.
 - `exec` runs an arbitrary command under a temporary saved-account snapshot and restores the previous live auth afterward. Useful for scripting or isolated `codex exec` pings without permanently switching accounts.
 
 Saved snapshot data lives in the app-data directory for the current environment:
@@ -86,6 +88,15 @@ Package a macOS menu-bar agent app (no Dock icon, tray-first):
 ```text
 ./scripts/build_macos_app.sh
 ```
+
+Or rebuild and relaunch the menubar agent from source:
+
+```text
+cargo build --release
+./contrib/macos-launch/open-menubar.command
+```
+
+**macOS UX:** left-click the menu bar icon for CodexBar-style meter cards (ChatGPT Codex weekly-only, Cursor, Claude). Right-click for the classic menu. Overview opens from the popover or menu item.
 
 ## Install
 
@@ -146,3 +157,9 @@ cargo fmt --check
 ## Optional macOS Menu Bar Wrapper
 
 An alternate Python-based menubar UI lives in `contrib/macos-menubar/`. The Rust binary already includes a native tray on macOS; use the Python wrapper only if you prefer its UI or workflow. See `contrib/macos-menubar/README.md`.
+
+## Acknowledgments
+
+This repository is a fork of [Pimpmuckl/codex-account-switcher](https://github.com/Pimpmuckl/codex-account-switcher).
+
+Menu bar UX and usage/pace presentation are inspired by [CodexBar](https://github.com/steipete/CodexBar) by [steipete](https://github.com/steipete). This project does not redistribute CodexBar source; the credit is for reference and inspiration.

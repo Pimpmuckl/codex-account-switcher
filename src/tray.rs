@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -11,12 +12,13 @@ use time::OffsetDateTime;
 use tray_icon::menu::{
     CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
 };
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use uuid::Uuid;
 use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::WindowId;
+use winit::window::{WindowId, WindowLevel};
 
 use crate::app::App;
 use crate::codex;
@@ -27,7 +29,21 @@ use crate::model::{
 };
 use crate::repository::SnapshotRepository;
 use crate::secrets::{MigratingSecretStore, SecretStore};
+use crate::settings::{ResolvedUiLanguage, load_settings, resolve_ui_language};
 use crate::usage::usage_error_requires_login;
+
+fn tray_ui_lang<S: SecretStore>(app: &App<S>) -> ResolvedUiLanguage {
+    load_settings(&app.env().app_data_dir)
+        .map(|settings| resolve_ui_language(&settings.ui_language))
+        .unwrap_or(ResolvedUiLanguage::En)
+}
+
+fn tt(lang: ResolvedUiLanguage, en: &'static str, vi: &'static str) -> &'static str {
+    match lang {
+        ResolvedUiLanguage::En => en,
+        ResolvedUiLanguage::Vi => vi,
+    }
+}
 
 trait AppendableMenu {
     fn append_item(
@@ -57,19 +73,30 @@ impl AppendableMenu for Submenu {
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
+    TrayIcon(TrayIconEvent),
     AutoStartUsageWindowsChecked,
     BackgroundTaskDone {
         notification: Option<(String, String)>,
     },
     UpdateMenu,
+    PopoverAction(PopoverAction),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum PopoverAction {
+    OpenOverview,
+    Quit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum TrayCommand {
     Activate(Uuid),
     Login(Uuid),
     SaveCurrent,
     SaveCursorCurrent,
+    SaveClaudeCurrent,
+    OpenDashboard,
     StartAddAccount,
     FinishAddAccount,
     CancelAddAccount,
@@ -80,43 +107,66 @@ enum TrayCommand {
     SetAutoSwitchOnLimit(bool),
     SetLaunchAtStartup(bool),
     SetShowQuotaInMenuBar(bool),
-    ShowTui,
+    OpenLogsDir,
     Refresh,
     Quit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrayExit {
-    ShowTui,
     Quit,
 }
 
-struct TrayState<'a, S> {
-    app: &'a App<S>,
+struct TrayState<S> {
+    app: Arc<App<S>>,
     tray_icon: Option<TrayIcon>,
     commands: HashMap<String, TrayCommand>,
     event_proxy: EventLoopProxy<UserEvent>,
     exit: TrayExit,
+    dashboard_port: Option<u16>,
+    window: Option<winit::window::Window>,
+    webview: Option<wry::WebView>,
+    popover: Option<winit::window::Window>,
+    popover_webview: Option<wry::WebView>,
+    last_tray_rect: Option<(PhysicalPosition<f64>, PhysicalSize<u32>)>,
+    open_dashboard_on_start: bool,
+    /// Coalesce rapid UpdateMenu storms (auto-start + background tasks).
+    menu_update_pending: bool,
+    last_menu_rebuild_at: Option<std::time::Instant>,
 }
 
-pub(crate) fn run<S>(app: &App<S>) -> Result<TrayExit>
+pub(crate) fn run<S>(app: Arc<App<S>>, open_dashboard: bool) -> Result<TrayExit>
 where
-    S: SecretStore,
+    S: SecretStore + Send + Sync + 'static,
 {
     #[cfg(target_os = "macos")]
     detach_from_controlling_terminal();
 
-    let _instance_lock = match TrayInstanceLock::acquire(&tray_lock_path(app))? {
+    let _instance_lock = match TrayInstanceLock::acquire(&tray_lock_path(&app))? {
         Some(lock) => lock,
         None => {
             log_tray_message(
-                app,
+                &app,
                 &format!(
                     "tray already running (pid={}), exiting duplicate instance",
-                    read_tray_lock_pid(&tray_lock_path(app)).unwrap_or(0)
+                    read_tray_lock_pid(&tray_lock_path(&app)).unwrap_or(0)
                 ),
             );
             return Ok(TrayExit::Quit);
+        }
+    };
+
+    let bound_port = match crate::server::start_dashboard_server(app.clone()) {
+        Ok(port) => {
+            log_tray_message(
+                &app,
+                &format!("Dashboard server started on http://127.0.0.1:{}", port),
+            );
+            Some(port)
+        }
+        Err(e) => {
+            log_tray_message(&app, &format!("Failed to start dashboard server: {e:#}"));
+            None
         }
     };
 
@@ -139,18 +189,33 @@ where
     MenuEvent::set_event_handler(Some(move |event| {
         let _ = menu_proxy.send_event(UserEvent::Menu(event));
     }));
+    let tray_proxy = proxy.clone();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        let _ = tray_proxy.send_event(UserEvent::TrayIcon(event));
+    }));
     spawn_auto_start_usage_windows_menu_refresh(proxy.clone());
 
+    spawn_menu_bar_title_refresh(proxy.clone());
+
     let mut state = TrayState {
-        app,
+        app: app.clone(),
         tray_icon: None,
         commands: HashMap::new(),
         event_proxy: proxy,
         exit: TrayExit::Quit,
+        dashboard_port: bound_port,
+        window: None,
+        webview: None,
+        popover: None,
+        popover_webview: None,
+        last_tray_rect: None,
+        open_dashboard_on_start: open_dashboard,
+        menu_update_pending: false,
+        last_menu_rebuild_at: None,
     };
     let run_result = event_loop.run_app(&mut state);
     log_tray_message(
-        app,
+        &app,
         &format!(
             "tray event loop finished (exit={:?}, pid={})",
             state.exit,
@@ -177,9 +242,23 @@ fn spawn_auto_start_usage_windows_menu_refresh(proxy: EventLoopProxy<UserEvent>)
         });
 }
 
-impl<S> ApplicationHandler<UserEvent> for TrayState<'_, S>
+/// Keep menu-bar countdown / quota text fresh without waiting for a user action.
+fn spawn_menu_bar_title_refresh(proxy: EventLoopProxy<UserEvent>) {
+    let _ = thread::Builder::new()
+        .name("tray-menu-bar-title-refresh".to_owned())
+        .spawn(move || {
+            loop {
+                thread::sleep(std::time::Duration::from_secs(45));
+                if proxy.send_event(UserEvent::UpdateMenu).is_err() {
+                    break;
+                }
+            }
+        });
+}
+
+impl<S> ApplicationHandler<UserEvent> for TrayState<S>
 where
-    S: SecretStore,
+    S: SecretStore + Send + Sync + 'static,
 {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         // tray-icon must be created once the event loop is running (tauri-apps/tray-icon#90).
@@ -188,16 +267,59 @@ where
         }
     }
 
-    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.ensure_tray_icon();
+        if self.open_dashboard_on_start {
+            self.open_dashboard_on_start = false;
+            self.open_dashboard_window(event_loop);
+        }
     }
 
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        _event: WindowEvent,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
     ) {
+        let is_overview = self.window.as_ref().is_some_and(|w| w.id() == window_id);
+        let is_popover = self.popover.as_ref().is_some_and(|w| w.id() == window_id);
+
+        if is_overview {
+            match event {
+                WindowEvent::CloseRequested => {
+                    self.webview = None;
+                    self.window = None;
+                }
+                WindowEvent::Resized(size) => {
+                    if let Some(webview) = &self.webview {
+                        let _ = webview.set_bounds(wry_bounds_from_physical(size));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if is_popover {
+            match event {
+                WindowEvent::CloseRequested => {
+                    // Hide + reuse — destroying/recreating WKWebView on every click is the lag source.
+                    self.hide_popover();
+                }
+                // Click outside / app switch: auto-dismiss the menu panel.
+                WindowEvent::Focused(false) => {
+                    self.hide_popover();
+                }
+                WindowEvent::Destroyed => {
+                    self.popover_webview = None;
+                    self.popover = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let _ = event_loop;
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -211,19 +333,242 @@ where
                 {
                     tray_notify(title, body);
                 }
-                if let Err(error) = self.update_tray_menu() {
-                    eprintln!("failed to refresh tray menu: {error:#}");
-                }
+                self.request_menu_update();
             }
             UserEvent::Menu(event) => self.handle_menu_event(event_loop, event),
+            UserEvent::TrayIcon(event) => self.handle_tray_icon_event(event_loop, event),
+            UserEvent::PopoverAction(action) => match action {
+                PopoverAction::OpenOverview => {
+                    self.hide_popover();
+                    self.open_dashboard_window(event_loop);
+                }
+                PopoverAction::Quit => {
+                    self.hide_popover();
+                    self.exit = TrayExit::Quit;
+                    event_loop.exit();
+                }
+            },
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.menu_update_pending {
+            self.menu_update_pending = false;
+            if let Err(error) = self.update_tray_menu() {
+                eprintln!("failed to refresh tray menu: {error:#}");
+            }
         }
     }
 }
 
-impl<S> TrayState<'_, S>
+impl<S> TrayState<S>
 where
-    S: SecretStore,
+    S: SecretStore + Send + Sync + 'static,
 {
+    fn open_dashboard_window(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(port) = self.dashboard_port {
+            if self.window.is_none() {
+                // Native titled window — tray stays primary UX; overview is secondary.
+                // Keep a normal macOS title bar ("ChatGPT Codex") so this does not feel
+                // like a browser tab; localhost is never shown in UI chrome/copy.
+                let window_attrs = winit::window::Window::default_attributes()
+                    .with_title("ChatGPT Codex")
+                    .with_inner_size(LogicalSize::new(1120.0, 760.0))
+                    .with_resizable(true);
+                match event_loop.create_window(window_attrs) {
+                    Ok(window) => {
+                        let url = format!("http://127.0.0.1:{port}/");
+                        // new_as_child keeps winit's NSView as contentView. WebViewBuilder::new
+                        // replaces it and later crashes in windowDidResignKey (objc weak / SIGSEGV).
+                        match wry::WebViewBuilder::new_as_child(&window)
+                            .with_bounds(wry_bounds_from_physical(window.inner_size()))
+                            .with_url(url)
+                            .build()
+                        {
+                            Ok(webview) => {
+                                self.webview = Some(webview);
+                                self.window = Some(window);
+                            }
+                            Err(e) => {
+                                eprintln!("failed to create WebView: {e}");
+                                tray_notify("ChatGPT Codex", "Failed to open overview window.");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("failed to create window: {e}");
+                        tray_notify("ChatGPT Codex", "Failed to create overview window.");
+                    }
+                }
+            } else if let Some(window) = &self.window {
+                window.focus_window();
+            }
+        } else {
+            tray_notify("ChatGPT Codex", "Overview is unavailable right now.");
+        }
+    }
+
+    fn hide_popover(&mut self) {
+        if let Some(window) = &self.popover {
+            window.set_visible(false);
+        }
+        if let Some(webview) = &self.popover_webview {
+            // Cached WKWebView stays alive — stop JS polls while hidden.
+            let _ = webview
+                .evaluate_script("try{window.__popoverHidden&&window.__popoverHidden()}catch(e){}");
+        }
+    }
+
+    fn destroy_popover(&mut self) {
+        self.popover_webview = None;
+        self.popover = None;
+    }
+
+    fn handle_tray_icon_event(&mut self, event_loop: &ActiveEventLoop, event: TrayIconEvent) {
+        #[cfg(target_os = "macos")]
+        {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                rect,
+                ..
+            } = event
+            {
+                self.last_tray_rect = Some((rect.position, rect.size));
+                self.toggle_popover(event_loop);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (event_loop, event);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn popover_anchor(&self) -> (f64, f64) {
+        const WIDTH: f64 = 392.0;
+        if let Some((pos, size)) = self.last_tray_rect {
+            let x = pos.x + (f64::from(size.width) / 2.0) - (WIDTH / 2.0);
+            let y = pos.y + f64::from(size.height) + 6.0;
+            return (x, y);
+        }
+        if let Some(tray) = &self.tray_icon
+            && let Some(rect) = tray.rect()
+        {
+            let x = rect.position.x + (f64::from(rect.size.width) / 2.0) - (WIDTH / 2.0);
+            let y = rect.position.y + f64::from(rect.size.height) + 6.0;
+            return (x, y);
+        }
+        (40.0, 40.0)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn toggle_popover(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(window) = &self.popover
+            && window.is_visible() == Some(true)
+        {
+            self.hide_popover();
+            return;
+        }
+        self.open_popover(event_loop);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn show_existing_popover(&mut self) {
+        let (x, y) = self.popover_anchor();
+        if let Some(window) = &self.popover {
+            window.set_outer_position(PhysicalPosition::new(x, y));
+            window.set_visible(true);
+            window.focus_window();
+        }
+        if let Some(webview) = &self.popover_webview {
+            // Refresh data without reloading the document / recreating WKWebView.
+            let _ = webview
+                .evaluate_script("try{window.__popoverShown&&window.__popoverShown()}catch(e){}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_popover(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(port) = self.dashboard_port else {
+            tray_notify("ChatGPT Codex", "Menu panel is unavailable right now.");
+            return;
+        };
+
+        if self.popover.is_some() && self.popover_webview.is_some() {
+            self.show_existing_popover();
+            return;
+        }
+        // Partial / failed prior create — drop and rebuild once.
+        self.destroy_popover();
+
+        const WIDTH: f64 = 392.0;
+        const HEIGHT: f64 = 580.0;
+        let (x, y) = self.popover_anchor();
+
+        use winit::platform::macos::WindowAttributesExtMacOS;
+        let window_attrs = winit::window::Window::default_attributes()
+            .with_title("ChatGPT Codex")
+            .with_inner_size(LogicalSize::new(WIDTH, HEIGHT))
+            .with_max_inner_size(LogicalSize::new(WIDTH, HEIGHT))
+            .with_min_inner_size(LogicalSize::new(WIDTH, HEIGHT))
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_transparent(true)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_visible(false)
+            // Native square shadow bleeds past HTML border-radius; CSS shadow is enough.
+            .with_has_shadow(false)
+            .with_position(PhysicalPosition::new(x, y));
+
+        match event_loop.create_window(window_attrs) {
+            Ok(window) => {
+                // Reinforce transparency: NSWindow must be non-opaque + clearColor or
+                // rounded HTML leaves white corners over the default window fill.
+                window.set_transparent(true);
+                let proxy = self.event_proxy.clone();
+                let url = format!("http://127.0.0.1:{port}/menu");
+                // Child webview: must not replace winit's contentView (see open_dashboard_window).
+                match wry::WebViewBuilder::new_as_child(&window)
+                    .with_bounds(wry::Rect {
+                        position: wry::dpi::LogicalPosition::new(0.0, 0.0).into(),
+                        size: wry::dpi::LogicalSize::new(WIDTH, HEIGHT).into(),
+                    })
+                    .with_transparent(true)
+                    .with_url(url)
+                    .with_ipc_handler(move |request| {
+                        let body = request.body().as_str();
+                        let action = match body {
+                            "open-overview" => Some(PopoverAction::OpenOverview),
+                            "quit" => Some(PopoverAction::Quit),
+                            _ => None,
+                        };
+                        if let Some(action) = action {
+                            let _ = proxy.send_event(UserEvent::PopoverAction(action));
+                        }
+                    })
+                    .build()
+                {
+                    Ok(webview) => {
+                        let _ = window.set_cursor_hittest(true);
+                        window.set_visible(true);
+                        window.focus_window();
+                        self.popover_webview = Some(webview);
+                        self.popover = Some(window);
+                    }
+                    Err(e) => {
+                        eprintln!("failed to create popover WebView: {e}");
+                        tray_notify("ChatGPT Codex", "Failed to open menu panel.");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to create popover window: {e}");
+                tray_notify("ChatGPT Codex", "Failed to create menu panel.");
+            }
+        }
+    }
+
     fn ensure_tray_icon(&mut self) {
         if self.tray_icon.is_some() {
             return;
@@ -234,9 +579,26 @@ where
             .and_then(|s| self.app.list().map(|l| (s, l)))
         {
             Ok((status, list)) => {
-                let tooltip = self.get_tooltip_text(&status, &list);
-                let title = self.get_menu_bar_title(&status, &list);
-                match self.rebuild_menu_with_status_and_list(&status, &list) {
+                let cursor_status = self.app.cursor_status().ok();
+                let claude_status = self.app.claude_status().ok();
+                let tooltip = self.get_tooltip_text(
+                    &status,
+                    &list,
+                    cursor_status.as_ref(),
+                    claude_status.as_ref(),
+                );
+                let title = self.get_menu_bar_title(
+                    &status,
+                    &list,
+                    cursor_status.as_ref(),
+                    claude_status.as_ref(),
+                );
+                match self.rebuild_menu_with_status_and_list(
+                    &status,
+                    &list,
+                    cursor_status.as_ref(),
+                    claude_status.as_ref(),
+                ) {
                     Ok(menu) => {
                         let (icon, template) = load_tray_icon();
                         let mut builder = TrayIconBuilder::new()
@@ -246,16 +608,20 @@ where
                             .with_menu(Box::new(menu));
                         #[cfg(target_os = "macos")]
                         {
-                            builder = builder.with_icon_as_template(template);
+                            builder = builder
+                                .with_icon_as_template(template)
+                                .with_menu_on_left_click(false)
+                                .with_menu_on_right_click(true);
                         }
                         match builder.build() {
                             Ok(tray_icon) => {
                                 self.tray_icon = Some(tray_icon);
+                                self.last_menu_rebuild_at = Some(std::time::Instant::now());
                                 self.spawn_startup_usage_refresh();
                                 #[cfg(target_os = "macos")]
                                 wake_main_run_loop();
                                 log_tray_message(
-                                    self.app,
+                                    &self.app,
                                     &format!(
                                         "tray icon created (template={template}, pid={})",
                                         std::process::id()
@@ -263,18 +629,18 @@ where
                                 );
                             }
                             Err(error) => log_tray_error(
-                                self.app,
+                                &self.app,
                                 &format!("failed to create tray icon: {error:#}"),
                             ),
                         }
                     }
                     Err(error) => {
-                        log_tray_error(self.app, &format!("failed to build tray menu: {error:#}"))
+                        log_tray_error(&self.app, &format!("failed to build tray menu: {error:#}"))
                     }
                 }
             }
             Err(error) => log_tray_error(
-                self.app,
+                &self.app,
                 &format!("failed to query app status and list: {error:#}"),
             ),
         }
@@ -313,7 +679,7 @@ where
                         " Codex restarted."
                     };
                     Ok(Some((
-                        "Codex Switcher".to_owned(),
+                        "ChatGPT Codex".to_owned(),
                         format!("Switched to {account_name} ({plan}).{detail}"),
                     )))
                 });
@@ -323,16 +689,18 @@ where
                 let env = self.app.env().clone();
                 spawn_tray_background(proxy, move || {
                     let app = tray_app_for_env(&env);
-                    crate::process::quit_running_codex_app();
                     let output = app.start_login_for_saved_account(account_id)?;
-                    crate::process::launch_codex_app();
+                    let launch =
+                        crate::process::relaunch_codex_for_interactive_login(&env.codex_root);
                     let account_name = account_display_name(&output.account);
-                    Ok(Some((
-                        "Codex Switcher".to_owned(),
-                        format!(
-                            "Login screen opened for {account_name}. After login, choose Save Current Workspace."
-                        ),
-                    )))
+                    let mut msg = format!(
+                        "Sign in for {account_name}: {}. After the browser finishes, choose Save signed-in session.",
+                        launch.detail
+                    );
+                    if !launch.oauth_port_ready {
+                        msg.push_str(" (OAuth port not ready yet.)");
+                    }
+                    Ok(Some(("ChatGPT Codex".to_owned(), msg)))
                 });
             }
             Some(TrayCommand::SaveCurrent) => {
@@ -347,7 +715,7 @@ where
                         format!("Failed to save workspace: {error:#}")
                     }
                 };
-                tray_notify("Codex Switcher", &msg);
+                tray_notify("ChatGPT Codex", &msg);
                 let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
             Some(TrayCommand::SaveCursorCurrent) => {
@@ -362,26 +730,54 @@ where
                         format!("Failed to save Cursor workspace: {error:#}")
                     }
                 };
-                tray_notify("Codex Switcher", &msg);
+                tray_notify("ChatGPT Codex", &msg);
                 let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
+            Some(TrayCommand::SaveClaudeCurrent) => {
+                let msg = match self.app.save_claude_current() {
+                    Ok(output) => {
+                        format!(
+                            "Saved Claude workspace {} successfully.",
+                            account_display_name(&output.account)
+                        )
+                    }
+                    Err(error) => {
+                        format!("Failed to save Claude workspace: {error:#}")
+                    }
+                };
+                tray_notify("ChatGPT Codex", &msg);
+                let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
+            }
+            Some(TrayCommand::OpenDashboard) => {
+                self.open_dashboard_window(event_loop);
+            }
             Some(TrayCommand::StartAddAccount) => {
-                match self.app.begin_add_account_session() {
+                let env = self.app.env().clone();
+                let started = if codex::add_account_session_active(self.app.env()) {
+                    // Stuck / mid-session: re-run CLI login without failing "already in progress".
+                    Ok(())
+                } else {
+                    self.app.begin_add_account_session()
+                };
+                match started {
                     Ok(()) => {
                         let proxy = self.event_proxy.clone();
                         spawn_tray_background(proxy, move || {
-                            crate::process::quit_running_codex_app();
-                            crate::process::launch_codex_app();
-                            Ok(Some((
-                                "Codex Switcher".to_owned(),
-                                "Step 1: log in to Codex with the new account or workspace. Step 2: return here and choose Finish Adding Workspace."
-                                    .to_owned(),
-                            )))
+                            let launch =
+                                crate::process::relaunch_codex_for_interactive_login(&env.codex_root);
+                            let mut msg = format!(
+                                "Step 1: {}. Step 2: return here → Finish Adding Workspace.",
+                                launch.detail
+                            );
+                            if !launch.oauth_port_ready {
+                                msg.push_str(" (OAuth port not ready yet.)");
+                            }
+                            Ok(Some(("ChatGPT Codex".to_owned(), msg)))
                         });
                     }
                     Err(error) => {
                         tray_notify(
-                            "Codex Switcher",
+                            "ChatGPT Codex",
                             &format!("Failed to start add account: {error:#}"),
                         );
                     }
@@ -411,7 +807,7 @@ where
                         }
                         Err(error) => format!("Failed to finish adding account: {error:#}"),
                     };
-                    Ok(Some(("Codex Switcher".to_owned(), msg)))
+                    Ok(Some(("ChatGPT Codex".to_owned(), msg)))
                 });
             }
             Some(TrayCommand::CancelAddAccount) => {
@@ -427,7 +823,7 @@ where
                         }
                         Err(error) => format!("Failed to cancel add account: {error:#}"),
                     };
-                    Ok(Some(("Codex Switcher".to_owned(), msg)))
+                    Ok(Some(("ChatGPT Codex".to_owned(), msg)))
                 });
             }
             Some(TrayCommand::PickBestQuota) => {
@@ -469,7 +865,7 @@ where
                     if was_running && msg.starts_with("Switched to best") {
                         crate::process::launch_codex_app();
                     }
-                    Ok(Some(("Codex Switcher".to_owned(), msg)))
+                    Ok(Some(("ChatGPT Codex".to_owned(), msg)))
                 });
             }
             Some(TrayCommand::Delete(account_id, account_name)) => {
@@ -521,7 +917,7 @@ where
                                 let _ = std::process::Command::new("osascript")
                                     .arg("-e")
                                     .arg(format!(
-                                        "display notification \"{}\" with title \"Codex Switcher\"",
+                                        "display notification \"{}\" with title \"ChatGPT Codex\"",
                                         msg.replace('"', "\\\"")
                                     ))
                                     .spawn();
@@ -538,11 +934,11 @@ where
                 match self.app.set_account_archived(account_id, archived) {
                     Ok(_) => {
                         let verb = if archived { "Archived" } else { "Unarchived" };
-                        tray_notify("Codex Switcher", &format!("{verb} account successfully."));
+                        tray_notify("ChatGPT Codex", &format!("{verb} account successfully."));
                     }
                     Err(error) => {
                         tray_notify(
-                            "Codex Switcher",
+                            "ChatGPT Codex",
                             &format!("Failed to archive/unarchive: {error:#}"),
                         );
                     }
@@ -601,42 +997,12 @@ where
                 }
                 let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
             }
-            Some(TrayCommand::ShowTui) => {
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                {
-                    use std::io::IsTerminal;
-                    if !std::io::stdin().is_terminal() {
-                        #[cfg(target_os = "macos")]
-                        {
-                            if let Ok(exe) = std::env::current_exe() {
-                                let _ = std::process::Command::new("osascript")
-                                    .arg("-e")
-                                    .arg(format!(
-                                        "tell application \"Terminal\" to do script \"'{}'\"",
-                                        exe.display()
-                                    ))
-                                    .spawn();
-                            }
-                        }
-                        #[cfg(target_os = "windows")]
-                        {
-                            if let Ok(exe) = std::env::current_exe() {
-                                let _ = std::process::Command::new("cmd")
-                                    .args([
-                                        "/c",
-                                        "start",
-                                        "cmd",
-                                        "/k",
-                                        &format!("\"{}\"", exe.display()),
-                                    ])
-                                    .spawn();
-                            }
-                        }
-                        return;
-                    }
-                }
-                self.exit = TrayExit::ShowTui;
-                event_loop.exit();
+            Some(TrayCommand::OpenLogsDir) => {
+                let log_dir = self.app.env().app_data_dir.join("logs");
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&log_dir).spawn();
+                #[cfg(target_os = "windows")]
+                let _ = std::process::Command::new("explorer").arg(&log_dir).spawn();
             }
             Some(TrayCommand::Refresh) => {
                 let _ = self.event_proxy.send_event(UserEvent::UpdateMenu);
@@ -649,17 +1015,53 @@ where
         }
     }
 
+    fn request_menu_update(&mut self) {
+        // Coalesce bursts so one event-loop turn rebuilds once.
+        self.menu_update_pending = true;
+        // If the last rebuild was very recent, still mark pending — about_to_wait
+        // will run it once the event loop settles.
+        if self
+            .last_menu_rebuild_at
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(80))
+        {
+            return;
+        }
+        self.menu_update_pending = false;
+        if let Err(error) = self.update_tray_menu() {
+            eprintln!("failed to refresh tray menu: {error:#}");
+        }
+    }
+
     fn update_tray_menu(&mut self) -> Result<()> {
         let status = self.app.status()?;
         let list = self.app.list()?;
-        let tooltip = self.get_tooltip_text(&status, &list);
-        let title = self.get_menu_bar_title(&status, &list);
-        let menu = self.rebuild_menu_with_status_and_list(&status, &list)?;
+        // Single status pass — title/tooltip/menu previously each re-fetched Cursor/Claude.
+        let cursor_status = self.app.cursor_status().ok();
+        let claude_status = self.app.claude_status().ok();
+        let tooltip = self.get_tooltip_text(
+            &status,
+            &list,
+            cursor_status.as_ref(),
+            claude_status.as_ref(),
+        );
+        let title = self.get_menu_bar_title(
+            &status,
+            &list,
+            cursor_status.as_ref(),
+            claude_status.as_ref(),
+        );
+        let menu = self.rebuild_menu_with_status_and_list(
+            &status,
+            &list,
+            cursor_status.as_ref(),
+            claude_status.as_ref(),
+        )?;
         if let Some(tray_icon) = &self.tray_icon {
             let _ = tray_icon.set_tooltip(Some(&tooltip));
             tray_icon.set_title(Some(title));
             tray_icon.set_menu(Some(Box::new(menu)));
         }
+        self.last_menu_rebuild_at = Some(std::time::Instant::now());
         Ok(())
     }
 
@@ -667,6 +1069,8 @@ where
         &self,
         status: &crate::model::StatusOutput,
         list: &crate::model::ListOutput,
+        cursor_status: Option<&crate::model::StatusOutput>,
+        claude_status: Option<&crate::model::StatusOutput>,
     ) -> String {
         let Ok(settings) = self.app.show_quota_in_menu_bar_status() else {
             return String::new();
@@ -674,16 +1078,123 @@ where
         if !settings.enabled {
             return String::new();
         }
-        let Some(current) = &status.current_account else {
-            return String::new();
-        };
-        let active_account = find_active_tray_account(
-            Some(current),
+
+        let codex_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref().unwrap_or("codex") == "codex")
+            .cloned()
+            .collect();
+        let active_codex = find_active_tray_account(
+            status.current_account.as_ref(),
             status.current_account_saved_id,
-            &list.accounts,
+            &codex_accounts,
         );
+
+        let cursor_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref() == Some("cursor"))
+            .cloned()
+            .collect();
+        let active_cursor = cursor_status.and_then(|cur_status| {
+            find_active_tray_account(
+                cur_status.current_account.as_ref(),
+                cur_status.current_account_saved_id,
+                &cursor_accounts,
+            )
+        });
+
+        let claude_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref() == Some("claude"))
+            .cloned()
+            .collect();
+        // Claude live identity often lacks email (or keychain times out on poll).
+        // Still resolve a saved Claude account so the menu bar can show CL %.
+        let active_claude = claude_status
+            .and_then(|c_status| {
+                find_active_tray_account(
+                    c_status.current_account.as_ref(),
+                    c_status.current_account_saved_id,
+                    &claude_accounts,
+                )
+            })
+            .or_else(|| {
+                fallback_unresolved_claude_tray_account(
+                    &claude_accounts,
+                    &DisplayIdentity {
+                        email: crate::claude::CLAUDE_UNKNOWN_EMAIL.to_owned(),
+                        subject: None,
+                        name: None,
+                        plan_label: claude_status
+                            .and_then(|s| s.current_account.as_ref())
+                            .and_then(|id| id.plan_label.clone()),
+                        workspace_id: None,
+                        workspace_name: None,
+                    },
+                )
+            });
+        // Prefer live identity; otherwise synthesize from the resolved saved account
+        // so format_menu_bar_part does not skip CL when keychain identity is empty.
+        let claude_identity_owned: Option<DisplayIdentity> = claude_status
+            .and_then(|s| s.current_account.clone())
+            .or_else(|| {
+                active_claude.map(|acc| DisplayIdentity {
+                    email: acc.email.clone(),
+                    subject: acc.subject.clone(),
+                    name: acc.name.clone(),
+                    plan_label: acc.plan_label.clone(),
+                    workspace_id: acc.workspace_id.clone(),
+                    workspace_name: acc.workspace_name.clone(),
+                })
+            });
+
+        let mut parts = Vec::new();
+
+        if let Some(part) =
+            self.format_menu_bar_part("CX", status.current_account.as_ref(), active_codex, true)
+        {
+            parts.push(part);
+        }
+        if let Some(part) = self.format_menu_bar_part(
+            "CR",
+            cursor_status.and_then(|s| s.current_account.as_ref()),
+            active_cursor,
+            false,
+        ) {
+            parts.push(part);
+        }
+        if let Some(part) = self.format_menu_bar_part(
+            "CL",
+            claude_identity_owned.as_ref(),
+            active_claude,
+            false,
+        ) {
+            parts.push(part);
+        }
+
+        if parts.is_empty() {
+            String::new()
+        } else {
+            // Compact spacing keeps the macOS menu bar readable with 3 providers.
+            format!(" {}", parts.join(" "))
+        }
+    }
+
+    fn format_menu_bar_part(
+        &self,
+        label: &str,
+        current_identity: Option<&DisplayIdentity>,
+        active_account: Option<&AccountView>,
+        weekly_only: bool,
+    ) -> Option<String> {
+        current_identity?;
+
         let Some(account) = active_account else {
-            return String::new();
+            // Live session detected but not matched to a saved snapshot with usage.
+            return Some(format!("{label} ·"));
         };
 
         if account
@@ -691,69 +1202,211 @@ where
             .as_deref()
             .is_some_and(usage_error_requires_login)
         {
-            return " Login".to_owned();
+            return Some(format!("{label} auth"));
         }
 
         if let Some(usage) = &account.usage {
             let now = OffsetDateTime::now_utc();
-            if usage.is_out_of_quota(now) {
-                return " 0%".to_owned();
+            // Prefer provider-specific windows, then fall back to any available
+            // window so Codex still shows 5h when weekly is null (common API shape).
+            let mut windows: Vec<&crate::model::UsageWindowView> = if weekly_only {
+                usage.weekly.as_ref().into_iter().collect()
+            } else {
+                [usage.five_hour.as_ref(), usage.weekly.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            };
+            if windows.is_empty() {
+                windows = [usage.five_hour.as_ref(), usage.weekly.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
             }
-            let bottleneck = [usage.five_hour.as_ref(), usage.weekly.as_ref()]
-                .into_iter()
-                .flatten()
+
+            // When any active window is at 0%, show the soonest reset countdown.
+            let exhausted_resets: Vec<_> = windows
+                .iter()
+                .filter(|w| w.remaining_percent == 0 && w.reset_at > now)
+                .map(|w| w.reset_at)
+                .collect();
+            if !exhausted_resets.is_empty() {
+                // Prefer showing remaining % of a non-zero window when available
+                // (e.g. Cursor Auto 0% but monthly still has quota).
+                let live = windows
+                    .iter()
+                    .filter(|w| w.remaining_percent > 0 && w.reset_at > now)
+                    .min_by_key(|w| w.remaining_percent);
+                if let Some(window) = live {
+                    return Some(format!("{label} {}%", window.remaining_percent));
+                }
+                if let Some(reset_at) = exhausted_resets.into_iter().min() {
+                    return Some(format!(
+                        "{label} {}",
+                        crate::time_display::format_countdown(reset_at, now)
+                    ));
+                }
+            }
+
+            let bottleneck = windows
+                .iter()
                 .filter(|w| w.reset_at > now)
                 .min_by_key(|w| w.remaining_percent);
             if let Some(window) = bottleneck {
-                return format!(" {}%", window.remaining_percent);
-            } else if usage.has_stale_quota_cache(now) {
-                return " Stale".to_owned();
+                return Some(format!("{label} {}%", window.remaining_percent));
+            }
+
+            // Past-reset cache: still show last known remaining so the bar is not blank.
+            if let Some(window) = windows.iter().min_by_key(|w| w.remaining_percent) {
+                return Some(format!("{label} {}%", window.remaining_percent));
+            }
+            if usage.has_stale_quota_cache(now) {
+                return Some(format!("{label} stale"));
             }
         }
 
-        String::new()
+        // No cached usage yet (refresh in progress or never fetched).
+        Some(format!("{label} …"))
     }
 
     fn get_tooltip_text(
         &self,
         status: &crate::model::StatusOutput,
         list: &crate::model::ListOutput,
+        cursor_status: Option<&crate::model::StatusOutput>,
+        claude_status: Option<&crate::model::StatusOutput>,
     ) -> String {
-        match &status.current_account {
-            Some(account) => {
-                let plan = format_plan_label_simple(account.plan_label.as_deref());
-                let active_account = find_active_tray_account(
-                    Some(account),
-                    status.current_account_saved_id,
-                    &list.accounts,
-                );
-                let usage_info = active_account
-                    .map(|act| {
-                        let (remaining, _) = account_usage_labels_simple(act);
-                        let status = account_status_label_simple(act);
-                        match (status.is_empty(), remaining.is_empty()) {
-                            (true, true) => String::new(),
-                            (false, true) => format!(" - {status}"),
-                            (true, false) => format!(" - {remaining}"),
-                            (false, false) => format!(" - {status}, {remaining}"),
-                        }
-                    })
-                    .unwrap_or_default();
+        let codex_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref().unwrap_or("codex") == "codex")
+            .cloned()
+            .collect();
+        let active_codex = find_active_tray_account(
+            status.current_account.as_ref(),
+            status.current_account_saved_id,
+            &codex_accounts,
+        );
+
+        let cursor_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref() == Some("cursor"))
+            .cloned()
+            .collect();
+        let active_cursor = cursor_status.and_then(|cur_status| {
+            find_active_tray_account(
+                cur_status.current_account.as_ref(),
+                cur_status.current_account_saved_id,
+                &cursor_accounts,
+            )
+        });
+
+        let claude_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref() == Some("claude"))
+            .cloned()
+            .collect();
+        let active_claude = claude_status.and_then(|c_status| {
+            find_active_tray_account(
+                c_status.current_account.as_ref(),
+                c_status.current_account_saved_id,
+                &claude_accounts,
+            )
+        });
+
+        fn format_app_tooltip_line(
+            app_name: &str,
+            current: Option<&DisplayIdentity>,
+            active_account: Option<&AccountView>,
+        ) -> Option<String> {
+            current.map(|identity| {
+                let plan = format_plan_label_simple(identity.plan_label.as_deref());
+                let usage_info =
+                    active_account
+                        .map(|act| {
+                            let (remaining, _) = account_usage_labels_simple(act);
+                            let status = account_status_label_simple(act);
+                            let pace = act.usage.as_ref().and_then(|u| u.weekly.as_ref()).and_then(
+                                |weekly| {
+                                    let now = OffsetDateTime::now_utc();
+                                    if weekly.reset_at > now {
+                                        crate::usage_pace::pace_for_weekly(
+                                            weekly.used_percent,
+                                            weekly.reset_at,
+                                            now,
+                                        )
+                                        .map(|p| p.delta_text().to_owned())
+                                    } else {
+                                        None
+                                    }
+                                },
+                            );
+                            let mut parts = Vec::new();
+                            if !status.is_empty() {
+                                parts.push(status);
+                            }
+                            if !remaining.is_empty() {
+                                parts.push(remaining);
+                            }
+                            if let Some(pace) = pace {
+                                parts.push(pace);
+                            }
+                            if parts.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — {}", parts.join(", "))
+                            }
+                        })
+                        .unwrap_or_default();
                 format!(
-                    "Codex Account Switcher — {}{} ({})",
-                    identity_display_name(account),
-                    usage_info,
-                    plan
+                    "{app_name}: {} ({plan}){usage_info}",
+                    identity_display_name(identity)
                 )
-            }
-            None => "Codex Account Switcher — Not logged in".to_owned(),
+            })
         }
+
+        let codex_line = format_app_tooltip_line(
+            "ChatGPT Codex",
+            status.current_account.as_ref(),
+            active_codex,
+        );
+        let cursor_line = cursor_status.and_then(|cur_status| {
+            format_app_tooltip_line("Cursor", cur_status.current_account.as_ref(), active_cursor)
+        });
+        let claude_line = claude_status.and_then(|c_status| {
+            format_app_tooltip_line("Claude", c_status.current_account.as_ref(), active_claude)
+        });
+
+        let mut lines = vec!["ChatGPT Codex".to_owned()];
+        let lang = tray_ui_lang(self.app.as_ref());
+        let not_logged = tt(lang, "Not logged in", "Chưa đăng nhập");
+        if let Some(line) = codex_line {
+            lines.push(line);
+        } else {
+            lines.push(format!("ChatGPT Codex: {not_logged}"));
+        }
+        if let Some(line) = cursor_line {
+            lines.push(line);
+        } else {
+            lines.push(format!("Cursor: {not_logged}"));
+        }
+        if let Some(line) = claude_line {
+            lines.push(line);
+        } else {
+            lines.push(format!("Claude: {not_logged}"));
+        }
+
+        lines.join("\n")
     }
 
     fn rebuild_menu_with_status_and_list(
         &mut self,
         status: &crate::model::StatusOutput,
         list: &crate::model::ListOutput,
+        cursor_status: Option<&crate::model::StatusOutput>,
+        claude_status: Option<&crate::model::StatusOutput>,
     ) -> Result<Menu> {
         if codex::add_account_session_active(self.app.env()) {
             return self.rebuild_add_account_pending_menu();
@@ -762,7 +1415,6 @@ where
         let menu = Menu::new();
         self.commands.clear();
 
-        // Split accounts by target_app
         let codex_accounts: Vec<AccountView> = list
             .accounts
             .iter()
@@ -775,129 +1427,74 @@ where
             .filter(|acc| acc.target_app.as_deref() == Some("cursor"))
             .cloned()
             .collect();
-
-        let saved_accounts = tray_saved_accounts(&list.accounts);
-
-        // Fetch Cursor status
-        let cursor_status = self.app.cursor_status().ok();
+        let claude_accounts: Vec<AccountView> = list
+            .accounts
+            .iter()
+            .filter(|acc| acc.target_app.as_deref() == Some("claude"))
+            .cloned()
+            .collect();
+        let lang = tray_ui_lang(self.app.as_ref());
 
         // ── Codex Section ───────────────────────────────────────
         self.rebuild_app_section(
             &menu,
-            "OpenAI Codex",
+            "ChatGPT Codex",
             status.current_account.as_ref(),
             status.current_account_saved_id,
             &codex_accounts,
+            lang,
         )?;
 
         menu.append(&PredefinedMenuItem::separator())?;
 
-        // ── Cursor Section ──────────────────────────────────────
-        if let Some(cur_status) = &cursor_status {
-            self.rebuild_app_section(
-                &menu,
-                "Cursor IDE",
-                cur_status.current_account.as_ref(),
-                cur_status.current_account_saved_id,
-                &cursor_accounts,
-            )?;
-            menu.append(&PredefinedMenuItem::separator())?;
-        }
+        // ── Cursor Section (always shown) ───────────────────────
+        self.rebuild_app_section(
+            &menu,
+            "Cursor",
+            cursor_status.and_then(|s| s.current_account.as_ref()),
+            cursor_status.and_then(|s| s.current_account_saved_id),
+            &cursor_accounts,
+            lang,
+        )?;
+        menu.append(&PredefinedMenuItem::separator())?;
 
-        // ── Actions ─────────────────────────────────────────────
+        // ── Claude Section (always shown) ───────────────────────
+        self.rebuild_app_section(
+            &menu,
+            "Claude",
+            claude_status.and_then(|s| s.current_account.as_ref()),
+            claude_status.and_then(|s| s.current_account_saved_id),
+            &claude_accounts,
+            lang,
+        )?;
+        menu.append(&PredefinedMenuItem::separator())?;
+
+        // ── Actions (tray-first; overview is secondary) ──────────
         self.append_command(
             &menu,
             "pick-best-quota",
-            "Best Quota",
+            tt(lang, "Switch to Best Quota", "Chuyển hạn mức tốt nhất"),
             TrayCommand::PickBestQuota,
         )?;
         self.append_command(
             &menu,
-            "save-current",
-            "Save Codex Account",
-            TrayCommand::SaveCurrent,
+            "refresh",
+            tt(lang, "Refresh", "Làm mới"),
+            TrayCommand::Refresh,
         )?;
-        self.append_command(
-            &menu,
-            "save-cursor",
-            "Save Cursor Account",
-            TrayCommand::SaveCursorCurrent,
-        )?;
-        self.append_command(
-            &menu,
-            "add-account",
-            "Add Account…",
-            TrayCommand::StartAddAccount,
-        )?;
-        if !saved_accounts.is_empty() {
-            let delete_submenu = Submenu::new("Delete Account", true);
-            for account in &saved_accounts {
-                let delete_id = format!("delete:{}", account.id);
-                let account_name = account_display_name(account);
-                delete_submenu.append(&MenuItem::with_id(
-                    MenuId::new(&delete_id),
-                    account_name.clone(),
-                    true,
-                    None,
-                ))?;
-                self.commands
-                    .insert(delete_id, TrayCommand::Delete(account.id, account_name));
-            }
-            menu.append(&delete_submenu)?;
-
-            // Archive Account Submenu
-            let archive_submenu = Submenu::new("Archive Account (Lưu trữ)", true);
-            let mut has_archivable = false;
-            for account in &saved_accounts {
-                if !account.is_archived {
-                    has_archivable = true;
-                    let archive_id = format!("archive:{}", account.id);
-                    let account_name = account_display_name(account);
-                    archive_submenu.append(&MenuItem::with_id(
-                        MenuId::new(&archive_id),
-                        account_name.clone(),
-                        true,
-                        None,
-                    ))?;
-                    self.commands
-                        .insert(archive_id, TrayCommand::SetArchived(account.id, true));
-                }
-            }
-            if has_archivable {
-                menu.append(&archive_submenu)?;
-            }
-
-            // Unarchive Account Submenu
-            let unarchive_submenu = Submenu::new("Unarchive Account (Hủy lưu trữ)", true);
-            let mut has_unarchivable = false;
-            for account in &saved_accounts {
-                if account.is_archived {
-                    has_unarchivable = true;
-                    let unarchive_id = format!("unarchive:{}", account.id);
-                    let account_name = account_display_name(account);
-                    unarchive_submenu.append(&MenuItem::with_id(
-                        MenuId::new(&unarchive_id),
-                        account_name.clone(),
-                        true,
-                        None,
-                    ))?;
-                    self.commands
-                        .insert(unarchive_id, TrayCommand::SetArchived(account.id, false));
-                }
-            }
-            if has_unarchivable {
-                menu.append(&unarchive_submenu)?;
-            }
-        }
         menu.append(&PredefinedMenuItem::separator())?;
 
-        // ── Settings & system ───────────────────────────────────
-        let automation_submenu = Submenu::new("Automation", true);
+        let automation_submenu = Submenu::new(tt(lang, "Automation", "Tự động hóa"), true);
         let auto_start_enabled = self.app.auto_start_usage_windows_status()?.enabled;
+        let auto_refresh_label = tt(
+            lang,
+            AUTO_REFRESH_QUOTA_ON_RESET_LABEL,
+            "Tự làm mới hạn mức khi reset",
+        );
         self.append_check_submenu_command(
             &automation_submenu,
             "toggle-auto-start-usage-windows",
-            AUTO_REFRESH_QUOTA_ON_RESET_LABEL,
+            auto_refresh_label,
             auto_start_enabled,
             TrayCommand::SetAutoStartUsageWindows(!auto_start_enabled),
         )?;
@@ -905,7 +1502,11 @@ where
         self.append_check_submenu_command(
             &automation_submenu,
             "toggle-auto-switch-on-limit",
-            "Auto-switch when exhausted",
+            tt(
+                lang,
+                "Auto-switch when exhausted",
+                "Tự chuyển khi hết hạn mức",
+            ),
             auto_switch_enabled,
             TrayCommand::SetAutoSwitchOnLimit(!auto_switch_enabled),
         )?;
@@ -913,7 +1514,7 @@ where
         self.append_check_submenu_command(
             &automation_submenu,
             "toggle-launch-at-startup",
-            "Launch at Login",
+            tt(lang, "Launch at Login", "Mở khi đăng nhập"),
             launch_at_startup_enabled,
             TrayCommand::SetLaunchAtStartup(!launch_at_startup_enabled),
         )?;
@@ -921,14 +1522,41 @@ where
         self.append_check_submenu_command(
             &automation_submenu,
             "toggle-show-quota-in-menu-bar",
-            "Show Quota in Menu Bar",
+            tt(lang, "Show Quota in Menu Bar", "Hiện hạn mức trên menu bar"),
             show_quota_enabled,
             TrayCommand::SetShowQuotaInMenuBar(!show_quota_enabled),
         )?;
         menu.append(&automation_submenu)?;
-        self.append_command(&menu, "refresh", "Refresh", TrayCommand::Refresh)?;
-        self.append_command(&menu, "show-tui", "Show TUI", TrayCommand::ShowTui)?;
-        self.append_command(&menu, "quit", "Quit", TrayCommand::Quit)?;
+        self.append_command(
+            &menu,
+            "open-dashboard",
+            tt(lang, "Open Overview…", "Mở Tổng quan…"),
+            TrayCommand::OpenDashboard,
+        )?;
+        self.append_command(
+            &menu,
+            "start-add-account",
+            tt(lang, "Add Codex Account…", "Thêm tài khoản Codex…"),
+            TrayCommand::StartAddAccount,
+        )?;
+        self.append_command(
+            &menu,
+            "open-logs",
+            tt(lang, "Open Logs Folder", "Mở thư mục nhật ký"),
+            TrayCommand::OpenLogsDir,
+        )?;
+        menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&MenuItem::new(
+            tt(lang, "Inspired by CodexBar", "Tham khảo CodexBar"),
+            false,
+            None,
+        ))?;
+        self.append_command(
+            &menu,
+            "quit",
+            tt(lang, "Quit ChatGPT Codex", "Thoát ChatGPT Codex"),
+            TrayCommand::Quit,
+        )?;
         Ok(menu)
     }
 
@@ -939,23 +1567,27 @@ where
         current_account: Option<&crate::model::DisplayIdentity>,
         current_saved_id: Option<Uuid>,
         accounts: &[crate::model::AccountView],
+        lang: ResolvedUiLanguage,
     ) -> Result<()> {
-        menu.append_item(&MenuItem::new(format!("--- {app_label} ---"), false, None))?;
+        // CodexBar-style section header (disabled text item, not "--- dashes ---").
+        menu.append_item(&MenuItem::new(app_label, false, None))?;
 
         let active_account = find_active_tray_account(current_account, current_saved_id, accounts);
         let active_account_id = active_account.map(|account| account.id);
+        let weekly_only = app_label == "ChatGPT Codex";
 
         if let Some(current) = current_account {
             let not_saved = active_account.is_none();
             let name = identity_display_name(current);
-            let suffix = if not_saved { "  [not saved]" } else { "" };
-            menu.append_item(&MenuItem::new(
-                format!("\u{2713} {name}{suffix}"),
-                true,
-                None,
-            ))?;
-
             let plan = format_plan_label_simple(current.plan_label.as_deref());
+            let unsaved = tt(lang, "unsaved", "chưa lưu");
+            let title = if not_saved {
+                format!("\u{2713} {name} · {plan} ({unsaved})")
+            } else {
+                format!("\u{2713} {name} · {plan}")
+            };
+            menu.append_item(&MenuItem::new(title, false, None))?;
+
             let needs_login = active_account
                 .and_then(|a| a.usage_error.as_deref())
                 .is_some_and(usage_error_requires_login);
@@ -964,7 +1596,7 @@ where
                     let login_id = format!("login_active_{}", act_acc.id);
                     let item = MenuItem::with_id(
                         MenuId::new(&login_id),
-                        format!("    {plan}  •  Click to Login"),
+                        tt(lang, "Sign in again…", "Đăng nhập lại…"),
                         true,
                         None,
                     );
@@ -973,32 +1605,64 @@ where
                         .insert(login_id, TrayCommand::Login(act_acc.id));
                 } else {
                     menu.append_item(&MenuItem::new(
-                        format!("    {plan}  •  Login required"),
-                        true,
+                        tt(lang, "Login required", "Cần đăng nhập"),
+                        false,
                         None,
                     ))?;
                 }
             } else {
-                let details = format_account_details_line(
-                    &plan,
+                for line in format_usage_menu_lines(
                     active_account.and_then(|a| a.usage.as_ref()),
-                );
-                menu.append_item(&MenuItem::new(format!("    {details}"), true, None))?;
+                    weekly_only,
+                    lang,
+                ) {
+                    menu.append_item(&MenuItem::new(line, false, None))?;
+                }
+
+                if not_saved {
+                    let save_id =
+                        format!("save_active_{}", app_label.to_lowercase().replace(' ', "_"));
+                    let item = MenuItem::with_id(
+                        MenuId::new(&save_id),
+                        tt(lang, "Save Active Account", "Lưu tài khoản đang dùng"),
+                        true,
+                        None,
+                    );
+                    menu.append_item(&item)?;
+                    self.commands.insert(
+                        save_id,
+                        match app_label {
+                            "ChatGPT Codex" => TrayCommand::SaveCurrent,
+                            "Cursor" => TrayCommand::SaveCursorCurrent,
+                            "Claude" => TrayCommand::SaveClaudeCurrent,
+                            _ => TrayCommand::Refresh,
+                        },
+                    );
+                }
             }
         } else {
-            menu.append_item(&MenuItem::new("Not logged in", true, None))?;
+            menu.append_item(&MenuItem::new(
+                tt(lang, "Not logged in", "Chưa đăng nhập"),
+                false,
+                None,
+            ))?;
         }
 
-        let saved_accounts = accounts;
-        if saved_accounts.is_empty() {
-            menu.append_item(&MenuItem::new("  No saved accounts", true, None))?;
+        // Flat Switch Account submenu (no nested "Hidden Accounts").
+        let switch_submenu = Submenu::new(tt(lang, "Switch Account", "Đổi tài khoản"), true);
+        if accounts.is_empty() {
+            switch_submenu.append_item(&MenuItem::new(
+                tt(lang, "No saved accounts", "Chưa có tài khoản đã lưu"),
+                false,
+                None,
+            ))?;
         } else {
-            let mut active_group = Vec::new();
+            let mut ready_group = Vec::new();
             let mut depleted_group = Vec::new();
             let mut login_group = Vec::new();
             let mut archived_group = Vec::new();
 
-            for account in saved_accounts {
+            for account in accounts {
                 if account.is_archived {
                     archived_group.push(account);
                 } else {
@@ -1013,7 +1677,7 @@ where
                     {
                         depleted_group.push(account);
                     } else {
-                        active_group.push(account);
+                        ready_group.push(account);
                     }
                 }
             }
@@ -1030,91 +1694,102 @@ where
             });
 
             let mut first_group = true;
-
-            if !active_group.is_empty() {
-                first_group = false;
-                menu.append_item(&MenuItem::new("🟢 Active (Còn token)", true, None))?;
-                for account in active_group {
-                    append_tray_account_item(menu, account, active_account_id, &mut self.commands)?;
-                }
-            }
-
-            if !depleted_group.is_empty() {
-                if !first_group {
-                    menu.append_item(&PredefinedMenuItem::separator())?;
-                }
-                first_group = false;
-                menu.append_item(&MenuItem::new("🔴 Depleted (Hết token)", true, None))?;
-                for account in depleted_group {
-                    append_tray_account_item(menu, account, active_account_id, &mut self.commands)?;
-                }
-            }
-
-            if !login_group.is_empty() || !archived_group.is_empty() {
-                if !first_group {
-                    menu.append_item(&PredefinedMenuItem::separator())?;
-                }
-                let hidden_submenu = Submenu::new("📂 Show Hidden Accounts", true);
-                let mut first_hidden_group = true;
-
-                if !login_group.is_empty() {
-                    hidden_submenu.append_item(&MenuItem::new("⚠️ Login Required", true, None))?;
-                    first_hidden_group = false;
-                    for account in login_group {
-                        append_tray_account_item(
-                            &hidden_submenu,
-                            account,
-                            active_account_id,
-                            &mut self.commands,
-                        )?;
-                    }
-                }
-
-                if !archived_group.is_empty() {
-                    if !first_hidden_group {
-                        hidden_submenu.append_item(&PredefinedMenuItem::separator())?;
-                    }
-                    hidden_submenu.append_item(&MenuItem::new("📁 Archived", true, None))?;
-                    for account in archived_group {
-                        append_tray_account_item(
-                            &hidden_submenu,
-                            account,
-                            active_account_id,
-                            &mut self.commands,
-                        )?;
-                    }
-                }
-
-                menu.append_item(&hidden_submenu)?;
-            }
+            append_switch_account_group(
+                &switch_submenu,
+                tt(lang, "Ready", "Sẵn sàng"),
+                &ready_group,
+                active_account_id,
+                &mut self.commands,
+                &mut first_group,
+            )?;
+            append_switch_account_group(
+                &switch_submenu,
+                tt(lang, "Depleted", "Đã hết"),
+                &depleted_group,
+                active_account_id,
+                &mut self.commands,
+                &mut first_group,
+            )?;
+            append_switch_account_group(
+                &switch_submenu,
+                tt(lang, "Login required", "Cần đăng nhập"),
+                &login_group,
+                active_account_id,
+                &mut self.commands,
+                &mut first_group,
+            )?;
+            append_switch_account_group(
+                &switch_submenu,
+                tt(lang, "Archived", "Đã lưu trữ"),
+                &archived_group,
+                active_account_id,
+                &mut self.commands,
+                &mut first_group,
+            )?;
         }
+        menu.append_item(&switch_submenu)?;
+
         Ok(())
     }
 
     fn rebuild_add_account_pending_menu(&mut self) -> Result<Menu> {
+        let lang = tray_ui_lang(self.app.as_ref());
         let menu = Menu::new();
         self.commands.clear();
 
-        menu.append(&MenuItem::new("Adding Account / Workspace", false, None))?;
-        menu.append(&MenuItem::new("  1. Log in with Codex", false, None))?;
-        menu.append(&MenuItem::new("  2. Return to this menu", false, None))?;
-        menu.append(&MenuItem::new("  3. Finish adding workspace", false, None))?;
+        menu.append(&MenuItem::new(
+            tt(
+                lang,
+                "Adding Account / Workspace",
+                "Đang thêm tài khoản / workspace",
+            ),
+            false,
+            None,
+        ))?;
+        menu.append(&MenuItem::new(
+            tt(lang, "  1. Log in with Codex", "  1. Đăng nhập Codex"),
+            false,
+            None,
+        ))?;
+        menu.append(&MenuItem::new(
+            tt(lang, "  2. Return to this menu", "  2. Quay lại menu này"),
+            false,
+            None,
+        ))?;
+        menu.append(&MenuItem::new(
+            tt(
+                lang,
+                "  3. Finish adding workspace",
+                "  3. Hoàn tất thêm workspace",
+            ),
+            false,
+            None,
+        ))?;
         menu.append(&PredefinedMenuItem::separator())?;
         self.append_command(
             &menu,
             "finish-add-account",
-            "  Finish Adding Workspace",
+            tt(
+                lang,
+                "  Finish Adding Workspace",
+                "  Hoàn tất thêm workspace",
+            ),
             TrayCommand::FinishAddAccount,
         )?;
         self.append_command(
             &menu,
             "cancel-add-account",
-            "  Cancel",
+            tt(lang, "  Cancel", "  Hủy"),
             TrayCommand::CancelAddAccount,
         )?;
         menu.append(&PredefinedMenuItem::separator())?;
-        self.append_command(&menu, "refresh", "Refresh", TrayCommand::Refresh)?;
-        self.append_command(&menu, "quit", "Quit", TrayCommand::Quit)?;
+        self.append_command(
+            &menu,
+            "refresh",
+            tt(lang, "Refresh", "Làm mới"),
+            TrayCommand::Refresh,
+        )?;
+        self.append_command(&menu, "quit", tt(lang, "Quit", "Thoát"), TrayCommand::Quit)?;
         Ok(menu)
     }
 
@@ -1193,8 +1868,31 @@ fn get_nearest_reset_time(account: &AccountView) -> Option<OffsetDateTime> {
     nearest
 }
 
+#[allow(dead_code)]
 fn tray_saved_accounts(accounts: &[AccountView]) -> Vec<&AccountView> {
     accounts.iter().collect()
+}
+
+fn append_switch_account_group(
+    menu: &dyn AppendableMenu,
+    heading: &str,
+    accounts: &[&AccountView],
+    active_account_id: Option<Uuid>,
+    commands: &mut HashMap<String, TrayCommand>,
+    first_group: &mut bool,
+) -> Result<()> {
+    if accounts.is_empty() {
+        return Ok(());
+    }
+    if !*first_group {
+        menu.append_item(&PredefinedMenuItem::separator())?;
+    }
+    *first_group = false;
+    menu.append_item(&MenuItem::new(heading, false, None))?;
+    for account in accounts {
+        append_tray_account_item(menu, account, active_account_id, commands)?;
+    }
+    Ok(())
 }
 
 fn append_tray_account_item(
@@ -1205,36 +1903,93 @@ fn append_tray_account_item(
 ) -> Result<()> {
     let id = format!("activate:{}", account.id);
     let is_active = Some(account.id) == active_account_id || account.is_active;
-    let label = format!("  {}", account_display_name(account));
+    let weekly_only = account
+        .target_app
+        .as_deref()
+        .map(|app| app == "codex")
+        .unwrap_or(true);
+    let label = format_switch_account_label(account, is_active, weekly_only);
+
+    let needs_login = account
+        .usage_error
+        .as_deref()
+        .is_some_and(usage_error_requires_login);
+
     if is_active {
-        menu.append_item(&MenuItem::new(label, true, None))?;
+        menu.append_item(&MenuItem::new(label, false, None))?;
+    } else if needs_login {
+        let login_id = format!("login:{}", account.id);
+        let item = MenuItem::with_id(MenuId::new(&login_id), label, true, None);
+        menu.append_item(&item)?;
+        commands.insert(login_id, TrayCommand::Login(account.id));
     } else {
         let item = MenuItem::with_id(MenuId::new(&id), label, true, None);
         menu.append_item(&item)?;
         commands.insert(id, TrayCommand::Activate(account.id));
     }
+    Ok(())
+}
 
-    // Details line
-    let plan = format_plan_label_simple(account.plan_label.as_deref());
-    let needs_login = account
+fn format_switch_account_label(
+    account: &AccountView,
+    is_active: bool,
+    weekly_only: bool,
+) -> String {
+    let name = account_display_name(account);
+    let prefix = if is_active { "\u{2713} " } else { "" };
+    let summary = format_account_quota_summary(account, weekly_only);
+    if summary.is_empty() {
+        format!("{prefix}{name}")
+    } else {
+        format!("{prefix}{name} · {summary}")
+    }
+}
+
+fn format_account_quota_summary(account: &AccountView, weekly_only: bool) -> String {
+    if account
         .usage_error
         .as_deref()
-        .is_some_and(usage_error_requires_login);
-    if needs_login {
-        let login_id = format!("login:{}", account.id);
-        let item = MenuItem::with_id(
-            MenuId::new(&login_id),
-            format!("    {plan}  •  Click to Login"),
-            true,
-            None,
-        );
-        menu.append_item(&item)?;
-        commands.insert(login_id, TrayCommand::Login(account.id));
-    } else {
-        let details = format_account_details_line(&plan, account.usage.as_ref());
-        menu.append_item(&MenuItem::new(format!("    {details}"), true, None))?;
+        .is_some_and(usage_error_requires_login)
+    {
+        return "Login required".to_owned();
     }
-    Ok(())
+    let Some(usage) = account.usage.as_ref() else {
+        return String::new();
+    };
+    let now = OffsetDateTime::now_utc();
+
+    if !weekly_only
+        && let Some(five_hour) = &usage.five_hour
+        && five_hour.reset_at > now
+    {
+        let at = crate::time_display::format_local_reset_at(five_hour.reset_at);
+        if five_hour.remaining_percent == 0 {
+            return format!(
+                "Session 0% · reset {at} ({})",
+                crate::time_display::format_countdown(five_hour.reset_at, now)
+            );
+        }
+        return format!("Session {}% · reset {at}", five_hour.remaining_percent);
+    }
+
+    if let Some(weekly) = &usage.weekly {
+        let at = crate::time_display::format_local_reset_at(weekly.reset_at);
+        if weekly.reset_at <= now {
+            return format!("Weekly {QUOTA_PAST_RESET_LABEL} · {at}");
+        }
+        if weekly.remaining_percent == 0 {
+            return format!(
+                "Weekly 0% · reset {at} ({})",
+                crate::time_display::format_countdown(weekly.reset_at, now)
+            );
+        }
+        return format!("Weekly {}% · reset {at}", weekly.remaining_percent);
+    }
+
+    if usage.has_stale_quota_cache(now) {
+        return QUOTA_PAST_RESET_LABEL.to_owned();
+    }
+    String::new()
 }
 
 fn find_active_tray_account<'a>(
@@ -1242,15 +1997,70 @@ fn find_active_tray_account<'a>(
     current_saved_id: Option<Uuid>,
     accounts: &'a [AccountView],
 ) -> Option<&'a AccountView> {
-    current_saved_id
-        .and_then(|id| accounts.iter().find(|account| account.id == id))
-        .or_else(|| {
-            current_account.and_then(|current| {
-                accounts
-                    .iter()
-                    .find(|account| account.is_active && account_matches_identity(account, current))
-            })
+    if let Some(account) =
+        current_saved_id.and_then(|id| accounts.iter().find(|account| account.id == id))
+    {
+        return Some(account);
+    }
+    if let Some(current) = current_account {
+        if let Some(account) = accounts
+            .iter()
+            .find(|account| account.is_active && account_matches_identity(account, current))
+        {
+            return Some(account);
+        }
+        // Claude live identity is often the placeholder email — still show quota
+        // from the sole / most-recent Claude saved account with cached usage.
+        if current
+            .email
+            .eq_ignore_ascii_case(crate::claude::CLAUDE_UNKNOWN_EMAIL)
+        {
+            return fallback_unresolved_claude_tray_account(accounts, current);
+        }
+    }
+    None
+}
+
+fn fallback_unresolved_claude_tray_account<'a>(
+    accounts: &'a [AccountView],
+    identity: &DisplayIdentity,
+) -> Option<&'a AccountView> {
+    let mut candidates: Vec<&'a AccountView> = accounts
+        .iter()
+        .filter(|account| {
+            account.target_app.as_deref() == Some("claude") && !account.is_archived
         })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(plan) = identity.plan_label.as_deref() {
+        let plan_matches: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|account| {
+                account
+                    .plan_label
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(plan))
+            })
+            .collect();
+        if !plan_matches.is_empty() {
+            candidates = plan_matches;
+        }
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0]);
+    }
+    candidates.into_iter().max_by_key(|account| {
+        (
+            account
+                .last_activated_at
+                .map(|t| t.unix_timestamp_nanos())
+                .unwrap_or(0),
+            account.updated_at.unix_timestamp_nanos(),
+        )
+    })
 }
 
 fn account_matches_identity(account: &AccountView, identity: &DisplayIdentity) -> bool {
@@ -1298,43 +2108,118 @@ fn format_plan_label_simple(plan: Option<&str>) -> String {
     .unwrap_or_else(|| "Free".to_owned())
 }
 
-/// Build a compact quota bar: `[█████░] 83%`
+/// CodexBar-style compact 3-glyph usage bar: `▮▮▯ 83%`
+#[allow(dead_code)]
 fn format_quota_bar(percent: u8) -> String {
-    const BAR_WIDTH: usize = 6;
-    let filled = (percent as usize * BAR_WIDTH + 50) / 100; // round
+    const BAR_WIDTH: usize = 3;
+    let filled = ((f64::from(percent) / 100.0) * BAR_WIDTH as f64).round() as usize;
+    let filled = filled.min(BAR_WIDTH);
     let empty = BAR_WIDTH.saturating_sub(filled);
     format!(
-        "[{}{}] {percent}%",
-        "\u{2588}".repeat(filled),
-        "\u{2591}".repeat(empty),
+        "{}{} {percent}%",
+        "\u{25ae}".repeat(filled),
+        "\u{25af}".repeat(empty),
     )
 }
 
-/// Build the compact details line for an account: `Plan  •  [████░░░░] 52%  •  ↻ 12/05`
+/// CodexBar-style multi-line usage card for the active account.
+/// Codex (`weekly_only`): Weekly / Resets / Pace only — no session/5h.
+fn format_usage_menu_lines(
+    usage: Option<&crate::model::AccountUsageView>,
+    weekly_only: bool,
+    lang: ResolvedUiLanguage,
+) -> Vec<String> {
+    let Some(usage) = usage else {
+        return Vec::new();
+    };
+    let now = OffsetDateTime::now_utc();
+    let mut lines = Vec::new();
+    let vi = matches!(lang, ResolvedUiLanguage::Vi);
+
+    if !weekly_only
+        && let Some(five_hour) = &usage.five_hour
+        && five_hour.reset_at > now
+    {
+        let at = crate::time_display::format_local_reset_at(five_hour.reset_at);
+        let in_cd = crate::time_display::format_countdown(five_hour.reset_at, now);
+        if five_hour.remaining_percent == 0 {
+            lines.push(if vi {
+                format!("Phiên 0% · làm mới {at} ({in_cd})")
+            } else {
+                format!("Session 0% · reset {at} ({in_cd})")
+            });
+        } else {
+            lines.push(if vi {
+                format!("Phiên còn {}%", five_hour.remaining_percent)
+            } else {
+                format!("Session {}% left", five_hour.remaining_percent)
+            });
+            lines.push(if vi {
+                format!("Làm mới {at} · còn {in_cd}")
+            } else {
+                format!("Reset {at} · in {in_cd}")
+            });
+        }
+    }
+
+    if let Some(weekly) = &usage.weekly {
+        let at = crate::time_display::format_local_reset_at(weekly.reset_at);
+        if weekly.reset_at <= now {
+            lines.push(if vi {
+                format!("Tuần: đã qua mốc làm mới · {at}")
+            } else {
+                format!("Weekly {QUOTA_PAST_RESET_LABEL} · {at}")
+            });
+        } else if weekly.remaining_percent == 0 {
+            let in_cd = crate::time_display::format_countdown(weekly.reset_at, now);
+            lines.push(if vi {
+                format!("Tuần 0% · làm mới {at} ({in_cd})")
+            } else {
+                format!("Weekly 0% · reset {at} ({in_cd})")
+            });
+        } else {
+            let in_cd = crate::time_display::format_countdown(weekly.reset_at, now);
+            lines.push(if vi {
+                format!("Tuần còn {}%", weekly.remaining_percent)
+            } else {
+                format!("Weekly {}% left", weekly.remaining_percent)
+            });
+            lines.push(if vi {
+                format!("Làm mới {at} · còn {in_cd}")
+            } else {
+                format!("Reset {at} · in {in_cd}")
+            });
+            if let Some(pace) =
+                crate::usage_pace::pace_for_weekly(weekly.used_percent, weekly.reset_at, now)
+            {
+                lines.push(pace.summary_label_localized(vi));
+                if let Some(eta) = pace.eta_label_localized(now, vi) {
+                    lines.push(eta);
+                }
+            }
+        }
+    } else if usage.has_stale_quota_cache(now) && (weekly_only || usage.five_hour.is_none()) {
+        lines.push(if vi {
+            "Đã qua mốc làm mới".to_owned()
+        } else {
+            QUOTA_PAST_RESET_LABEL.to_owned()
+        });
+    }
+
+    lines
+}
+
+/// Compact one-line summary kept for tooltips / legacy helpers.
+#[allow(dead_code)]
 fn format_account_details_line(
     plan: &str,
     usage: Option<&crate::model::AccountUsageView>,
+    weekly_only: bool,
+    lang: ResolvedUiLanguage,
 ) -> String {
     let mut parts = vec![plan.to_owned()];
-    if let Some(usage) = usage {
-        let now = OffsetDateTime::now_utc();
-        // Pick bottleneck: lowest remaining% across active windows
-        let bottleneck = [usage.five_hour.as_ref(), usage.weekly.as_ref()]
-            .into_iter()
-            .flatten()
-            .filter(|w| w.reset_at > now)
-            .min_by_key(|w| w.remaining_percent);
-        if let Some(window) = bottleneck {
-            parts.push(format_quota_bar(window.remaining_percent));
-            parts.push(format!(
-                "\u{21bb} {}",
-                crate::time_display::format_short_local_reset_at(window.reset_at)
-            ));
-        } else if usage.has_stale_quota_cache(now) {
-            parts.push(QUOTA_PAST_RESET_LABEL.to_owned());
-        }
-    }
-    parts.join(" • ")
+    parts.extend(format_usage_menu_lines(usage, weekly_only, lang));
+    parts.join(" · ")
 }
 
 fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
@@ -1347,7 +2232,8 @@ fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
     } else if let Some(usage) = &account.usage
         && let Some(weekly) = &usage.weekly
     {
-        if weekly.reset_at <= OffsetDateTime::now_utc() {
+        let now = OffsetDateTime::now_utc();
+        if weekly.reset_at <= now {
             (QUOTA_PAST_RESET_LABEL.to_owned(), String::new())
         } else {
             (
@@ -1356,8 +2242,8 @@ fn account_usage_labels_simple(account: &AccountView) -> (String, String) {
                     format_remaining_percent(weekly.remaining_percent).trim()
                 ),
                 format!(
-                    "Reset: {}",
-                    crate::time_display::format_short_local_reset_at(weekly.reset_at)
+                    "Reset in: {}",
+                    crate::time_display::format_countdown(weekly.reset_at, now)
                 ),
             )
         }
@@ -1448,7 +2334,7 @@ fn spawn_tray_background(
             Err(error) => {
                 eprintln!("background tray task failed: {error:#}");
                 Some((
-                    "Codex Switcher".to_owned(),
+                    "ChatGPT Codex".to_owned(),
                     format!("Operation failed: {error:#}"),
                 ))
             }
@@ -1593,18 +2479,17 @@ fn tray_lock_path<S: SecretStore>(app: &App<S>) -> PathBuf {
     app.env().app_data_dir.join("tray.lock")
 }
 
+fn wry_bounds_from_physical(size: PhysicalSize<u32>) -> wry::Rect {
+    wry::Rect {
+        position: wry::dpi::LogicalPosition::new(0.0, 0.0).into(),
+        size: wry::dpi::PhysicalSize::new(size.width, size.height).into(),
+    }
+}
+
 fn read_tray_lock_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path)
         .ok()
         .and_then(|content| content.trim().parse().ok())
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn tray_instance_pid() -> Option<u32> {
-    directories::ProjectDirs::from("com", "nextide", "codex-account-switcher")
-        .map(|dirs| dirs.data_local_dir().join("tray.lock"))
-        .and_then(|path| read_tray_lock_pid(&path))
-        .filter(|pid| unsafe { libc::kill(*pid as i32, 0) == 0 })
 }
 
 fn log_tray_error<S: SecretStore>(app: &App<S>, message: &str) {
@@ -1634,77 +2519,12 @@ fn tray_log_path<S: SecretStore>(app: &App<S>) -> PathBuf {
     app.env().app_data_dir.join("tray.log")
 }
 
-#[cfg(target_os = "macos")]
-fn default_tray_log_path() -> PathBuf {
-    directories::ProjectDirs::from("com", "nextide", "codex-account-switcher")
-        .map(|dirs| dirs.data_local_dir().join("tray.log"))
-        .unwrap_or_else(|| PathBuf::from("tray.log"))
-}
-
-/// Start a detached tray instance and return `true` when the current process should exit.
-#[cfg(target_os = "macos")]
-pub(crate) fn spawn_detached_tray_instance() -> Result<bool> {
-    use std::fs::OpenOptions;
-    use std::process::{Command, Stdio};
-
-    if !std::io::stdin().is_terminal() {
-        return Ok(false);
-    }
-    if tray_instance_pid().is_some() {
-        return Ok(false);
-    }
-    let exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let log_path = default_tray_log_path();
-    if let Some(parent) = log_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .context("failed to open tray log for detached tray instance")?;
-    Command::new("nohup")
-        .arg(exe)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .context("failed to spawn detached tray instance")?;
-    Ok(true)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn spawn_detached_tray_instance() -> Result<bool> {
-    Ok(false)
-}
-
-pub(crate) fn show_console_window() {
-    #[cfg(target_os = "windows")]
-    allocate_console();
-}
-
 #[cfg(target_os = "windows")]
 fn release_console() {
     use windows_sys::Win32::System::Console::FreeConsole;
 
     unsafe {
         FreeConsole();
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn allocate_console() {
-    use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, ShowWindow};
-
-    unsafe {
-        AllocConsole();
-    }
-    let window = unsafe { GetConsoleWindow() };
-    if !window.is_null() {
-        unsafe {
-            ShowWindow(window, SW_RESTORE);
-        }
     }
 }
 
@@ -1939,11 +2759,105 @@ mod tests {
 
     #[test]
     fn quota_bar_renders_correct_fill() {
-        assert_eq!(format_quota_bar(100), "[██████] 100%");
-        assert_eq!(format_quota_bar(0), "[░░░░░░] 0%");
-        assert_eq!(format_quota_bar(50), "[███░░░] 50%");
-        assert_eq!(format_quota_bar(83), "[█████░] 83%");
-        assert_eq!(format_quota_bar(17), "[█░░░░░] 17%");
+        assert_eq!(format_quota_bar(100), "▮▮▮ 100%");
+        assert_eq!(format_quota_bar(0), "▯▯▯ 0%");
+        assert_eq!(format_quota_bar(50), "▮▮▯ 50%");
+        assert_eq!(format_quota_bar(83), "▮▮▯ 83%");
+        assert_eq!(format_quota_bar(17), "▮▯▯ 17%");
+    }
+
+    #[test]
+    fn usage_menu_lines_are_codexbar_style_weekly_only_for_codex() {
+        let now = OffsetDateTime::now_utc();
+        let usage = AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: now,
+            five_hour: Some(UsageWindowView {
+                used_percent: 40,
+                remaining_percent: 60,
+                reset_at: now + time::Duration::hours(2),
+            }),
+            weekly: Some(UsageWindowView {
+                used_percent: 16,
+                remaining_percent: 84,
+                reset_at: now + time::Duration::days(3),
+            }),
+            credits: None,
+        };
+
+        let lines = format_usage_menu_lines(Some(&usage), true, ResolvedUiLanguage::En);
+        assert_eq!(lines[0], "Weekly 84% left");
+        assert!(lines[1].starts_with("Reset "));
+        assert!(lines[1].contains(" · in "));
+        assert!(!lines.iter().any(|line| line.contains("Session")));
+    }
+
+    #[test]
+    fn usage_menu_lines_include_session_when_not_weekly_only() {
+        let now = OffsetDateTime::now_utc();
+        let usage = AccountUsageView {
+            source: UsageSource::SavedAccessToken,
+            fetched_at: now,
+            five_hour: Some(UsageWindowView {
+                used_percent: 40,
+                remaining_percent: 60,
+                reset_at: now + time::Duration::hours(2),
+            }),
+            weekly: Some(UsageWindowView {
+                used_percent: 16,
+                remaining_percent: 84,
+                reset_at: now + time::Duration::days(3),
+            }),
+            credits: None,
+        };
+
+        let lines = format_usage_menu_lines(Some(&usage), false, ResolvedUiLanguage::En);
+        assert_eq!(lines[0], "Session 60% left");
+        assert!(lines.iter().any(|line| line == "Weekly 84% left"));
+    }
+
+    #[test]
+    fn switch_account_label_is_single_compact_line() {
+        let now = OffsetDateTime::now_utc();
+        let account = AccountView {
+            id: Uuid::new_v4(),
+            email: "person@gmail.com".to_owned(),
+            subject: None,
+            name: None,
+            plan_label: Some("Plus".to_owned()),
+            workspace_id: None,
+            workspace_name: None,
+            target_app: Some("codex".to_owned()),
+            environment: EnvironmentKind::Macos,
+            is_active: false,
+            created_at: now,
+            updated_at: now,
+            last_activated_at: None,
+            usage: Some(AccountUsageView {
+                source: UsageSource::SavedAccessToken,
+                fetched_at: now,
+                five_hour: Some(UsageWindowView {
+                    used_percent: 90,
+                    remaining_percent: 10,
+                    reset_at: now + time::Duration::hours(1),
+                }),
+                weekly: Some(UsageWindowView {
+                    used_percent: 20,
+                    remaining_percent: 80,
+                    reset_at: now + time::Duration::days(2),
+                }),
+                credits: None,
+            }),
+            usage_error: None,
+            label: None,
+            is_archived: false,
+        };
+
+        let label = format_switch_account_label(&account, false, true);
+        assert!(
+            label.starts_with("person · Weekly 80% · reset "),
+            "unexpected switch label: {label}"
+        );
     }
 
     #[test]

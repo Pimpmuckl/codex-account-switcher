@@ -40,6 +40,11 @@ where
     }
 
     pub fn status(&self) -> Result<StatusOutput> {
+        self.status_with_processes(true)
+    }
+
+    /// Like [`Self::status`], but process scanning is optional (UI polls skip it when unused).
+    pub fn status_with_processes(&self, include_processes: bool) -> Result<StatusOutput> {
         let saved_accounts = self.repository.list_accounts(&self.env.kind)?;
         let live = codex::try_read_live_auth_bundle(&self.env)?;
         let current_saved_id = live
@@ -52,7 +57,11 @@ where
             current_account: live.map(|bundle| bundle.identity),
             current_account_saved_id: current_saved_id,
             saved_accounts: saved_accounts.len(),
-            process_warnings: crate::process::detect_running_codex_processes(),
+            process_warnings: if include_processes {
+                crate::process::detect_running_codex_processes()
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -84,11 +93,19 @@ where
             anyhow::bail!("not logged in yet — complete Codex login first");
         }
         codex::ensure_cap_sid_exists(&self.env)?;
+        // Marker stays until restore_add_account_backup / cancel clears the session.
         self.save_current()
     }
 
     pub fn cancel_add_account_session(&self) -> Result<()> {
         codex::cancel_add_account_session(&self.env)
+    }
+
+    /// Call after a successful interactive re-login + Save when not in add-account flow.
+    pub fn clear_interactive_login_if_saved(&self) {
+        if self.env.codex_root.join("auth.json").exists() {
+            codex::clear_interactive_login_session(&self.env);
+        }
     }
 
     pub fn save_current(&self) -> Result<SaveOutput> {
@@ -101,6 +118,11 @@ where
         let (metadata, created) =
             self.repository
                 .save_snapshot(&self.env.kind, &live.identity, &live.snapshot)?;
+        // OAuth finished for a normal save. Keep the guard during add-account until
+        // backup restore completes (see save_during_add_account_session / cancel).
+        if !codex::add_account_session_active(&self.env) {
+            codex::clear_interactive_login_session(&self.env);
+        }
         Ok(SaveOutput {
             account: account_view(metadata.clone(), Some(metadata.id), None, None),
             action: if created {
@@ -113,7 +135,7 @@ where
 
     pub fn save_cursor_current(&self) -> Result<SaveOutput> {
         let live = crate::cursor::read_live_cursor_auth(&self.env)
-            .context("no live Cursor auth bundle found")?;
+            .context("failed to read live Cursor session — open Cursor, sign in, then try again")?;
         let (metadata, created) = self.repository.save_snapshot_with_app(
             &self.env.kind,
             &live.identity,
@@ -130,15 +152,42 @@ where
         })
     }
 
+    pub fn save_claude_current(&self) -> Result<SaveOutput> {
+        let live = crate::claude::read_live_claude_auth(&self.env)
+            .context("no live Claude auth bundle found")?;
+        let (metadata, created) = self.repository.save_snapshot_with_app(
+            &self.env.kind,
+            &live.identity,
+            &live.snapshot,
+            Some("claude".to_owned()),
+        )?;
+        Ok(SaveOutput {
+            account: account_view(metadata.clone(), Some(metadata.id), None, None),
+            action: if created {
+                SaveAction::Created
+            } else {
+                SaveAction::Refreshed
+            },
+        })
+    }
+
     pub fn activate(&self, account_id: Uuid) -> Result<ActivateOutput> {
         self.activate_with_running_policy(account_id, false)
     }
 
     pub fn start_login_for_saved_account(&self, account_id: Uuid) -> Result<ActivateOutput> {
-        let output = self.activate_with_running_policy(account_id, false)?;
-        codex::clear_live_auth_for_login(&self.env)
-            .context("failed to clear live Codex auth before login")?;
-        Ok(output)
+        let metadata = self
+            .repository
+            .get_account(&self.env.kind, account_id)?
+            .ok_or_else(|| anyhow::anyhow!("saved account not found"))?;
+        // Do not restore then clear — that races Codex Desktop OAuth and can leave
+        // the browser stuck on auth.openai.com with nothing listening on :1455.
+        codex::begin_relogin_session(&self.env)
+            .context("failed to prepare live Codex auth for re-login")?;
+        Ok(ActivateOutput {
+            account: account_view(metadata, Some(account_id), None, None),
+            warnings: Vec::new(),
+        })
     }
 
     pub fn validate_activation_target(&self, account_id: Uuid) -> Result<()> {
@@ -161,14 +210,17 @@ where
             .get_account(&self.env.kind, account_id)?
             .ok_or_else(|| anyhow::anyhow!("saved account not found"))?;
         let is_cursor = account_metadata.target_app.as_deref() == Some("cursor");
+        let is_claude = account_metadata.target_app.as_deref() == Some("claude");
 
         let warnings = if is_cursor {
             crate::process::detect_switch_blocking_cursor_processes()
+        } else if is_claude {
+            crate::process::detect_switch_blocking_claude_processes()
         } else {
             crate::process::detect_switch_blocking_codex_processes()
         };
 
-        if !is_cursor {
+        if !is_cursor && !is_claude {
             self.refresh_current_saved_account_before_activation();
         }
 
@@ -179,6 +231,9 @@ where
         if is_cursor {
             crate::cursor::restore_cursor_snapshot(&self.env, &snapshot)
                 .context("failed to restore the selected Cursor account snapshot")?;
+        } else if is_claude {
+            crate::claude::restore_claude_snapshot(&self.env, &snapshot)
+                .context("failed to restore the selected Claude account snapshot")?;
         } else {
             codex::restore_snapshot(&self.env, &snapshot, &restore_identity, verify_stable)
                 .context("failed to restore the selected account snapshot")?;
@@ -193,7 +248,13 @@ where
             account_id,
             &metadata.email,
             metadata.label.as_deref(),
-            Some(if is_cursor { "cursor" } else { "codex" }),
+            Some(if is_cursor {
+                "cursor"
+            } else if is_claude {
+                "claude"
+            } else {
+                "codex"
+            }),
         );
         Ok(ActivateOutput {
             account: account_view(metadata, Some(account_id), None, None),
@@ -273,6 +334,15 @@ where
                 workspace_id: None,
                 workspace_name: None,
             }
+        } else if metadata.target_app.as_deref() == Some("claude") {
+            DisplayIdentity {
+                email: metadata.email.clone(),
+                subject: metadata.subject.clone(),
+                name: metadata.name.clone(),
+                plan_label: metadata.plan_label.clone(),
+                workspace_id: metadata.workspace_id.clone(),
+                workspace_name: metadata.workspace_name.clone(),
+            }
         } else {
             codex::identity_from_snapshot(&snapshot)?
         };
@@ -300,16 +370,16 @@ where
         &self,
         account_id: Uuid,
     ) -> Vec<RunningCodexProcess> {
-        let is_cursor = self
+        let target_app = self
             .repository
             .get_account(&self.env.kind, account_id)
             .ok()
             .flatten()
-            .and_then(|meta| meta.target_app)
-            .as_deref()
-            == Some("cursor");
-        if is_cursor {
+            .and_then(|meta| meta.target_app);
+        if target_app.as_deref() == Some("cursor") {
             return crate::process::detect_switch_blocking_cursor_processes();
+        } else if target_app.as_deref() == Some("claude") {
+            return crate::process::detect_switch_blocking_claude_processes();
         }
         crate::process::detect_switch_blocking_codex_processes()
     }
@@ -343,46 +413,145 @@ where
     pub fn usage(&self, account_id: Option<Uuid>) -> Result<UsageOutput> {
         match account_id {
             Some(account_id) => {
-                let (snapshot, _, _) = self.load_activation_target(account_id)?;
-                let original_snapshot = snapshot.clone();
-                let target = usage_target_from_snapshot(
-                    self.env.kind.clone(),
-                    snapshot,
-                    UsageSource::SavedAccessToken,
-                    true,
-                )?;
-                let (output, refreshed_snapshot) = match fetch_usage(target) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let _ = self.repository.record_usage_error(
-                            &self.env.kind,
-                            account_id,
-                            usage_error_message(&error),
-                        );
-                        return Err(error);
-                    }
-                };
-                if refreshed_snapshot != original_snapshot {
-                    self.restore_refreshed_live_auth_if_still_current(
-                        &original_snapshot,
-                        &refreshed_snapshot,
-                        &output.account,
-                    )
-                    .context(
-                        "refreshed saved auth but failed to update matching live auth files",
-                    )?;
+                let metadata = self
+                    .repository
+                    .get_account(&self.env.kind, account_id)?
+                    .ok_or_else(|| anyhow::anyhow!("saved account not found"))?;
+                let app = metadata.target_app.as_deref().unwrap_or("codex");
+                match app {
+                    "cursor" => self.usage_cursor_saved(account_id, &metadata),
+                    "claude" => self.usage_claude_saved(account_id, &metadata),
+                    _ => self.usage_codex_saved(account_id),
                 }
-                self.repository.replace_snapshot(
-                    &self.env.kind,
-                    account_id,
-                    &output.account,
-                    &refreshed_snapshot,
-                    Some(output.usage.clone()),
-                )?;
-                Ok(output)
             }
             None => self.usage_live(true),
         }
+    }
+
+    fn usage_codex_saved(&self, account_id: Uuid) -> Result<UsageOutput> {
+        let (snapshot, _, _) = self.load_activation_target(account_id)?;
+        let original_snapshot = snapshot.clone();
+        let target = usage_target_from_snapshot(
+            self.env.kind.clone(),
+            snapshot,
+            UsageSource::SavedAccessToken,
+            true,
+        )?;
+        let (output, refreshed_snapshot) = match fetch_usage(target) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.repository.record_usage_error(
+                    &self.env.kind,
+                    account_id,
+                    usage_error_message(&error),
+                );
+                return Err(error);
+            }
+        };
+        if refreshed_snapshot != original_snapshot {
+            self.restore_refreshed_live_auth_if_still_current(
+                &original_snapshot,
+                &refreshed_snapshot,
+                &output.account,
+            )
+            .context("refreshed saved auth but failed to update matching live auth files")?;
+        }
+        self.repository.replace_snapshot(
+            &self.env.kind,
+            account_id,
+            &output.account,
+            &refreshed_snapshot,
+            Some(output.usage.clone()),
+        )?;
+        Ok(output)
+    }
+
+    fn usage_cursor_saved(
+        &self,
+        account_id: Uuid,
+        metadata: &crate::model::SavedAccountMetadata,
+    ) -> Result<UsageOutput> {
+        let (_, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
+        let token = crate::cursor_usage::access_token_from_snapshot(&snapshot).map_err(|e| {
+            let _ = self.repository.record_usage_error(
+                &self.env.kind,
+                account_id,
+                usage_error_message(&e),
+            );
+            e
+        })?;
+        let usage = crate::cursor_usage::fetch_cursor_usage(&token).map_err(|e| {
+            let _ = self.repository.record_usage_error(
+                &self.env.kind,
+                account_id,
+                usage_error_message(&e),
+            );
+            e
+        })?;
+        let identity = crate::model::DisplayIdentity {
+            email: metadata.email.clone(),
+            subject: metadata.subject.clone(),
+            name: metadata.name.clone(),
+            plan_label: metadata.plan_label.clone(),
+            workspace_id: metadata.workspace_id.clone(),
+            workspace_name: metadata.workspace_name.clone(),
+        };
+        self.repository.replace_snapshot(
+            &self.env.kind,
+            account_id,
+            &identity,
+            &snapshot,
+            Some(usage.clone()),
+        )?;
+        Ok(UsageOutput {
+            environment: self.env.kind.clone(),
+            account: identity,
+            usage,
+        })
+    }
+
+    fn usage_claude_saved(
+        &self,
+        account_id: Uuid,
+        metadata: &crate::model::SavedAccountMetadata,
+    ) -> Result<UsageOutput> {
+        let (_, snapshot) = self.repository.load_snapshot(&self.env.kind, account_id)?;
+        let token = crate::claude_usage::access_token_from_snapshot(&snapshot).map_err(|e| {
+            let _ = self.repository.record_usage_error(
+                &self.env.kind,
+                account_id,
+                usage_error_message(&e),
+            );
+            e
+        })?;
+        let usage = crate::claude_usage::fetch_claude_usage(&token).map_err(|e| {
+            let _ = self.repository.record_usage_error(
+                &self.env.kind,
+                account_id,
+                usage_error_message(&e),
+            );
+            e
+        })?;
+        let identity = crate::model::DisplayIdentity {
+            email: metadata.email.clone(),
+            subject: metadata.subject.clone(),
+            name: metadata.name.clone(),
+            plan_label: metadata.plan_label.clone(),
+            workspace_id: metadata.workspace_id.clone(),
+            workspace_name: metadata.workspace_name.clone(),
+        };
+        self.repository.replace_snapshot(
+            &self.env.kind,
+            account_id,
+            &identity,
+            &snapshot,
+            Some(usage.clone()),
+        )?;
+        Ok(UsageOutput {
+            environment: self.env.kind.clone(),
+            account: identity,
+            usage,
+        })
     }
 
     fn usage_live(&self, retry_if_live_changed: bool) -> Result<UsageOutput> {
@@ -661,28 +830,118 @@ where
     }
 
     pub fn cursor_status(&self) -> Result<StatusOutput> {
+        self.cursor_status_with_processes(true)
+    }
+
+    pub fn cursor_status_with_processes(&self, include_processes: bool) -> Result<StatusOutput> {
         let saved_accounts = self
             .repository
             .list_accounts(&self.env.kind)?
             .into_iter()
             .filter(|acc| acc.target_app.as_deref() == Some("cursor"))
             .collect::<Vec<_>>();
-        let live = crate::cursor::try_read_live_cursor_auth(&self.env)?;
-        let current_saved_id = live
-            .as_ref()
-            .and_then(|bundle| {
-                match_saved_account_with_app(&saved_accounts, &bundle.identity, Some("cursor"))
-            })
-            .map(|account| account.id);
+        // Identity-only read keeps status/popover polls cheap and avoids RW locks
+        // on Cursor's large state DB while Cursor itself is running.
+        let live = crate::cursor::try_read_live_cursor_identity(&self.env).unwrap_or(None);
+        let current_saved_id = live.as_ref().and_then(|identity| {
+            match_saved_account_with_app(&saved_accounts, identity, Some("cursor"))
+                .map(|account| account.id)
+        });
         Ok(StatusOutput {
             environment: self.env.kind.clone(),
             codex_root: crate::cursor::cursor_db_path(&self.env)?
                 .display()
                 .to_string(),
-            current_account: live.map(|bundle| bundle.identity),
+            current_account: live,
             current_account_saved_id: current_saved_id,
             saved_accounts: saved_accounts.len(),
-            process_warnings: crate::process::detect_running_cursor_processes(),
+            process_warnings: if include_processes {
+                crate::process::detect_running_cursor_processes()
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    pub fn claude_status(&self) -> Result<StatusOutput> {
+        self.claude_status_with_processes(true)
+    }
+
+    pub fn claude_status_with_processes(&self, include_processes: bool) -> Result<StatusOutput> {
+        let saved_accounts = self
+            .repository
+            .list_accounts(&self.env.kind)?
+            .into_iter()
+            .filter(|acc| acc.target_app.as_deref() == Some("claude"))
+            .collect::<Vec<_>>();
+        let live = crate::claude::try_read_live_claude_identity(&self.env).unwrap_or(None);
+        let current_saved_id = live.as_ref().and_then(|identity| {
+            match_saved_account_with_app(&saved_accounts, identity, Some("claude"))
+                .map(|account| account.id)
+        });
+        Ok(StatusOutput {
+            environment: self.env.kind.clone(),
+            codex_root: crate::claude::claude_dir(&self.env).display().to_string(),
+            current_account: live,
+            current_account_saved_id: current_saved_id,
+            saved_accounts: saved_accounts.len(),
+            process_warnings: if include_processes {
+                crate::process::detect_running_claude_processes()
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    pub fn import_cookies_json(
+        &self,
+        provider: &str,
+        json_text: &str,
+        label: Option<String>,
+    ) -> Result<ImportOutput> {
+        let mut provider = provider.trim().to_ascii_lowercase();
+        if provider.is_empty() || provider == "auto" {
+            provider = crate::cookie_import::detect_provider_from_json(json_text).to_owned();
+        }
+        let (imported, target_app) = match provider.as_str() {
+            "codex" | "chatgpt" | "openai" => {
+                let imported = crate::cookie_import::import_codex_from_cookies_json(json_text)?;
+                crate::codex::validate_import_snapshot(&imported.snapshot)?;
+                (imported, None)
+            }
+            "cursor" => {
+                let imported = crate::cookie_import::import_cursor_from_cookies_json(json_text)?;
+                (imported, Some("cursor".to_owned()))
+            }
+            other => anyhow::bail!(crate::cookie_import::unsupported_provider_message(other)),
+        };
+
+        let (metadata, created) = if let Some(app) = target_app {
+            self.repository.save_snapshot_with_app(
+                &self.env.kind,
+                &imported.identity,
+                &imported.snapshot,
+                Some(app),
+            )?
+        } else {
+            self.repository.save_snapshot(
+                &self.env.kind,
+                &imported.identity,
+                &imported.snapshot,
+            )?
+        };
+        let metadata = if label.is_some() {
+            self.repository
+                .set_account_label(&self.env.kind, metadata.id, label)?
+        } else {
+            metadata
+        };
+        Ok(ImportOutput {
+            account_id: metadata.id,
+            email: metadata.email,
+            label: metadata.label,
+            created,
+            warnings: imported.warnings,
         })
     }
 
@@ -694,6 +953,16 @@ where
             .and_then(|acc| acc.target_app)
             .as_deref()
             == Some("cursor")
+    }
+
+    pub fn is_claude_account(&self, account_id: Uuid) -> bool {
+        self.repository
+            .get_account(&self.env.kind, account_id)
+            .ok()
+            .flatten()
+            .and_then(|acc| acc.target_app)
+            .as_deref()
+            == Some("claude")
     }
 }
 
@@ -1411,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn start_login_for_saved_account_clears_live_auth_after_targeting_account() {
+    fn start_login_for_saved_account_clears_live_auth_and_marks_login_session() {
         let temp = tempdir().expect("tempdir");
         let env = AppEnv {
             kind: EnvironmentKind::Linux,
@@ -1419,6 +1688,15 @@ mod tests {
             codex_root: temp.path().join(".codex"),
             app_data_dir: temp.path().join("app"),
         };
+
+        // Seed live auth so clear has something to remove.
+        std::fs::create_dir_all(&env.codex_root).expect("codex root");
+        std::fs::write(
+            env.codex_root.join("auth.json"),
+            auth_json_fixture("expired@example.com", "sub-expired", Some("pro")),
+        )
+        .expect("auth");
+        std::fs::write(env.codex_root.join("cap_sid"), "sid-expired").expect("sid");
 
         let repo = SnapshotRepository::new(&env.app_data_dir, MemorySecretStore::default());
         let saved = repo
@@ -1465,5 +1743,6 @@ mod tests {
         assert_eq!(output.account.email, "expired@example.com");
         assert!(!env.codex_root.join("auth.json").exists());
         assert!(!env.codex_root.join("cap_sid").exists());
+        assert!(crate::codex::interactive_login_in_progress(&env));
     }
 }

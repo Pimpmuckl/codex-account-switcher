@@ -392,9 +392,56 @@ fn snapshot_files<'a>(snapshot: &'a SnapshotBlob, file_name: &str) -> Vec<&'a st
 
 const ADD_ACCOUNT_AUTH_BACKUP: &str = "auth.json.switcher-bak";
 const ADD_ACCOUNT_CAP_BACKUP: &str = "cap_sid.switcher-bak";
+/// Marks an interactive browser/desktop login so background workers do not
+/// quit Codex or touch live auth while OAuth (`localhost:1455`) is in flight.
+const LOGIN_SESSION_MARKER: &str = ".cas-login-session";
+const LOGIN_SESSION_MAX_AGE: Duration = Duration::from_secs(45 * 60);
 
 pub fn add_account_session_active(env: &AppEnv) -> bool {
     env.codex_root.join(ADD_ACCOUNT_AUTH_BACKUP).exists()
+}
+
+/// True while the user is expected to complete Codex Desktop / browser OAuth.
+pub fn interactive_login_in_progress(env: &AppEnv) -> bool {
+    if add_account_session_active(env) {
+        return true;
+    }
+    let path = env.codex_root.join(LOGIN_SESSION_MARKER);
+    let Ok(meta) = fs::metadata(&path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    let age = modified.elapsed().unwrap_or(Duration::ZERO);
+    if age > LOGIN_SESSION_MAX_AGE {
+        let _ = fs::remove_file(&path);
+        return false;
+    }
+    true
+}
+
+pub fn mark_interactive_login_session(env: &AppEnv) -> Result<()> {
+    fs::create_dir_all(&env.codex_root)
+        .with_context(|| format!("failed to create {}", env.codex_root.display()))?;
+    let path = env.codex_root.join(LOGIN_SESSION_MARKER);
+    fs::write(
+        &path,
+        format!(
+            "pid={}\nstarted_unix_ms={}\n",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ),
+    )
+    .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+pub fn clear_interactive_login_session(env: &AppEnv) {
+    let _ = fs::remove_file(env.codex_root.join(LOGIN_SESSION_MARKER));
 }
 
 pub fn begin_add_account_session(env: &AppEnv) -> Result<()> {
@@ -430,6 +477,9 @@ pub fn begin_add_account_session(env: &AppEnv) -> Result<()> {
             .with_context(|| format!("failed to remove {}", cap_sid.display()))?;
     }
     fs::remove_file(&auth).with_context(|| format!("failed to remove {}", auth.display()))?;
+    // Keep marker even if backup already implies session — dual signal for workers.
+    drop(_lock);
+    mark_interactive_login_session(env)?;
     Ok(())
 }
 
@@ -471,14 +521,23 @@ pub fn restore_add_account_backup(env: &AppEnv) -> Result<()> {
         fs::remove_file(&backup_sid)
             .with_context(|| format!("failed to remove {}", backup_sid.display()))?;
     }
+    clear_interactive_login_session(env);
     Ok(())
 }
 
 pub fn cancel_add_account_session(env: &AppEnv) -> Result<()> {
     if !add_account_session_active(env) {
+        clear_interactive_login_session(env);
         return Ok(());
     }
     restore_add_account_backup(env)
+}
+
+/// Clear live auth and mark a re-login session (Sign in again…).
+pub fn begin_relogin_session(env: &AppEnv) -> Result<()> {
+    clear_live_auth_for_login(env)?;
+    mark_interactive_login_session(env)?;
+    Ok(())
 }
 
 #[cfg(test)]

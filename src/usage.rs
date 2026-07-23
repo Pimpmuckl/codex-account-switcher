@@ -188,14 +188,30 @@ struct UsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct UsageRateLimit {
+    /// 5-hour / session window (may be absent when OpenAI temporarily disables it).
+    #[serde(default, alias = "primary")]
     primary_window: Option<UsageWindow>,
+    /// Weekly window.
+    #[serde(default, alias = "secondary")]
     secondary_window: Option<UsageWindow>,
+    /// Newer payloads sometimes nest windows differently.
+    #[serde(default)]
+    rate_limit_window: Option<UsageWindow>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsageWindow {
-    used_percent: u8,
-    reset_at: i64,
+    /// Used percent 0–100 (API may send float).
+    #[serde(default)]
+    used_percent: Option<f64>,
+    /// Some payloads expose remaining directly.
+    #[serde(default)]
+    remaining_percent: Option<f64>,
+    /// Unix seconds (classic) or RFC3339 string.
+    #[serde(default)]
+    reset_at: Option<serde_json::Value>,
+    #[serde(default, alias = "reset_time")]
+    reset_time: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,21 +247,21 @@ impl UsageResponse {
 
     fn into_view(self, source: UsageSource) -> Result<AccountUsageView> {
         let now = OffsetDateTime::now_utc();
+        let limits = self.rate_limit.as_ref();
+        let five_hour = limits
+            .and_then(|l| l.primary_window.as_ref())
+            .or_else(|| limits.and_then(|l| l.rate_limit_window.as_ref()))
+            .map(window_view)
+            .transpose()?;
+        let weekly = limits
+            .and_then(|l| l.secondary_window.as_ref())
+            .map(window_view)
+            .transpose()?;
         Ok(AccountUsageView {
             source,
             fetched_at: now,
-            five_hour: self
-                .rate_limit
-                .as_ref()
-                .and_then(|limits| limits.primary_window.as_ref())
-                .map(window_view)
-                .transpose()?,
-            weekly: self
-                .rate_limit
-                .as_ref()
-                .and_then(|limits| limits.secondary_window.as_ref())
-                .map(window_view)
-                .transpose()?,
+            five_hour,
+            weekly,
             credits: self.credits.map(credits_view),
         })
     }
@@ -490,13 +506,68 @@ fn refresh_source(source: UsageSource) -> UsageSource {
 }
 
 fn window_view(window: &UsageWindow) -> Result<UsageWindowView> {
-    let reset_at = OffsetDateTime::from_unix_timestamp(window.reset_at)
-        .map_err(|error| anyhow!("invalid reset timestamp {}: {error}", window.reset_at))?;
+    let used = window
+        .used_percent
+        .map(|v| v.clamp(0.0, 100.0).round() as u8)
+        .or_else(|| {
+            window
+                .remaining_percent
+                .map(|r| 100u8.saturating_sub(r.clamp(0.0, 100.0).round() as u8))
+        })
+        .unwrap_or(0);
+    let remaining = window
+        .remaining_percent
+        .map(|v| v.clamp(0.0, 100.0).round() as u8)
+        .unwrap_or_else(|| 100u8.saturating_sub(used));
+
+    let reset_raw = window
+        .reset_at
+        .as_ref()
+        .or(window.reset_time.as_ref())
+        .context("usage window missing reset_at")?;
+    let reset_at = parse_reset_value(reset_raw)?;
+
     Ok(UsageWindowView {
-        used_percent: window.used_percent,
-        remaining_percent: 100u8.saturating_sub(window.used_percent),
+        used_percent: used,
+        remaining_percent: remaining,
         reset_at,
     })
+}
+
+fn parse_reset_value(value: &serde_json::Value) -> Result<OffsetDateTime> {
+    if let Some(secs) = value.as_i64() {
+        // Heuristic: ms vs seconds.
+        let secs = if secs > 10_000_000_000 {
+            secs / 1000
+        } else {
+            secs
+        };
+        return OffsetDateTime::from_unix_timestamp(secs)
+            .map_err(|error| anyhow!("invalid reset timestamp {secs}: {error}"));
+    }
+    if let Some(secs) = value.as_f64() {
+        let secs = if secs > 10_000_000_000.0 {
+            (secs / 1000.0) as i64
+        } else {
+            secs as i64
+        };
+        return OffsetDateTime::from_unix_timestamp(secs)
+            .map_err(|error| anyhow!("invalid reset timestamp {secs}: {error}"));
+    }
+    if let Some(s) = value.as_str() {
+        if let Ok(secs) = s.parse::<i64>() {
+            let secs = if secs > 10_000_000_000 {
+                secs / 1000
+            } else {
+                secs
+            };
+            return OffsetDateTime::from_unix_timestamp(secs)
+                .map_err(|error| anyhow!("invalid reset timestamp {secs}: {error}"));
+        }
+        return OffsetDateTime::parse(s, &Rfc3339)
+            .map_err(|error| anyhow!("invalid reset timestamp {s:?}: {error}"));
+    }
+    bail!("unsupported reset timestamp shape: {value}")
 }
 
 fn credits_view(credits: UsageCredits) -> CreditsView {
@@ -638,7 +709,7 @@ mod tests {
             r#"{
                 "email": "user@example.com",
                 "rate_limit": {
-                    "primary_window": { "used_percent": 10, "reset_at": 9999999999999 }
+                    "primary_window": { "used_percent": 10, "reset_at": "not-a-timestamp" }
                 }
             }"#,
         )
